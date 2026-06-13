@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Editor / OS cruft
+**/*.rs.bk
+.DS_Store
+
+# Local Claude settings (keep shared skills, drop machine-local overrides)
+.claude/settings.local.json

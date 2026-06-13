@@ -1,0 +1,20 @@
+[package]
+name = "marina"
+version = "0.0.0"
+edition = "2021"
+description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
+license = "Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+ratatui = "0.29"          # rendering (diff buffer) + re-exports crossterm
+sysinfo = "0.33"          # process cpu/mem/cwd/argv/parent (+ cpu delta math)
+netstat2 = "0.11"         # listening socket -> pid
+serde = { version = "1", features = ["derive"] } # config structs
+serde_json = "1"          # parse package.json name
+toml = "0.8"              # parse config + Cargo.toml / pyproject.toml name
+regex = "1"               # config rule matching
+libproc = "0.14"          # macOS phys_footprint (accurate memory)
+
+# Planned:
+# arc-swap = "1"            # atomic snapshot swap (currently Arc + mpsc)
