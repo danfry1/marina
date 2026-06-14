@@ -112,6 +112,20 @@ marina url <selector>
 A selector matching a project name acts on **every** service under it. Exit
 codes: `0` ok, `1` no match, `2` usage error.
 
+## Use with AI agents
+
+The CLI is built to be driven by coding agents. Install the bundled
+[skill](skills/marina/SKILL.md) so your agent knows how to use it:
+
+```sh
+# Claude Code (personal skills directory)
+cp -r skills/marina ~/.claude/skills/marina
+```
+
+Then ask things like *"what's running?"*, *"kill the client-portal project"*, or
+*"what's on :3000?"* and it'll drive `marina ls --json` / `marina kill <project>`.
+It's plain Markdown — adapt the path for other agent tools.
+
 ## Config
 
 Optional `~/.config/marina/config.toml`:
