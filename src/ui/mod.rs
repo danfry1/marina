@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
@@ -693,20 +693,24 @@ fn target_row(t: &Target, indent: bool) -> Row<'static> {
     } else {
         (format!("{:.1}%", t.cpu_pct), fmt_mem(t.mem_bytes))
     };
-    let row = Row::new(vec![
+    // Infra (databases/caches) gets a subtle category tag rather than a dimmed
+    // row — categorize it without making it look dead.
+    let command = match infra_tag(&t.command_label) {
+        Some(tag) => Cell::from(Line::from(vec![
+            Span::raw(t.command_label.clone()),
+            Span::styled(format!(" ·{tag}"), Style::new().fg(Color::DarkGray)),
+        ])),
+        None => Cell::from(t.command_label.clone()),
+    };
+    Row::new(vec![
         Cell::from(project),
-        Cell::from(t.command_label.clone()),
+        command,
         Cell::from(port),
         Cell::from(cpu),
         Cell::from(mem),
         Cell::from(fmt_uptime(t.anchor.start_time)),
         Cell::from(t.git_branch.clone().unwrap_or_else(|| "—".into())),
-    ]);
-    if is_infra(&t.command_label) {
-        row.style(Style::new().fg(Color::DarkGray))
-    } else {
-        row
-    }
+    ])
 }
 
 /// The target key behind an entry (`None` for a group header).
@@ -737,11 +741,14 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
     }
 }
 
-fn is_infra(label: &str) -> bool {
-    matches!(
-        label,
-        "postgres" | "redis" | "mysql" | "mongodb" | "memcached"
-    )
+/// A category tag for recognized infrastructure, so datastores/caches read as
+/// "supporting service" without dimming the row (which looks like "dead").
+fn infra_tag(label: &str) -> Option<&'static str> {
+    match label {
+        "postgres" | "mysql" | "mongodb" => Some("db"),
+        "redis" | "memcached" => Some("cache"),
+        _ => None,
+    }
 }
 
 fn fmt_uptime(start: u64) -> String {
@@ -921,6 +928,13 @@ mod tests {
             &Entry::Group("a".into()),
             &Entry::Group("b".into())
         ));
+    }
+
+    #[test]
+    fn infra_commands_get_a_category_tag() {
+        assert_eq!(infra_tag("postgres"), Some("db"));
+        assert_eq!(infra_tag("redis"), Some("cache"));
+        assert_eq!(infra_tag("vite"), None);
     }
 
     #[test]

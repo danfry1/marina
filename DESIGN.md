@@ -283,7 +283,7 @@ package.json is just one manifest among many. Inputs (macOS via
 - **JVM:** `gradle bootRun`, `spring-boot:run`, `java -jar`
 - **Elixir:** `mix phx.server` · **.NET:** `dotnet run/watch` · **PHP:** `php artisan serve`, `php -S`
 - **Local infra:** `postgres`, `redis-server`, `mysqld`, `mongod`, `memcached`
-  (listen on ports; labelled but visually de-emphasized as infra)
+  (listen on ports; shown with a `·db`/`·cache` category tag, not dimmed)
 
 **Typed, optional URL.** The `url` is rule-driven and carries a *scheme*, not just
 http: `http`/`https` (web servers), `postgres://`/`redis://`/`mysql://`
