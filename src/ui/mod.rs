@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -95,6 +95,7 @@ pub struct App {
     pending_kill: Option<PendingKill>,
     filter: String,
     filter_active: bool,
+    show_help: bool,
 }
 
 impl App {
@@ -113,7 +114,20 @@ impl App {
             pending_kill: None,
             filter: String::new(),
             filter_active: false,
+            show_help: false,
         }
+    }
+
+    // --- help overlay (`?`) -------------------------------------------------
+
+    pub fn help_open(&self) -> bool {
+        self.show_help
+    }
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+    pub fn close_help(&mut self) {
+        self.show_help = false;
     }
 
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
@@ -519,8 +533,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .block(block);
         frame.render_widget(hint, table_area);
     } else {
-        let header = Row::new(["PROJECT", "COMMAND", "PORT", "CPU", "MEM", "UP", "BRANCH"])
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        // Drop the rightmost columns (BRANCH, then UP) on narrow panes.
+        let cols = visible_columns(table_area.width);
+        let arrow = |m: SortMode| if app.sort == m { " ▾" } else { "" };
+        let head = [
+            "PROJECT".to_string(),
+            "COMMAND".to_string(),
+            format!("PORT{}", arrow(SortMode::Port)),
+            format!("CPU{}", arrow(SortMode::Cpu)),
+            format!("MEM{}", arrow(SortMode::Mem)),
+            "UP".to_string(),
+            "BRANCH".to_string(),
+        ];
+        let header = Row::new(
+            head[..cols]
+                .iter()
+                .cloned()
+                .map(Cell::from)
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         let by_key: HashMap<&TargetKey, &Target> =
             app.snapshot.targets.iter().map(|t| (&t.key, t)).collect();
         let rows: Vec<Row> = app
@@ -528,7 +560,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .iter()
             .map(|e| entry_row(e, &app.snapshot.targets, &by_key, &app.collapsed))
             .collect();
-        let widths = [
+        const WIDTHS: [Constraint; 7] = [
             Constraint::Length(22),
             Constraint::Length(16),
             Constraint::Length(7),
@@ -537,7 +569,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(6),
             Constraint::Length(15),
         ];
-        let table = Table::new(rows, widths)
+        let table = Table::new(rows, WIDTHS[..cols].to_vec())
             .header(header)
             .block(block)
             .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -579,11 +611,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         )
     } else {
         Line::styled(
-            "  j/k move · Enter fold · g/G · / filter · s sort · K kill · R restart · T tail · Y copy · O open · q",
+            "  j/k move · / filter · s sort · K kill · ? help · q quit",
             Style::new().fg(Color::DarkGray),
         )
     };
     frame.render_widget(footer, footer_area);
+
+    if app.show_help {
+        let lines = help_lines();
+        let area = centered_rect(46, lines.len() as u16 + 2, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" keys ")),
+            area,
+        );
+    }
 }
 
 fn detail_line(app: &App) -> Line<'static> {
@@ -754,6 +796,52 @@ fn infra_tag(label: &str) -> Option<&'static str> {
         "redis" | "memcached" => Some("cache"),
         _ => None,
     }
+}
+
+/// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
+fn visible_columns(width: u16) -> usize {
+    if width >= 92 {
+        7
+    } else if width >= 76 {
+        6
+    } else {
+        5
+    }
+}
+
+/// A `w`×`h` rectangle centered within `area` (clamped to it).
+fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let key = Style::new().fg(Color::Cyan);
+    let dim = Style::new().fg(Color::DarkGray);
+    let row = |k: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<9}"), key),
+            Span::styled(d.to_string(), dim),
+        ])
+    };
+    vec![
+        Line::from(""),
+        row("j / k", "move"),
+        row("g / G", "top / bottom"),
+        row("Enter", "fold / unfold group"),
+        row("s", "cycle sort (port/cpu/mem)"),
+        row("/", "filter"),
+        row("K · u", "kill · undo"),
+        row("R", "restart"),
+        row("T", "tail logs"),
+        row("Y · O", "copy URL · open"),
+        row("? · q", "this help · quit"),
+        Line::from(""),
+    ]
 }
 
 fn fmt_uptime(start: u64) -> String {
@@ -949,6 +1037,37 @@ mod tests {
         app.cycle_sort();
         // the new sort must apply immediately, not after the freeze window
         assert!(app.last_input.elapsed() >= FREEZE);
+    }
+
+    #[test]
+    fn visible_columns_drop_from_the_right_when_narrow() {
+        assert_eq!(visible_columns(120), 7);
+        assert_eq!(visible_columns(80), 6);
+        assert_eq!(visible_columns(60), 5);
+    }
+
+    #[test]
+    fn help_overlay_lists_the_keys() {
+        let mut app = app_with_sample();
+        app.toggle_help();
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("keys"));
+        assert!(out.contains("fold / unfold"));
+        assert!(out.contains("tail logs"));
+    }
+
+    #[test]
+    fn active_sort_marks_its_column_header() {
+        let mut app = app_with_sample();
+        app.sort = SortMode::Mem;
+        assert!(render_to_string(&mut app, 120, 20).contains("MEM ▾"));
+    }
+
+    #[test]
+    fn narrow_pane_drops_the_branch_column() {
+        let mut app = app_with_sample();
+        assert!(render_to_string(&mut app, 120, 20).contains("BRANCH"));
+        assert!(!render_to_string(&mut app, 64, 20).contains("BRANCH"));
     }
 
     #[test]

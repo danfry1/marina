@@ -55,6 +55,12 @@ Sleep 2s
 Escape
 Sleep 1s
 
+# the help overlay
+Type "?"
+Sleep 2500ms
+Escape
+Sleep 800ms
+
 # back to the top — leave the full cockpit on screen
 Type "g"
-Sleep 2500ms
+Sleep 2000ms

@@ -61,7 +61,10 @@ fn run(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if app.is_filtering() {
+                    if app.help_open() {
+                        // Any key dismisses the help overlay.
+                        app.close_help();
+                    } else if app.is_filtering() {
                         // Filter input mode captures keystrokes.
                         match key.code {
                             KeyCode::Esc => app.filter_cancel(),
@@ -80,6 +83,7 @@ fn run(
                             KeyCode::Enter => app.toggle_collapse(),
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
+                            KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Char('K') => verb_kill(app),
                             KeyCode::Char('u') => app.undo_kill(),
                             KeyCode::Char('R') => verb_restart(app),
