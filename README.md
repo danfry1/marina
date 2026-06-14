@@ -114,17 +114,28 @@ codes: `0` ok, `1` no match, `2` usage error.
 
 ## Use with AI agents
 
-The CLI is built to be driven by coding agents. Install the bundled
-[skill](skills/marina/SKILL.md) so your agent knows how to use it:
+The CLI is built to be driven by coding agents. The usage instructions are a
+single, **tool-neutral Markdown file** — [skills/marina/SKILL.md](skills/marina/SKILL.md)
+— that any agent can read. Wire it into whatever you use:
 
-```sh
-# Claude Code (personal skills directory)
-cp -r skills/marina ~/.claude/skills/marina
-```
+- **`AGENTS.md`** (opencode, Cursor, Zed, Gemini CLI, … — the cross-tool standard) —
+  append it to your project's (or global) `AGENTS.md`:
 
-Then ask things like *"what's running?"*, *"kill the client-portal project"*, or
-*"what's on :3000?"* and it'll drive `marina ls --json` / `marina kill <project>`.
-It's plain Markdown — adapt the path for other agent tools.
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/danfry1/marina/main/skills/marina/SKILL.md >> AGENTS.md
+  ```
+
+- **Claude Code** — drop it in your skills directory:
+
+  ```sh
+  mkdir -p ~/.claude/skills && cp -r skills/marina ~/.claude/skills/marina
+  ```
+
+- **Any other agent** — point it at the file, or paste its contents into the
+  agent's rules/context.
+
+Then ask *"what's running?"*, *"kill the client-portal project"*, or *"what's on
+:3000?"* and the agent drives `marina ls --json` / `marina kill <project>`.
 
 ## Config
 
