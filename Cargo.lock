@@ -757,7 +757,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "marina"
+name = "marina-tui"
 version = "0.1.0"
 dependencies = [
  "libproc",

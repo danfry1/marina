@@ -42,10 +42,10 @@ curl -L https://github.com/danfry1/marina/releases/latest/download/marina-aarch6
 ./marina
 ```
 
-**From crates.io:**
+**From crates.io** (package is `marina-tui`; the installed command is `marina`):
 
 ```sh
-cargo install marina
+cargo install marina-tui
 ```
 
 **From source:**

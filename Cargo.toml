@@ -1,5 +1,6 @@
 [package]
-name = "marina"
+# crates.io package id (the name `marina` is taken); the binary stays `marina`.
+name = "marina-tui"
 version = "0.1.0"
 edition = "2021"
 description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
@@ -10,6 +11,11 @@ homepage = "https://github.com/danfry1/marina"
 keywords = ["tui", "cli", "ports", "devtools", "process"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/demo", "/.github", "/docs"]
+
+# The installed binary is `marina` regardless of the package id.
+[[bin]]
+name = "marina"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30"          # rendering (diff buffer) + re-exports crossterm
