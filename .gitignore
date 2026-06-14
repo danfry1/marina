@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target
 
+# Nix build output symlinks
+/result
+/result-*
+
 # Editor / OS cruft
 **/*.rs.bk
 .DS_Store
