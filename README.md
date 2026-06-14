@@ -11,7 +11,7 @@ client-portal · next dev · :3000 · 340MB
 Not a system monitor (btop/bottom own that). Not an `lsof` wrapper. Ruthlessly
 developer-process-centric.
 
-![marina in action](demo/marina.gif)
+![marina in action](https://raw.githubusercontent.com/danfry1/marina/main/demo/marina.gif)
 
 > A marina is a harbour full of berthed boats — a cockpit of dev services each
 > occupying a port. `marina` enumerates what's listening, resolves each to a
