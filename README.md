@@ -54,6 +54,13 @@ curl -L https://github.com/danfry1/marina/releases/latest/download/marina-aarch6
 cargo install marina-tui
 ```
 
+**Nix** (flakes):
+
+```sh
+nix run github:danfry1/marina               # run without installing
+nix profile install github:danfry1/marina   # install
+```
+
 **From source:**
 
 ```sh
