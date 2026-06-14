@@ -10,7 +10,7 @@ repository = "https://github.com/danfry1/marina"
 homepage = "https://github.com/danfry1/marina"
 keywords = ["tui", "cli", "ports", "devtools", "process"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["/demo", "/.github", "/docs"]
+exclude = ["/demo", "/.github", "/docs", "/.agents"]
 
 # The installed binary is `marina` regardless of the package id.
 [[bin]]

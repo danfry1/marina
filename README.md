@@ -115,24 +115,17 @@ codes: `0` ok, `1` no match, `2` usage error.
 ## Use with AI agents
 
 The CLI is built to be driven by coding agents. The usage instructions are a
-single, **tool-neutral Markdown file** — [skills/marina/SKILL.md](skills/marina/SKILL.md)
-— that any agent can read. Wire it into whatever you use:
+tool-neutral Markdown skill — [.agents/skills/marina/SKILL.md](.agents/skills/marina/SKILL.md).
+Install it into your agent's skills directory:
 
-- **`AGENTS.md`** (opencode, Cursor, Zed, Gemini CLI, … — the cross-tool standard) —
-  append it to your project's (or global) `AGENTS.md`:
+```sh
+mkdir -p .agents/skills/marina        # or ~/.agents/skills/marina for every project
+curl -fsSL https://raw.githubusercontent.com/danfry1/marina/main/.agents/skills/marina/SKILL.md \
+  -o .agents/skills/marina/SKILL.md
+```
 
-  ```sh
-  curl -fsSL https://raw.githubusercontent.com/danfry1/marina/main/skills/marina/SKILL.md >> AGENTS.md
-  ```
-
-- **Claude Code** — drop it in your skills directory:
-
-  ```sh
-  mkdir -p ~/.claude/skills && cp -r skills/marina ~/.claude/skills/marina
-  ```
-
-- **Any other agent** — point it at the file, or paste its contents into the
-  agent's rules/context.
+Claude Code looks in `~/.claude/skills/` instead — same file, that path. For any
+other agent, point it at the file or load the directory however it discovers skills.
 
 Then ask *"what's running?"*, *"kill the client-portal project"*, or *"what's on
 :3000?"* and the agent drives `marina ls --json` / `marina kill <project>`.
