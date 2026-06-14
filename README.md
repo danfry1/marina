@@ -33,6 +33,12 @@ developer-process-centric.
 
 ## Install
 
+**Homebrew** (macOS / Linux):
+
+```sh
+brew install danfry1/tap/marina
+```
+
 **Prebuilt binary** — macOS (arm64/x64) and Linux (x64), from
 [Releases](https://github.com/danfry1/marina/releases/latest):
 
