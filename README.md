@@ -71,6 +71,18 @@ Runs on **macOS and Linux**. On Linux, `O` (open) uses `xdg-open` and `Y` (copy)
 uses `wl-copy`/`xclip`; accurate `phys_footprint` memory is macOS-only (Linux
 falls back to RSS).
 
+## Run it
+
+However you installed it, the command is **`marina`** (on your `PATH`):
+
+```sh
+marina        # launch the TUI — leave it open in a pane while you work
+marina ls     # or a one-shot list (add --json for scripts/agents)
+```
+
+No flags or config needed — it auto-discovers your running dev servers. Press
+`?` inside the TUI for the full key list.
+
 ## Usage
 
 **TUI** — `marina`
