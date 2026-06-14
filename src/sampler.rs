@@ -674,8 +674,20 @@ mod tests {
         use crate::sources::Listener;
         // a listener whose pid is marina's own pid (i.e. our session) is dropped
         let me = std::process::id();
-        let procs = vec![proc(me, Some(1), "node", "/Users/me/web", &["node", "server.js"])];
-        let mut s = sampler_with(vec![Listener { port: 4000, pid: me }], procs);
+        let procs = vec![proc(
+            me,
+            Some(1),
+            "node",
+            "/Users/me/web",
+            &["node", "server.js"],
+        )];
+        let mut s = sampler_with(
+            vec![Listener {
+                port: 4000,
+                pid: me,
+            }],
+            procs,
+        );
         assert_eq!(s.build().targets.len(), 0);
     }
 
