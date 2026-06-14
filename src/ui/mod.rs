@@ -134,7 +134,12 @@ impl App {
 
     pub fn cycle_sort(&mut self) {
         self.sort = self.sort.next();
-        self.last_input = Instant::now();
+        // A sort change is an explicit "reorder now" — push the navigation freeze
+        // into the past so the new order applies immediately (not after 2s).
+        self.last_input = self
+            .last_input
+            .checked_sub(FREEZE)
+            .unwrap_or(self.last_input);
     }
 
     // --- selection ----------------------------------------------------------
@@ -935,6 +940,15 @@ mod tests {
         assert_eq!(infra_tag("postgres"), Some("db"));
         assert_eq!(infra_tag("redis"), Some("cache"));
         assert_eq!(infra_tag("vite"), None);
+    }
+
+    #[test]
+    fn sort_change_bypasses_the_navigation_freeze() {
+        let mut app = app_with_sample();
+        app.last_input = Instant::now(); // pretend we just navigated (freeze active)
+        app.cycle_sort();
+        // the new sort must apply immediately, not after the freeze window
+        assert!(app.last_input.elapsed() >= FREEZE);
     }
 
     #[test]
