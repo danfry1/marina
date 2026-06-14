@@ -33,13 +33,30 @@ developer-process-centric.
 
 ## Install
 
+**Prebuilt binary** — macOS (arm64/x64) and Linux (x64), from
+[Releases](https://github.com/danfry1/marina/releases/latest):
+
 ```sh
-cargo build --release
-./target/release/marina
+# macOS (Apple silicon) — adjust the target for your platform
+curl -L https://github.com/danfry1/marina/releases/latest/download/marina-aarch64-apple-darwin.tar.gz | tar xz
+./marina
 ```
 
-macOS-first. Linux source adapters sit behind trait boundaries but aren't
-implemented yet.
+**From crates.io:**
+
+```sh
+cargo install marina
+```
+
+**From source:**
+
+```sh
+cargo build --release && ./target/release/marina
+```
+
+Runs on **macOS and Linux**. On Linux, `O` (open) uses `xdg-open` and `Y` (copy)
+uses `wl-copy`/`xclip`; accurate `phys_footprint` memory is macOS-only (Linux
+falls back to RSS).
 
 ## Usage
 
@@ -126,9 +143,9 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS-first · ~4k LOC · 47 tests. Docker container naming is implemented but
-pending live verification against a running daemon; restart env-capture and an
-MCP wrapper are future work.
+macOS + Linux · ~4k LOC · 55 tests (CI builds + tests on both). Docker container
+naming is implemented but pending live verification against a running daemon;
+restart env-capture and an MCP wrapper are future work.
 
 ## License
 

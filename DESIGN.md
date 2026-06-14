@@ -21,7 +21,8 @@ _Terminology is defined in [CONTEXT.md](./CONTEXT.md)._
 3. **First-class verbs.** One keystroke each on the selected row: kill, restart,
    tail logs inline, copy URL, open in browser. Vim-modal navigation.
 
-macOS-first, cross-platform-ish (Linux is a later target, behind trait boundaries).
+macOS + Linux (the data sources are cross-platform; `phys_footprint` and the
+`open`/clipboard verbs branch per-OS). CI builds and tests on both.
 
 ---
 
@@ -420,5 +421,5 @@ non-issue — rows for system stuff may just be opaque.
   re-execs argv in cwd with inherited env — fine for most `.env`/profile setups).
 - Docker: live verification + container cpu/mem (`docker stats`).
 - Two-cadence split (optional — adaptive single-path suffices today).
-- Terminal-focus-based idle backoff; Linux source impls;
+- Terminal-focus-based idle backoff;
   hybrid "expand a Target row to reveal the PID subtree" view.

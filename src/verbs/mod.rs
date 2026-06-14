@@ -115,17 +115,40 @@ pub fn respawn(argv: &[String], cwd: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Copy to the clipboard via the platform's tool: `pbcopy` on macOS, and
+/// `wl-copy` (Wayland) or `xclip` (X11) on Linux — whichever is present.
 pub fn copy_url(url: &str) -> std::io::Result<()> {
-    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(url.as_bytes())?;
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["pbcopy"]];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: &[&[&str]] = &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
+
+    for cmd in candidates {
+        let (prog, args) = cmd.split_first().expect("clipboard command not empty");
+        let mut c = Command::new(prog);
+        c.args(args).stdin(Stdio::piped());
+        if let Ok(mut child) = c.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(url.as_bytes())?;
+            }
+            child.wait()?;
+            return Ok(());
+        }
     }
-    child.wait()?;
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no clipboard tool found (pbcopy / wl-copy / xclip)",
+    ))
 }
 
+/// Open a URL in the default browser: `open` on macOS, `xdg-open` on Linux.
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    Command::new("open").arg(url).spawn()?;
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(opener).arg(url).spawn()?;
     Ok(())
 }
 

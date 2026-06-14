@@ -1,10 +1,15 @@
 [package]
 name = "marina"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/danfry1/marina"
+homepage = "https://github.com/danfry1/marina"
+keywords = ["tui", "cli", "ports", "devtools", "process"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/demo", "/.github", "/docs"]
 
 [dependencies]
 ratatui = "0.30"          # rendering (diff buffer) + re-exports crossterm
@@ -14,7 +19,7 @@ serde = { version = "1", features = ["derive"] } # config structs
 serde_json = "1"          # parse package.json name
 toml = "1.1"              # parse config + Cargo.toml / pyproject.toml name
 regex = "1"               # config rule matching
-libproc = "0.14"          # macOS phys_footprint (accurate memory)
 
-# Planned:
-# arc-swap = "1"            # atomic snapshot swap (currently Arc + mpsc)
+# macOS-only: accurate phys_footprint memory. On Linux marina falls back to RSS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
