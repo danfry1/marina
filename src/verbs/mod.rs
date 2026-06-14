@@ -76,20 +76,6 @@ fn survivors(pids: &[u32], captured: &HashMap<u32, u64>, now: &HashMap<u32, u64>
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn survivors_excludes_exited_and_recycled_pids() {
-        let pids = [10, 20, 30];
-        let captured = HashMap::from([(10, 100u64), (20, 200), (30, 300)]);
-        // 10 still same; 20 exited (absent); 30's number recycled (new start_time)
-        let now = HashMap::from([(10, 100u64), (30, 999)]);
-        assert_eq!(survivors(&pids, &captured, &now), vec![10]);
-    }
-}
-
 /// Current start_time per pid (the identity fingerprint). Missing = not running.
 fn start_times(pids: &[u32]) -> HashMap<u32, u64> {
     let wanted: Vec<Pid> = pids.iter().map(|&p| Pid::from_u32(p)).collect();
@@ -141,4 +127,18 @@ pub fn copy_url(url: &str) -> std::io::Result<()> {
 pub fn open_url(url: &str) -> std::io::Result<()> {
     Command::new("open").arg(url).spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn survivors_excludes_exited_and_recycled_pids() {
+        let pids = [10, 20, 30];
+        let captured = HashMap::from([(10, 100u64), (20, 200), (30, 300)]);
+        // 10 still same; 20 exited (absent); 30's number recycled (new start_time)
+        let now = HashMap::from([(10, 100u64), (30, 999)]);
+        assert_eq!(survivors(&pids, &captured, &now), vec![10]);
+    }
 }

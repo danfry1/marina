@@ -44,10 +44,7 @@ pub fn project_root(start: &Path) -> Option<PathBuf> {
 /// manifest name -> dir basename.
 pub fn project_name(root: &Path) -> String {
     name_from_manifest(root)
-        .or_else(|| {
-            root.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
+        .or_else(|| root.file_name().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "?".into())
 }
 
@@ -143,8 +140,23 @@ const TOOLS: &[(&str, &str)] = &[
 /// Launchers that are not themselves the interesting command — we look past them
 /// (usually into the process subtree) to find the real tool.
 const WRAPPERS: &[&str] = &[
-    "pnpm", "npm", "npx", "yarn", "bun", "node", "deno", "ts-node", "tsx", "dotenv", "dotenvx",
-    "cross-env", "concurrently", "turbo", "nx", "make", "env",
+    "pnpm",
+    "npm",
+    "npx",
+    "yarn",
+    "bun",
+    "node",
+    "deno",
+    "ts-node",
+    "tsx",
+    "dotenv",
+    "dotenvx",
+    "cross-env",
+    "concurrently",
+    "turbo",
+    "nx",
+    "make",
+    "env",
 ];
 
 fn strip_js(b: &str) -> &str {
@@ -209,7 +221,9 @@ fn single_label(argv: &[String]) -> String {
             return format!("{} {}", fb, basename(second));
         }
     }
-    argv.first().map(|a| basename(a)).unwrap_or_else(|| "?".into())
+    argv.first()
+        .map(|a| basename(a))
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Port-less watcher detection. Returns a label when argv looks like a watcher.
@@ -378,12 +392,7 @@ impl Resolver {
             watch_rules: cfg
                 .watch
                 .into_iter()
-                .filter_map(|w| {
-                    compile(&w.match_cmd).map(|re| WatchRule {
-                        re,
-                        label: w.label,
-                    })
-                })
+                .filter_map(|w| compile(&w.match_cmd).map(|re| WatchRule { re, label: w.label }))
                 .collect(),
             overrides: cfg
                 .overrides
@@ -462,8 +471,8 @@ impl Resolver {
         label: &mut String,
     ) {
         for o in &self.overrides {
-            let port_ok = o.port.map_or(true, |p| port == Some(p));
-            let cmd_ok = o.cmd.as_ref().map_or(true, |re| re.is_match(argv_joined));
+            let port_ok = o.port.is_none_or(|p| port == Some(p));
+            let cmd_ok = o.cmd.as_ref().is_none_or(|re| re.is_match(argv_joined));
             if port_ok && cmd_ok {
                 if let Some(p) = &o.project {
                     *project = p.clone();
@@ -474,6 +483,22 @@ impl Resolver {
                 return;
             }
         }
+    }
+}
+
+fn scheme_from_url(v: &str) -> UrlScheme {
+    if v.starts_with("https://") {
+        UrlScheme::Https
+    } else if v.starts_with("http://") {
+        UrlScheme::Http
+    } else if v.starts_with("postgres") {
+        UrlScheme::Postgres
+    } else if v.starts_with("redis") {
+        UrlScheme::Redis
+    } else if v.starts_with("mysql") {
+        UrlScheme::Mysql
+    } else {
+        UrlScheme::Other
     }
 }
 
@@ -542,9 +567,15 @@ mod tests {
             argv(&["node", "/x/node_modules/vite/bin/vite.js"]),
         ];
         assert_eq!(label_from_subtree(&tree), "vite");
-        assert_eq!(label_from_subtree(&[argv(&["node", "/x/.bin/next", "dev"])]), "next dev");
+        assert_eq!(
+            label_from_subtree(&[argv(&["node", "/x/.bin/next", "dev"])]),
+            "next dev"
+        );
         // unknown -> node-script fallback
-        assert_eq!(label_from_subtree(&[argv(&["node", "server.js"])]), "node server.js");
+        assert_eq!(
+            label_from_subtree(&[argv(&["node", "server.js"])]),
+            "node server.js"
+        );
     }
 
     #[test]
@@ -624,25 +655,8 @@ mod tests {
             overrides: vec![],
             groups: vec![],
         };
-        let (label, url) =
-            r.label_and_url(&[argv(&["node", "my-special-server.js"])], Some(8080));
+        let (label, url) = r.label_and_url(&[argv(&["node", "my-special-server.js"])], Some(8080));
         assert_eq!(label, "special");
         assert_eq!(url.unwrap().value, "http://localhost:8080/health");
-    }
-}
-
-fn scheme_from_url(v: &str) -> UrlScheme {
-    if v.starts_with("https://") {
-        UrlScheme::Https
-    } else if v.starts_with("http://") {
-        UrlScheme::Http
-    } else if v.starts_with("postgres") {
-        UrlScheme::Postgres
-    } else if v.starts_with("redis") {
-        UrlScheme::Redis
-    } else if v.starts_with("mysql") {
-        UrlScheme::Mysql
-    } else {
-        UrlScheme::Other
     }
 }

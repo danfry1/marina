@@ -38,7 +38,11 @@ SELECTOR:
 pub fn dispatch(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     let rest = &args[1..];
-    let selectors: Vec<&str> = rest.iter().map(|s| s.as_str()).filter(|s| !s.starts_with('-')).collect();
+    let selectors: Vec<&str> = rest
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.starts_with('-'))
+        .collect();
     let code = match cmd {
         "ls" => {
             ls(rest.iter().any(|a| a == "--json"));
@@ -109,11 +113,18 @@ fn ls(json: bool) {
         "PROJECT", "COMMAND", "PORT", "CPU", "MEM", "URL"
     );
     for t in &snap.targets {
-        let port = t.ports.first().map(|p| format!(":{p}")).unwrap_or_else(|| "—".into());
+        let port = t
+            .ports
+            .first()
+            .map(|p| format!(":{p}"))
+            .unwrap_or_else(|| "—".into());
         let (cpu, mem) = if t.pids.is_empty() {
             ("—".into(), "—".into())
         } else {
-            (format!("{:.1}%", t.cpu_pct), format!("{}MB", t.mem_bytes / (1024 * 1024)))
+            (
+                format!("{:.1}%", t.cpu_pct),
+                format!("{}MB", t.mem_bytes / (1024 * 1024)),
+            )
         };
         let url = t.url.as_ref().map(|u| u.value.as_str()).unwrap_or("");
         println!(
@@ -220,6 +231,34 @@ struct TargetJson {
     branch: Option<String>,
 }
 
+impl From<&Target> for TargetJson {
+    fn from(t: &Target) -> Self {
+        let measured = !t.pids.is_empty();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        TargetJson {
+            project: t.project.clone(),
+            command: t.command_label.clone(),
+            kind: match t.kind {
+                TargetKind::Listener => "listener",
+                TargetKind::Watched => "watched",
+            },
+            ports: t.ports.clone(),
+            url: t.url.as_ref().map(|u| u.value.clone()),
+            cpu_pct: measured.then_some(t.cpu_pct),
+            mem_bytes: measured.then_some(t.mem_bytes),
+            uptime_secs: (t.anchor.start_time != 0)
+                .then(|| now.saturating_sub(t.anchor.start_time)),
+            pids: t.pids.clone(),
+            anchor_pid: t.anchor.pid,
+            cwd: t.cwd.display().to_string(),
+            branch: t.git_branch.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +284,10 @@ mod tests {
             key: TargetKey::Port(5432),
             kind: TargetKind::Listener,
             ports: vec![5432],
-            anchor: Anchor { pid: 0, start_time: 0 },
+            anchor: Anchor {
+                pid: 0,
+                start_time: 0,
+            },
             anchor_argv: vec![],
             pids: vec![],
             project: "db".into(),
@@ -260,32 +302,5 @@ mod tests {
         assert_eq!(j.kind, "listener");
         assert!(j.cpu_pct.is_none() && j.mem_bytes.is_none() && j.uptime_secs.is_none());
         assert_eq!(j.ports, vec![5432]);
-    }
-}
-
-impl From<&Target> for TargetJson {
-    fn from(t: &Target) -> Self {
-        let measured = !t.pids.is_empty();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        TargetJson {
-            project: t.project.clone(),
-            command: t.command_label.clone(),
-            kind: match t.kind {
-                TargetKind::Listener => "listener",
-                TargetKind::Watched => "watched",
-            },
-            ports: t.ports.clone(),
-            url: t.url.as_ref().map(|u| u.value.clone()),
-            cpu_pct: measured.then_some(t.cpu_pct),
-            mem_bytes: measured.then_some(t.mem_bytes),
-            uptime_secs: (t.anchor.start_time != 0).then(|| now.saturating_sub(t.anchor.start_time)),
-            pids: t.pids.clone(),
-            anchor_pid: t.anchor.pid,
-            cwd: t.cwd.display().to_string(),
-            branch: t.git_branch.clone(),
-        }
     }
 }

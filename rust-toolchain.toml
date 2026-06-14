@@ -1,0 +1,5 @@
+# Pin the toolchain so local builds and CI use the exact same compiler +
+# components — reproducible builds. Bump deliberately when you want a newer Rust.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

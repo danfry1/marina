@@ -194,12 +194,18 @@ impl App {
     /// All targets the selection acts on: a whole group, or one target.
     pub fn selected_targets(&self) -> Vec<&Target> {
         match &self.selected {
-            Some(Entry::Group(p)) => {
-                self.snapshot.targets.iter().filter(|t| &t.project == p).collect()
-            }
-            Some(Entry::Member(k)) | Some(Entry::Target(k)) => {
-                self.snapshot.targets.iter().filter(|t| &t.key == k).collect()
-            }
+            Some(Entry::Group(p)) => self
+                .snapshot
+                .targets
+                .iter()
+                .filter(|t| &t.project == p)
+                .collect(),
+            Some(Entry::Member(k)) | Some(Entry::Target(k)) => self
+                .snapshot
+                .targets
+                .iter()
+                .filter(|t| &t.key == k)
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -299,7 +305,10 @@ impl App {
             Some(path) => {
                 let stop = Arc::new(AtomicBool::new(false));
                 let rx = crate::logs::tail(path.clone(), Arc::clone(&stop));
-                self.set_status(format!("tailing {name} · {}", tildify(&path.display().to_string())));
+                self.set_status(format!(
+                    "tailing {name} · {}",
+                    tildify(&path.display().to_string())
+                ));
                 self.log = Some(LogView {
                     path,
                     lines: VecDeque::new(),
@@ -374,7 +383,11 @@ impl App {
 
         match self.sort {
             SortMode::Port => grouped.sort_by(|a, b| {
-                let mp = |m: &[usize]| m.iter().filter_map(|&i| targets[i].ports.iter().min().copied()).min();
+                let mp = |m: &[usize]| {
+                    m.iter()
+                        .filter_map(|&i| targets[i].ports.iter().min().copied())
+                        .min()
+                };
                 match (mp(&a.1), mp(&b.1)) {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -384,7 +397,9 @@ impl App {
             }),
             SortMode::Cpu => grouped.sort_by(|a, b| {
                 let s = |m: &[usize]| m.iter().map(|&i| targets[i].cpu_pct).sum::<f32>();
-                s(&b.1).partial_cmp(&s(&a.1)).unwrap_or(std::cmp::Ordering::Equal)
+                s(&b.1)
+                    .partial_cmp(&s(&a.1))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }),
             SortMode::Mem => grouped.sort_by(|a, b| {
                 let s = |m: &[usize]| m.iter().map(|&i| targets[i].mem_bytes).sum::<u64>();
@@ -442,7 +457,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .selected
         .as_ref()
         .and_then(|s| app.display.iter().position(|e| same_entry(e, s)))
-        .or(if app.display.is_empty() { None } else { Some(0) });
+        .or(if app.display.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     app.selected = idx.map(|i| app.display[i].clone());
     app.table_state.select(idx);
 
@@ -455,7 +474,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ]
     } else {
-        vec![Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]
+        vec![
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
     };
     let chunks = Layout::vertical(constraints).split(frame.area());
     let table_area = chunks[0];
@@ -523,8 +546,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let (Some(area), Some(l)) = (log_area, app.log.as_ref()) {
         let inner_h = area.height.saturating_sub(2) as usize;
         let start = l.lines.len().saturating_sub(inner_h);
-        let text: Vec<Line> = l.lines.iter().skip(start).map(|s| Line::from(s.clone())).collect();
-        let title = format!(" logs: {} — Esc to close ", tildify(&l.path.display().to_string()));
+        let text: Vec<Line> = l
+            .lines
+            .iter()
+            .skip(start)
+            .map(|s| Line::from(s.clone()))
+            .collect();
+        let title = format!(
+            " logs: {} — Esc to close ",
+            tildify(&l.path.display().to_string())
+        );
         let para = Paragraph::new(text).block(Block::bordered().title(title));
         frame.render_widget(para, area);
     }
@@ -553,10 +584,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn detail_line(app: &App) -> Line<'static> {
     match &app.selected {
         Some(Entry::Group(p)) => {
-            let members: Vec<&Target> =
-                app.snapshot.targets.iter().filter(|t| &t.project == p).collect();
-            let cpu: f32 = members.iter().filter(|t| !t.pids.is_empty()).map(|t| t.cpu_pct).sum();
-            let mem: u64 = members.iter().filter(|t| !t.pids.is_empty()).map(|t| t.mem_bytes).sum();
+            let members: Vec<&Target> = app
+                .snapshot
+                .targets
+                .iter()
+                .filter(|t| &t.project == p)
+                .collect();
+            let cpu: f32 = members
+                .iter()
+                .filter(|t| !t.pids.is_empty())
+                .map(|t| t.cpu_pct)
+                .sum();
+            let mem: u64 = members
+                .iter()
+                .filter(|t| !t.pids.is_empty())
+                .map(|t| t.mem_bytes)
+                .sum();
             Line::styled(
                 format!(
                     "  {} · {} services · {:.1}% · {} · K kills all",
@@ -599,8 +642,16 @@ fn entry_row(
     match entry {
         Entry::Group(p) => {
             let members: Vec<&Target> = targets.iter().filter(|t| &t.project == p).collect();
-            let cpu: f32 = members.iter().filter(|t| !t.pids.is_empty()).map(|t| t.cpu_pct).sum();
-            let mem: u64 = members.iter().filter(|t| !t.pids.is_empty()).map(|t| t.mem_bytes).sum();
+            let cpu: f32 = members
+                .iter()
+                .filter(|t| !t.pids.is_empty())
+                .map(|t| t.cpu_pct)
+                .sum();
+            let mem: u64 = members
+                .iter()
+                .filter(|t| !t.pids.is_empty())
+                .map(|t| t.mem_bytes)
+                .sum();
             let arrow = if collapsed.contains(p) { "▸" } else { "▾" };
             Row::new(vec![
                 Cell::from(format!("{arrow} {p} ({})", members.len())),
@@ -687,7 +738,10 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
 }
 
 fn is_infra(label: &str) -> bool {
-    matches!(label, "postgres" | "redis" | "mysql" | "mongodb" | "memcached")
+    matches!(
+        label,
+        "postgres" | "redis" | "mysql" | "mongodb" | "memcached"
+    )
 }
 
 fn fmt_uptime(start: u64) -> String {
@@ -768,7 +822,13 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|e| matches!(e, Entry::Group(p) if p == "billing-api")));
-        assert!(entries.iter().filter(|e| matches!(e, Entry::Member(_))).count() >= 2);
+        assert!(
+            entries
+                .iter()
+                .filter(|e| matches!(e, Entry::Member(_)))
+                .count()
+                >= 2
+        );
     }
 
     #[test]
@@ -779,7 +839,13 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| matches!(e, Entry::Group(p) if p == "client-portal")));
-        assert_eq!(entries.iter().filter(|e| matches!(e, Entry::Member(_))).count(), 0);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(e, Entry::Member(_)))
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -847,8 +913,14 @@ mod tests {
     #[test]
     fn selection_matches_target_and_member_by_key() {
         let k = TargetKey::Port(3000);
-        assert!(same_entry(&Entry::Target(k.clone()), &Entry::Member(k.clone())));
-        assert!(!same_entry(&Entry::Group("a".into()), &Entry::Group("b".into())));
+        assert!(same_entry(
+            &Entry::Target(k.clone()),
+            &Entry::Member(k.clone())
+        ));
+        assert!(!same_entry(
+            &Entry::Group("a".into()),
+            &Entry::Group("b".into())
+        ));
     }
 
     #[test]

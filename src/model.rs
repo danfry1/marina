@@ -106,7 +106,10 @@ impl Snapshot {
             },
             kind,
             ports: port.into_iter().collect(),
-            anchor: Anchor { pid: 0, start_time: 0 },
+            anchor: Anchor {
+                pid: 0,
+                start_time: 0,
+            },
             anchor_argv: vec![],
             pids: vec![],
             project: project.into(),
@@ -126,19 +129,54 @@ impl Snapshot {
         Snapshot {
             seq: 0,
             targets: vec![
-                t("client-portal", "next dev", Some(3000), 3.4, 340, http(3000), TargetKind::Listener),
-                t("billing-api", "uvicorn", Some(8000), 1.1, 96, http(8000), TargetKind::Listener),
-                t("worker", "celery", Some(5555), 0.4, 72, http(5555), TargetKind::Listener),
+                t(
+                    "client-portal",
+                    "next dev",
+                    Some(3000),
+                    3.4,
+                    340,
+                    http(3000),
+                    TargetKind::Listener,
+                ),
+                t(
+                    "billing-api",
+                    "uvicorn",
+                    Some(8000),
+                    1.1,
+                    96,
+                    http(8000),
+                    TargetKind::Listener,
+                ),
+                t(
+                    "worker",
+                    "celery",
+                    Some(5555),
+                    0.4,
+                    72,
+                    http(5555),
+                    TargetKind::Listener,
+                ),
                 t(
                     "client-portal",
                     "postgres",
                     Some(5432),
                     0.2,
                     410,
-                    Some(Url { scheme: UrlScheme::Postgres, value: "postgres://localhost:5432".into() }),
+                    Some(Url {
+                        scheme: UrlScheme::Postgres,
+                        value: "postgres://localhost:5432".into(),
+                    }),
                     TargetKind::Listener,
                 ),
-                t("design-system", "tsc --watch", None, 0.8, 188, None, TargetKind::Watched),
+                t(
+                    "design-system",
+                    "tsc --watch",
+                    None,
+                    0.8,
+                    188,
+                    None,
+                    TargetKind::Watched,
+                ),
             ],
         }
     }
@@ -159,7 +197,11 @@ mod tests {
     #[test]
     fn sample_has_a_multi_target_project() {
         let snap = Snapshot::sample();
-        let portal = snap.targets.iter().filter(|t| t.project == "client-portal").count();
+        let portal = snap
+            .targets
+            .iter()
+            .filter(|t| t.project == "client-portal")
+            .count();
         assert_eq!(portal, 2); // next dev + postgres — exercises grouping
     }
 }

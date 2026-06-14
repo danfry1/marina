@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use netstat2::{
-    get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState,
-};
+use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// A listening TCP socket mapped to the PID that holds it.
@@ -151,7 +149,10 @@ mod tests {
     fn sysinfo_sees_our_own_process() {
         let mut p = SysinfoProcs::new();
         p.refresh();
-        let me = p.procs().get(&std::process::id()).expect("our pid should exist");
+        let me = p
+            .procs()
+            .get(&std::process::id())
+            .expect("our pid should exist");
         assert!(!me.name.is_empty());
         assert!(me.start_time > 0);
         assert!(!me.argv.is_empty());

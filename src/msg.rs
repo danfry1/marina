@@ -17,7 +17,10 @@ pub enum UiMsg {
     SetFocused(bool),
     /// e.g. right after a verb, to reflect it quickly.
     RequestRefresh,
-    Verb { target: TargetKey, verb: Verb },
+    Verb {
+        target: TargetKey,
+        verb: Verb,
+    },
     Shutdown,
 }
 

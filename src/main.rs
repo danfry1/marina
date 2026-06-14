@@ -27,7 +27,10 @@ fn main() -> std::io::Result<()> {
         return dump();
     }
     if let Some(pos) = std::env::args().position(|a| a == "--logtest") {
-        let pids: Vec<u32> = std::env::args().skip(pos + 1).filter_map(|a| a.parse().ok()).collect();
+        let pids: Vec<u32> = std::env::args()
+            .skip(pos + 1)
+            .filter_map(|a| a.parse().ok())
+            .collect();
         return logtest(pids);
     }
 

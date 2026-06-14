@@ -21,8 +21,20 @@ use crate::resolve;
 use crate::sources::{Netstat2Ports, PortSource, ProcInfo, ProcSource, SysinfoProcs};
 
 const NON_DEV_PARENTS: &[&str] = &[
-    "zsh", "-zsh", "bash", "-bash", "sh", "fish", "tmux", "tmux: server", "login", "sshd", "ssh",
-    "init", "launchd", "systemd",
+    "zsh",
+    "-zsh",
+    "bash",
+    "-bash",
+    "sh",
+    "fish",
+    "tmux",
+    "tmux: server",
+    "login",
+    "sshd",
+    "ssh",
+    "init",
+    "launchd",
+    "systemd",
 ];
 
 type RootCache = HashMap<PathBuf, Option<PathBuf>>;
@@ -78,10 +90,7 @@ impl Sampler {
                     docker_ports.insert(l.port);
                     continue;
                 }
-                let root = p
-                    .cwd
-                    .as_deref()
-                    .and_then(|c| root_of(c, &mut root_cache));
+                let root = p.cwd.as_deref().and_then(|c| root_of(c, &mut root_cache));
                 if !is_dev_target(p.cwd.as_deref(), root.as_deref(), home.as_deref()) {
                     continue;
                 }
@@ -154,7 +163,9 @@ impl Sampler {
                 if claimed.contains(&p.pid) || resolve::is_shell(&p.name) {
                     continue;
                 }
-                let Some(label) = self.resolver.watcher_label(&p.argv) else { continue };
+                let Some(label) = self.resolver.watcher_label(&p.argv) else {
+                    continue;
+                };
                 let root = p.cwd.as_deref().and_then(|c| root_of(c, &mut root_cache));
                 let cwd = p.cwd.clone().unwrap_or_default();
                 let mut project = project_name(root.as_deref(), &cwd, &mut name_cache);
@@ -222,7 +233,10 @@ impl Sampler {
                             key: TargetKey::Port(port),
                             kind: TargetKind::Listener,
                             ports: vec![port],
-                            anchor: Anchor { pid: 0, start_time: 0 },
+                            anchor: Anchor {
+                                pid: 0,
+                                start_time: 0,
+                            },
                             anchor_argv: Vec::new(),
                             pids: Vec::new(),
                             project,
@@ -474,8 +488,20 @@ mod tests {
         // worker(300) -> next dev(200) in apps/web -> turbo(100) at repo root.
         let procs = map(vec![
             proc(100, Some(1), "turbo", "/repo", &["turbo", "run", "dev"]),
-            proc(200, Some(100), "node", "/repo/apps/web", &["node", "next", "dev"]),
-            proc(300, Some(200), "node", "/repo/apps/web", &["node", "worker"]),
+            proc(
+                200,
+                Some(100),
+                "node",
+                "/repo/apps/web",
+                &["node", "next", "dev"],
+            ),
+            proc(
+                300,
+                Some(200),
+                "node",
+                "/repo/apps/web",
+                &["node", "worker"],
+            ),
         ]);
         // anchors at next dev, NOT at the shared turbo parent (cwd leaves the root)
         assert_eq!(climb(300, &procs, Some(Path::new("/repo/apps/web"))), 200);
@@ -485,7 +511,13 @@ mod tests {
     fn climb_stops_at_a_shell_parent() {
         let procs = map(vec![
             proc(700, Some(1), "zsh", "/repo/apps/web", &["-zsh"]),
-            proc(600, Some(700), "node", "/repo/apps/web", &["node", "next", "dev"]),
+            proc(
+                600,
+                Some(700),
+                "node",
+                "/repo/apps/web",
+                &["node", "next", "dev"],
+            ),
         ]);
         assert_eq!(climb(600, &procs, Some(Path::new("/repo/apps/web"))), 600);
     }
@@ -530,8 +562,16 @@ mod tests {
     #[test]
     fn curation_keeps_dev_drops_system() {
         let home = Some(Path::new("/Users/me"));
-        assert!(is_dev_target(Some(Path::new("/Users/me/dev/x")), None, home)); // under $HOME
-        assert!(is_dev_target(Some(Path::new("/opt/x")), Some(Path::new("/opt/x")), home)); // has root
+        assert!(is_dev_target(
+            Some(Path::new("/Users/me/dev/x")),
+            None,
+            home
+        )); // under $HOME
+        assert!(is_dev_target(
+            Some(Path::new("/opt/x")),
+            Some(Path::new("/opt/x")),
+            home
+        )); // has root
         assert!(!is_dev_target(Some(Path::new("/")), None, home)); // system daemon
     }
 
@@ -581,7 +621,13 @@ mod tests {
             "/Users/me/web",
             &["node", "/x/.bin/vite", "dev"],
         )];
-        let mut s = sampler_with(vec![Listener { port: 3000, pid: 200 }], procs);
+        let mut s = sampler_with(
+            vec![Listener {
+                port: 3000,
+                pid: 200,
+            }],
+            procs,
+        );
         let snap = s.build();
         assert_eq!(snap.targets.len(), 1);
         let t = &snap.targets[0];
@@ -596,7 +642,13 @@ mod tests {
         use crate::sources::Listener;
         // cwd "/" with no project root, not under $HOME -> filtered out
         let procs = vec![proc(50, Some(1), "rapportd", "/", &["/usr/sbin/rapportd"])];
-        let mut s = sampler_with(vec![Listener { port: 50555, pid: 50 }], procs);
+        let mut s = sampler_with(
+            vec![Listener {
+                port: 50555,
+                pid: 50,
+            }],
+            procs,
+        );
         assert_eq!(s.build().targets.len(), 0);
     }
 }

@@ -63,7 +63,7 @@ fn in_dir(cwd: &Path) -> Option<PathBuf> {
             Some((mtime, p))
         })
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    logs.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
     logs.into_iter().next().map(|(_, p)| p)
 }
 
@@ -74,17 +74,14 @@ fn pm2_log(project: &str) -> Option<PathBuf> {
     }
     let dir = PathBuf::from(std::env::var_os("HOME")?).join(".pm2/logs");
     let entries = std::fs::read_dir(dir).ok()?;
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            name.contains(project) && name.contains("out")
-        })
+    entries.flatten().map(|e| e.path()).find(|p| {
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        name.contains(project) && name.contains("out")
+    })
 }
 
 fn has_log_ext(p: &Path) -> bool {
-    p.extension().map_or(false, |e| e == "log")
+    p.extension().is_some_and(|e| e == "log")
 }
 
 fn is_logish(p: &Path) -> bool {
