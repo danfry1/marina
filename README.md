@@ -11,6 +11,8 @@ client-portal · next dev · :3000 · 340MB
 Not a system monitor (btop/bottom own that). Not an `lsof` wrapper. Ruthlessly
 developer-process-centric.
 
+![marina in action](demo/marina.gif)
+
 > A marina is a harbour full of berthed boats — a cockpit of dev services each
 > occupying a port. `marina` enumerates what's listening, resolves each to a
 > project / tool / URL, groups them, and lets you act on them with one keystroke.
@@ -104,7 +106,9 @@ marina is deliberately boring on this front:
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
   ever inspects your own user's processes — system/root daemons and anything
   outside `$HOME` are filtered out (and the OS wouldn't let it read others
-  anyway). It's the same class of introspection `ps`, `lsof`, and your IDE already do.
+  anyway). It also never lists the session it runs in (your shell / terminal /
+  `ssh`), so you can't accidentally kill your own connection. It's the same class
+  of introspection `ps`, `lsof`, and your IDE already do.
 - **What it reads:** a process's `cwd`, argv, cpu/memory; the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via

@@ -79,12 +79,18 @@ impl Sampler {
             let procs = self.procs.procs();
             let children = child_map(procs);
             let listeners = self.ports.listeners();
+            // Never list the session marina runs inside (its own ancestor chain:
+            // shell, terminal/ttyd, sshd, …) — you'd never want to kill that.
+            let own = ancestors(std::process::id(), procs);
 
             // Group listener ports by their (boundary-bounded) anchor.
             let mut by_anchor: HashMap<u32, AnchorAgg> = HashMap::new();
             let mut docker_ports: HashSet<u16> = HashSet::new();
             for l in &listeners {
                 let Some(p) = procs.get(&l.pid) else { continue };
+                if own.contains(&l.pid) {
+                    continue; // marina's own session, not a target
+                }
                 // Ports bound by the docker host proxy are resolved via `docker ps`.
                 if crate::docker::is_binder(&p.name) {
                     docker_ports.insert(l.port);
@@ -160,7 +166,7 @@ impl Sampler {
             // by a listener subtree (subtree absorption — ADR 0001).
             let mut watched: HashMap<(String, String, PathBuf), WatchAgg> = HashMap::new();
             for p in procs.values() {
-                if claimed.contains(&p.pid) || resolve::is_shell(&p.name) {
+                if claimed.contains(&p.pid) || resolve::is_shell(&p.name) || own.contains(&p.pid) {
                     continue;
                 }
                 let Some(label) = self.resolver.watcher_label(&p.argv) else {
@@ -391,6 +397,19 @@ fn subtree_argvs(pids: &[u32], procs: &HashMap<u32, ProcInfo>) -> Vec<Vec<String
     pids.iter()
         .filter_map(|pid| procs.get(pid).map(|p| p.argv.clone()))
         .collect()
+}
+
+/// `start` plus its ancestor pids, walking up `ppid` (cycle-guarded).
+fn ancestors(start: u32, procs: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
+    let mut set = HashSet::new();
+    let mut cur = start;
+    while set.insert(cur) {
+        match procs.get(&cur).and_then(|p| p.ppid) {
+            Some(pp) if pp != 0 => cur = pp,
+            _ => break,
+        }
+    }
+    set
 }
 
 fn child_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>> {
@@ -635,6 +654,29 @@ mod tests {
         assert_eq!(t.command_label, "vite"); // subtree label resolution
         assert_eq!(t.project, "web"); // cwd basename fallback
         assert!(t.url.as_ref().map(|u| u.value.as_str()) == Some("http://localhost:3000"));
+    }
+
+    #[test]
+    fn ancestors_walks_the_parent_chain() {
+        let procs = map(vec![
+            proc(1, None, "launchd", "/", &[]),
+            proc(50, Some(1), "sshd", "/", &[]),
+            proc(60, Some(50), "zsh", "/Users/me", &[]),
+            proc(70, Some(60), "marina", "/Users/me", &[]),
+        ]);
+        let set = ancestors(70, &procs);
+        assert!(set.contains(&70) && set.contains(&60) && set.contains(&50) && set.contains(&1));
+        assert!(!set.contains(&999));
+    }
+
+    #[test]
+    fn build_excludes_marinas_own_session() {
+        use crate::sources::Listener;
+        // a listener whose pid is marina's own pid (i.e. our session) is dropped
+        let me = std::process::id();
+        let procs = vec![proc(me, Some(1), "node", "/Users/me/web", &["node", "server.js"])];
+        let mut s = sampler_with(vec![Listener { port: 4000, pid: me }], procs);
+        assert_eq!(s.build().targets.len(), 0);
     }
 
     #[test]
