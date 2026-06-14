@@ -31,7 +31,7 @@ jobs:
       - name: Package
         run: tar -C "target/${{ matrix.target }}/release" -czf "marina-${{ matrix.target }}.tar.gz" marina
       - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           files: marina-${{ matrix.target }}.tar.gz
 
@@ -45,7 +45,7 @@ jobs:
       id-token: write # mint the short-lived OIDC token; no stored secret
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1
         id: auth
       - run: cargo publish --locked
         env:
