@@ -20,12 +20,21 @@ developer-process-centric.
 ## Features
 
 - **Live, stable TUI** — grouped by project; no flicker, no cursor-jump while you
-  navigate, idles near-zero CPU when nothing changes.
+  navigate, and it only redraws when something changed — an idle cockpit does
+  near-zero work. Mouse works too (click to select, click a header to sort,
+  wheel to move / scroll logs).
 - **Smart resolution** — infers project + tool from cwd, argv, package manifests
-  (package.json / Cargo.toml / pyproject / go.mod / …) and git; sees through
-  `pnpm`/`npm`/`yarn`/`node` wrappers (`pnpm dev` → `vite`).
-- **First-class verbs** — kill (SIGTERM→SIGKILL escalation with undo), restart,
-  tail logs inline, copy URL, open in browser.
+  (package.json / Cargo.toml / pyproject / go.mod / …) and git (worktrees and
+  detached HEADs included); sees through `pnpm`/`npm`/`yarn`/`node` wrappers
+  (`pnpm dev` → `vite`).
+- **First-class verbs** — kill (fingerprint-verified SIGTERM→SIGKILL escalation,
+  `u` cancels the force-kill), restart (waits for the port to free, captures the
+  new process's output to a log), tail logs inline, copy URL, open in browser.
+  Docker rows stop/restart/tail via the docker CLI.
+- **Honest signals** — rows flash green when they appear, turn red while dying,
+  and if a long-running server vanishes *without* you killing it, marina says so
+  (`⚠ client-portal (:3000) exited unexpectedly`). A `:3000!` port badge warns
+  when a server is bound to `0.0.0.0` (reachable from your LAN).
 - **Grouping** — a project's services collapse under one header, and one keystroke
   kills the whole project. Declared groups bundle an app with its database.
 - **Agent/script CLI** — `marina ls --json`, `marina kill <project>`, sharing the
@@ -89,28 +98,34 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 
 | key | action |
 |---|---|
-| `j` / `k`, `g` / `G` | move / jump to top·bottom |
+| `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a project group |
-| `/` | filter (project / command / port) |
-| `s` | cycle sort (port / cpu / mem) |
-| `K` · `u` | kill selection · undo |
-| `R` · `T` | restart · tail logs |
+| `i` | inspect the selection (command, ports, cwd, pids) |
+| `/` | filter (project / command / port / cwd / branch) |
+| `s` | cycle sort (port / cpu / mem) — or click a column header |
+| `K` · `u` | kill selection · cancel the pending force-kill |
+| `R` · `T` | restart (output captured to a log) · tail logs |
+| `[` / `]`, `+` / `-` | scroll / resize the log pane |
 | `Y` · `O` | copy URL · open in browser |
-| `q` | quit |
+| `Esc` | close pane / clear filter |
+| `q` / `Ctrl+C` | quit |
 
-`K`/`R` on a group header act on the whole project.
+`K`/`R` on a group header act on the whole project. Docker rows map to
+`docker stop` / `docker restart` / `docker logs -f`.
 
 **CLI** (for scripts and agents)
 
 ```sh
-marina ls [--json]            # the snapshot — table, or a stable JSON contract
+marina ls [sel…] [--json]     # the snapshot — table, or a stable JSON contract
 marina kill <selector>        # project name, port (3000 / :3000), or command
-marina restart <selector>
-marina url <selector>
+marina restart <selector>     # output captured to ~/.local/state/marina/logs/
+marina url <selector> [--json]
+marina version
 ```
 
 A selector matching a project name acts on **every** service under it. Exit
-codes: `0` ok, `1` no match, `2` usage error.
+codes: `0` ok, `1` no match, `2` usage error — and unknown commands/flags are
+errors, they never fall through to the TUI.
 
 ## Use with AI agents
 
@@ -132,7 +147,7 @@ Then ask *"what's running?"*, *"kill the client-portal project"*, or *"what's on
 
 ## Config
 
-Optional `~/.config/marina/config.toml`:
+Optional `~/.config/marina/config.toml` (respects `$XDG_CONFIG_HOME`):
 
 ```toml
 [[rule]]                       # classify a command -> label (+ optional URL)
@@ -151,6 +166,9 @@ project    = "client-portal"
 [[group]]                      # bundle services that don't share a cwd (app + db)
 name    = "client-portal"
 members = [3000, 5432, "worker"]
+
+[[ignore]]                     # hide noise the heuristics keep picking up
+match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 ```
 
 ## Privacy & security
@@ -161,8 +179,11 @@ marina is deliberately boring on this front:
   the dependency tree, and no code that opens a connection. No telemetry, no
   phone-home, no data leaves your machine. (`netstat2`/`libproc` *read* the OS's
   socket and process tables locally; `mio` polls the terminal for keystrokes.)
-- **Nothing is persisted.** marina reads, displays, and forgets. The only optional
-  file it *reads* is `~/.config/marina/config.toml`; it writes nothing.
+- **Almost nothing is persisted.** marina reads, displays, and forgets. The only
+  optional file it *reads* is `~/.config/marina/config.toml`. The one write is
+  user-triggered: when **you** restart a process (`R` / `marina restart`), the
+  new process's stdout/stderr is captured to
+  `~/.local/state/marina/logs/<project>.log` so `T` can always tail it.
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
   ever inspects your own user's processes — system/root daemons and anything
   outside `$HOME` are filtered out (and the OS wouldn't let it read others
@@ -175,7 +196,8 @@ marina is deliberately boring on this front:
   `lsof`) and the discovered log file.
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
-  `ls --json` show only derived labels (`next dev`, `vite`). argv is used for
+  `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
+  panel shows just the program path and an arg count. argv is used for
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes.
@@ -186,9 +208,10 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~4k LOC · 55 tests (CI builds + tests on both). Docker container
-naming is implemented but pending live verification against a running daemon;
-restart env-capture and an MCP wrapper are future work.
+macOS + Linux · ~6k LOC · 84 tests (CI builds + tests on both). Docker container
+naming + verbs are implemented but pending live verification against a running
+daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
+wrapper are future work.
 
 ## License
 

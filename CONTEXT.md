@@ -67,4 +67,21 @@
   and its database — selected by port / project / command.
 
 - **View state** — UI-thread-only state that survives snapshot swaps: selection
-  key, scroll offset, active sort, open log pane, modal mode.
+  key, scroll offset, active sort, open log/inspect pane, modal mode, pending
+  kill, row-flash timers.
+
+- **Exposed** — a listener bound to a non-loopback address (`0.0.0.0` / `::`),
+  i.e. reachable from the LAN. Rendered as a red `:3000!` badge; `exposed` in
+  the JSON.
+
+- **Ignore rule** — a config `[[ignore]]` entry (by port and/or command regex)
+  that hides a target the curation heuristics keep surfacing. The complement of
+  a watch rule.
+
+- **Dying row** — a target inside an active kill grace window (SIGTERM sent,
+  SIGKILL pending, `u` still cancels the escalation), rendered struck-through
+  in red until the window closes.
+
+- **Inspect panel** — the `i` pane showing everything about the selection that
+  doesn't fit a row: program + arg count (never raw argv), all ports, url, cwd,
+  branch, pid count, container. Follows the cursor.

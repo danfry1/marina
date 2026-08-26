@@ -11,6 +11,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 pub struct Listener {
     pub port: u16,
     pub pid: u32,
+    /// Bound to a non-loopback address (0.0.0.0 / ::) — reachable from the LAN.
+    pub exposed: bool,
 }
 
 /// Per-process facts needed for rollup + resolution.
@@ -27,8 +29,9 @@ pub struct ProcInfo {
 }
 
 /// Listening socket -> PID. macOS via `netstat2`; Linux impl later.
+/// An `Err` is surfaced in the UI — never silently rendered as "no targets".
 pub trait PortSource {
-    fn listeners(&mut self) -> Vec<Listener>;
+    fn listeners(&mut self) -> Result<Vec<Listener>, String>;
 }
 
 /// Process facts: cpu/mem/cwd/argv/parent. macOS via `sysinfo`, which also
@@ -43,25 +46,25 @@ pub trait ProcSource {
 pub struct Netstat2Ports;
 
 impl PortSource for Netstat2Ports {
-    fn listeners(&mut self) -> Vec<Listener> {
+    fn listeners(&mut self) -> Result<Vec<Listener>, String> {
         let af = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
         let proto = ProtocolFlags::TCP;
+        let sockets = get_sockets_info(af, proto).map_err(|e| format!("port scan failed: {e}"))?;
         let mut out = Vec::new();
-        if let Ok(sockets) = get_sockets_info(af, proto) {
-            for si in sockets {
-                if let ProtocolSocketInfo::Tcp(tcp) = si.protocol_socket_info {
-                    if tcp.state == TcpState::Listen {
-                        for pid in si.associated_pids {
-                            out.push(Listener {
-                                port: tcp.local_port,
-                                pid,
-                            });
-                        }
+        for si in sockets {
+            if let ProtocolSocketInfo::Tcp(tcp) = si.protocol_socket_info {
+                if tcp.state == TcpState::Listen {
+                    for pid in si.associated_pids {
+                        out.push(Listener {
+                            port: tcp.local_port,
+                            pid,
+                            exposed: tcp.local_addr.is_unspecified(),
+                        });
                     }
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -163,11 +166,14 @@ mod tests {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let found = Netstat2Ports.listeners();
+        let found = Netstat2Ports.listeners().expect("port scan should work");
+        let ours = found.iter().find(|l| l.port == port);
         assert!(
-            found.iter().any(|l| l.port == port),
+            ours.is_some(),
             "expected our listener on :{port} to be enumerated"
         );
+        // bound to 127.0.0.1, so it must not be flagged LAN-exposed
+        assert!(!ours.unwrap().exposed);
         drop(listener);
     }
 

@@ -758,8 +758,9 @@ dependencies = [
 
 [[package]]
 name = "marina-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "libc",
  "libproc",
  "netstat2",
  "ratatui",

@@ -119,12 +119,18 @@ The "ignored" branch is the whole point: focus by curation, not by enumeration.
 
 The sampler runs a single build path on an **adaptive interval**: **1s** while the
 topology (set of target keys) is changing, **doubling toward a 5s cap** once it's
-stable. Start or stop a server and it snaps back to 1s; otherwise a cockpit left
-open all day idles near zero. With resolution cached (below) the per-tick cost is
-just one `sysinfo` refresh + one `netstat2` enumeration, both cheap — so a true
+stable. Start or stop a server and it snaps back to 1s; a verb sends
+`SamplerCtl::Refresh` to force a rebuild immediately. With resolution cached
+(below) the per-tick cost is just one `sysinfo` refresh + one `netstat2`
+enumeration, both cheap (`docker ps` is cached with a 5s TTL) — so a true
 two-cadence split (separate fast resources / slow topology) wasn't needed; it
 remains an option if profiling ever shows it. Terminal-focus-based backoff is a
 possible future refinement (crossterm focus events).
+
+The UI side is symmetric: the main loop **redraws only when something changed**
+(input, snapshot, log line, status transition, resize) or while a transient
+animation runs (kill countdown, new-row flash) — an idle cockpit does no
+per-frame work at all.
 
 ### Stability levers (priority-1 detail)
 
@@ -200,51 +206,59 @@ struct Target {
     ports: Vec<u16>,            // empty for Watched
     anchor: Anchor,
     pids: Vec<u32>,             // in-boundary subtree
+    pid_starts: Vec<(u32, u64)>, // per-pid fingerprints — verified before EVERY signal
     project: String,
     command_label: String,      // e.g. "next dev"
     cwd: PathBuf,
-    git_branch: Option<String>,
+    git_branch: Option<String>, // "main", or "@abc1234" when detached
     cpu_pct: f32,               // EWMA-smoothed, subtree rollup
     mem_bytes: u64,             // subtree rollup
-    url: Option<String>,        // None for watched targets
+    url: Option<Url>,           // typed scheme; None for watched targets
+    exposed: bool,              // bound to 0.0.0.0/:: — reachable from the LAN
+    container: Option<String>,  // docker container name (verbs go via docker CLI)
 }
 
 /// Immutable, produced by the sampler. Canonical order (by port); the UI
 /// applies presentation order (sort + hysteresis) — ordering is NOT baked here.
-struct Snapshot { seq: u64, targets: Vec<Target> }
+/// `error` carries a data-source failure for persistent display.
+struct Snapshot { seq: u64, targets: Vec<Target>, error: Option<String> }
 ```
 
-### Message contract — the sampler↔UI seam
+### Message contracts — the thread seams (IMPLEMENTED)
 
 ```rust
-// sampler -> UI
-enum SamplerMsg {
-    Snapshot(Arc<Snapshot>),
-    Error(String),              // surfaced in a status line, never panics the UI
+// sampler -> UI. A data-source failure rides inside the Snapshot
+// (`snapshot.error`) so the UI can show it persistently — an empty cockpit
+// must never silently mean "enumeration broke".
+enum SamplerMsg { Snapshot(Arc<Snapshot>) }
+
+// UI -> sampler. Dropping the sender shuts the thread down.
+enum SamplerCtl {
+    Refresh,   // rebuild NOW (sent right after a verb) instead of sleeping
 }
 
-// UI -> sampler / action thread
-enum UiMsg {
-    SetFocused(bool),           // drives adaptive idle cadence
-    RequestRefresh,             // e.g. right after a verb, to reflect it fast
-    Verb { target: TargetKey, verb: Verb },
-    Shutdown,
+// background verb / log-discovery threads -> UI, drained each loop tick
+enum UiEvent {
+    Status(String),                                    // verb outcomes, EPERM, …
+    LogReady { project: String, path: Option<PathBuf> }, // off-thread lsof result
 }
-
-enum Verb { Kill, Restart, CopyUrl, Open, ToggleTail }
 ```
 
-Two subtleties this contract encodes:
+Three subtleties these contracts encode:
 
 - **Ordering is the UI's job, not the sampler's.** Hysteresis and the
   freeze-while-navigating rule depend on view state (active sort, time since last
   keypress), which lives only on the UI thread. So `Snapshot.targets` is in a
   fixed canonical order and the UI re-sorts. This is what makes "no jump under the
   cursor" implementable.
-- **Blocking verbs don't run on the UI thread.** `Kill`/`Restart` (signals,
-  re-exec) go to an action executor (the sampler thread or a small dedicated
-  thread) via `UiMsg::Verb`, so the render loop never stalls. `CopyUrl`/`Open` are
-  cheap and can run inline on the UI thread.
+- **Blocking work doesn't run on the UI thread.** Kill escalation, restart
+  (port-wait + re-exec), docker verbs, and log discovery (`lsof` can stall) all
+  run on their own threads and report back over the `UiEvent` channel. Only the
+  initial signal burst and `CopyUrl`/`Open` are cheap enough to run inline.
+- **Verbs demand an immediate resample.** After `K`/`R` the UI sends
+  `SamplerCtl::Refresh` so the dead row disappears in ~a second even when the
+  adaptive cadence had backed off to 5s. The sampler blocks in `recv_timeout`,
+  so a refresh request also wakes it instantly.
 
 ### `resolve` — heuristic pipeline (run once per target, cached by PID)
 
@@ -325,17 +339,28 @@ remains a possible refinement.)
 | **restart** | capture argv + cwd (+ env where possible); kill tree; re-exec | shell-function / complex-env launches won't always restart cleanly — be upfront |
 | **tail logs** | best-effort: fd-sniff for `.log`; supervisor logs (pm2/foreman/docker); full capture only for our-launched targets | weakest OS support — can't generally attach to a running process's stdout on macOS |
 
-**Wired:** copy, open, kill (SIGTERM now → SIGKILL after a 4s grace period; the
-escalation re-checks each pid's start_time and only signals the *same* process,
-so a recycled pid is never hit; `u` undoes within the window), restart (kill
-subtree → wait → re-exec captured argv in cwd, off-thread).
-**Follow-ups:** env capture for restart, supervisor logs (pm2/foreman).
+**Wired:** copy, open, kill (fingerprint-verified SIGTERM now — the start_time
+check runs before *every* signal, the first SIGTERM included, since the pids
+come from a snapshot that can be seconds old — then SIGKILL after a 4s grace
+period, same verification; `u` cancels the escalation, and the status wording is
+honest that SIGTERM already went out; signals go through `libc::kill` so EPERM
+is reported, not swallowed), restart (verified kill subtree → wait for the ports
+to actually free, escalating if SIGTERM is ignored → re-exec captured argv in
+cwd with stdout/stderr captured to `~/.local/state/marina/logs/<project>.log`,
+plus a watchdog that reports a respawn crashing within 2s), docker verbs
+(`docker stop`/`restart`/`logs -f` for container rows).
+**Follow-ups:** env capture for restart, supervisor logs (pm2/foreman),
+container cpu/mem via `docker stats`.
 
-Navigation: `j/k` move, `g/G` top/bottom, `/` filter, `s` cycle sort
-(port/cpu/mem), `q` quit. **Verbs are capital letters** — `K` kill, `R` restart,
-`T` tail, `Y` copy-url, `O` open — distinct from lowercase nav so `k` (up) never
-collides with kill, and so destructive actions require a deliberate Shift.
-(`u` after a kill undoes the pending SIGKILL.)
+Navigation: `j/k` move, `g/G` top/bottom, `/` filter (project/command/port/cwd/
+branch), `s` cycle sort (port/cpu/mem — or click a header), `i` inspect panel,
+`Enter` fold/unfold, `[`/`]` + `+`/`-` scroll/resize the log pane, `Esc` closes
+the innermost thing (log → inspect → filter), mouse click/wheel, `q` or `Ctrl+C`
+quit. **Verbs are capital letters** — `K` kill, `R` restart, `T` tail, `Y`
+copy-url, `O` open — distinct from lowercase nav so `k` (up) never collides with
+kill, and so destructive actions require a deliberate Shift. (`u` after a kill
+cancels the pending SIGKILL; the rows render in a red "dying" style during the
+grace window.)
 
 ---
 
@@ -345,11 +370,15 @@ The resolution engine is exposed headless for scripts and agents. The TUI is the
 subcommands act through the same engine:
 
 ```
-marina ls [--json]        # the snapshot — table, or a stable JSON contract
-marina kill <selector>…   # SIGTERM -> SIGKILL matching targets
-marina restart <selector> # re-exec captured argv in cwd
-marina url <selector>…    # print matching URLs
+marina ls [sel…] [--json]   # the snapshot — table, or a stable JSON contract
+marina kill <sel>… [--json] # verified SIGTERM -> SIGKILL matching targets
+marina restart <sel>…       # re-exec captured argv in cwd (output captured)
+marina url <sel>… [--json]  # print matching URLs
+marina version
 ```
+
+Unknown commands/flags are hard errors (exit 2) — a typo in a script must never
+fall through and block on the TUI.
 
 A **selector** matches by project name (exact/substring), port (`3000`/`:3000`),
 or command label. **Killing a project selector stops every target under it** —
@@ -357,7 +386,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 47 tests
+## Testing — 84 tests
 
 Three layers:
 
@@ -389,23 +418,38 @@ non-issue — rows for system stuff may just be opaque.
 
 ## Implemented (this build)
 
-- **Config file** (`~/.config/marina/config.toml`): `[[rule]]` (regex →
-  label + url template), `[[watch]]`, `[[override]]` (pin by port/cmd). Layered
-  over built-in defaults; bad regex / absent file falls back silently.
+- **Config file** (`$XDG_CONFIG_HOME/marina/config.toml`, `~/.config` fallback):
+  `[[rule]]` (regex → label + url template), `[[watch]]`, `[[override]]` (pin by
+  port/cmd), `[[ignore]]` (hide noise by port/cmd). Layered over built-in
+  defaults; bad regex / absent file falls back silently.
 - **Inline log tail** (`T`): discovery in order of confidence — a `.log` held
-  open by the subtree (`lsof`), then `*.log` in the project dir / `logs/`, then a
-  pm2 log matching the project — live-tailed in a pane; `Esc` closes. Honest "no
-  log file" when nothing's found.
-- **Kill undo** (`u`): cancels the pending SIGKILL within the 4s grace window.
-- **`/` filter** (project/command/port), `g`/`G` jump-to-top/bottom, **uptime**
-  column.
-- **Docker resolver**: names host-bound container ports via `docker ps`
-  (fail-silent). _Port parser unit-tested; live container rows pending a running
-  daemon to verify. Container cpu/mem not captured — shown as `—`._
+  open by the subtree (`lsof`, run **off-thread**), then marina's own capture
+  from a previous restart, then `*.log` in the project dir / `logs/`, then a pm2
+  log — live-tailed in a scrollable, resizable pane (`[`/`]`, `+`/`-`) that
+  survives log rotation; `Esc` closes. Honest "no log file" when nothing's found.
+  Docker rows tail `docker logs -f`.
+- **Restart log capture**: anything marina restarts gets stdout/stderr appended
+  to `~/.local/state/marina/logs/<project>.log` — so `T` always works for it.
+- **Kill undo** (`u`): cancels the pending SIGKILL within the 4s grace window
+  (wording is honest that SIGTERM already went). Dying rows render red.
+- **Crash detection**: a long-running target vanishing without a marina-issued
+  kill/restart raises `⚠ … exited unexpectedly`; marina-initiated actions are
+  suppressed. New rows flash green briefly.
+- **LAN-exposure badge**: a listener bound to `0.0.0.0`/`::` renders its port as
+  `:3000!` in red (TUI + `ls`), with detail in the inspect panel and an
+  `exposed` field in the JSON.
+- **`/` filter** (project/command/port/cwd/branch), `g`/`G` jump-to-top/bottom,
+  **uptime** column, `i` **inspect panel**, **mouse** (click select, header-click
+  sort, wheel), persistent **data-source warnings** (port-scan failure, sampler
+  death) that can't be mistaken for "no dev processes".
+- **Docker targets**: named via `docker ps` (cached, fail-silent), with verbs —
+  `K` → `docker stop`, `R` → `docker restart`, `T` → `docker logs -f`.
+  _Container cpu/mem not captured — shown as `—`._
 - **`phys_footprint` memory** via `libproc` (Activity-Monitor-matching), with RSS
   fallback.
-- **CLI / agent surface**: `ls`/`kill`/`restart`/`url` with `--json`
-  and project/port/command selectors. Project-selector kill = group-kill.
+- **CLI / agent surface**: `ls [sel…]`/`kill`/`restart`/`url`/`version` with
+  `--json` and project/port/command selectors; strict argument parsing (typos
+  exit 2, never launch the TUI). Project-selector kill = group-kill.
 - **TUI grouping**: a project with several targets gets a collapsible header
   (`Enter` folds; `K`/`R` act on the whole group); a lone target stays a plain
   row. Group cpu/mem aggregate in the header; same project-matching as the CLI.
@@ -413,13 +457,24 @@ non-issue — rows for system stuff may just be opaque.
   cwd — an app + its database — under one name by port/project/command selectors.
   Applies to listener, watched, and docker targets; works in both TUI and CLI
   (`kill <group>`). Auto-grouping still covers app + watchers for free.
+- **Hardening**: per-pid `(pid, start_time)` fingerprints verified before every
+  signal (a snapshot-stale pid is never TERMed); signals via `libc::kill` with
+  EPERM surfaced; duplicate-port anchors (SO_REUSEPORT / v4+v6) merged into one
+  row; nested watchers de-duplicated; EWMA keyed by anchor fingerprint;
+  resolution caches invalidate on topology change; git worktrees / detached
+  HEADs resolve; `$HOME` itself never counts as a project root (dotfiles repos);
+  restarted children are reaped (no zombies) and early crashes reported.
 
 ## Still open
 
 - **MCP wrapper** over the CLI (deferred; CLI+JSON covers agents today).
 - **env capture** for restart (needs `KERN_PROCARGS2`; restart currently
   re-execs argv in cwd with inherited env — fine for most `.env`/profile setups).
-- Docker: live verification + container cpu/mem (`docker stats`).
+- Docker: live verification + container cpu/mem (`docker stats` — too slow for
+  the sampler tick; needs its own slow-poll thread).
+- **Expected services**: declare what *should* be running (argv + cwd in config),
+  render absent ones dimmed with an `S` start verb — marina as a lightweight
+  overmind. Needs an ADR (scope: monitor vs. supervisor).
 - Two-cadence split (optional — adaptive single-path suffices today).
-- Terminal-focus-based idle backoff;
-  hybrid "expand a Target row to reveal the PID subtree" view.
+- Terminal-focus-based idle backoff; desktop notification on crash detection
+  (status line only today).

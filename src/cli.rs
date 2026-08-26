@@ -1,13 +1,18 @@
 //! Non-interactive CLI — the resolution engine exposed for scripts and agents.
 //!
-//!   port-manager ls [--json]        list targets (table, or JSON for agents)
-//!   port-manager kill <selector>…   SIGTERM then SIGKILL matching targets
-//!   port-manager restart <selector> restart matching targets (re-exec in cwd)
-//!   port-manager url <selector>…    print matching targets' URLs
+//!   marina ls [sel]… [--json]   list running dev targets (optionally filtered)
+//!   marina kill <sel>… [--json] SIGTERM → verified SIGKILL matching targets
+//!   marina restart <sel>…       restart matching targets (output captured)
+//!   marina url <sel>… [--json]  print matching targets' URLs
+//!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
 //! by port (`3000` or `:3000`), or by command label. Killing a project name
 //! takes down every target under it — the grouping primitive, via the CLI.
+//! Docker targets are stopped/restarted via `docker stop`/`docker restart`.
+//!
+//! Unknown commands and flags are errors (exit 2) — a typo must never fall
+//! through and launch the TUI inside a script.
 
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,40 +27,57 @@ pub const USAGE: &str = "\
 marina — developer-process cockpit
 
 USAGE:
-    marina                 launch the TUI
-    marina ls [--json]     list running dev targets
-    marina kill <sel>...   stop matching targets (SIGTERM -> SIGKILL)
-    marina restart <sel>   restart matching targets
-    marina url <sel>...    print matching targets' URLs
+    marina                       launch the TUI
+    marina ls [sel]... [--json]  list running dev targets
+    marina kill <sel>... [--json] stop matching targets (SIGTERM -> SIGKILL)
+    marina restart <sel>...      restart matching targets (output captured)
+    marina url <sel>... [--json] print matching targets' URLs
+    marina version               print the version
 
 SELECTOR:
     a project name (exact or substring), a port (3000 or :3000), or a command.
 ";
 
-/// Dispatch a CLI subcommand. Returns `Some(exit_code)` if it handled a
-/// subcommand, `None` if there was none (caller should launch the TUI).
+/// Dispatch a CLI subcommand. Returns `Some(exit_code)` if it handled the
+/// invocation, `None` when there were no args (caller launches the TUI).
 /// Exit codes: 0 ok, 1 no match, 2 usage error — so scripts/agents can branch.
 pub fn dispatch(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     let rest = &args[1..];
+    let flags: Vec<&str> = rest
+        .iter()
+        .map(String::as_str)
+        .filter(|s| s.starts_with('-'))
+        .collect();
     let selectors: Vec<&str> = rest
         .iter()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .filter(|s| !s.starts_with('-'))
         .collect();
+    if let Some(bad) = flags.iter().find(|f| **f != "--json") {
+        eprintln!("marina: unknown flag {bad:?}\n");
+        eprint!("{USAGE}");
+        return Some(2);
+    }
+    let json = flags.contains(&"--json");
     let code = match cmd {
-        "ls" => {
-            ls(rest.iter().any(|a| a == "--json"));
+        "ls" => ls(json, &selectors),
+        "kill" => kill(&selectors, json),
+        "restart" => restart(&selectors),
+        "url" => url(&selectors, json),
+        "version" | "--version" | "-V" => {
+            println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        "kill" => kill(&selectors),
-        "restart" => restart(&selectors),
-        "url" => url(&selectors),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             0
         }
-        _ => return None, // not a subcommand (e.g. --dump, or TUI)
+        other => {
+            eprintln!("marina: unknown command {other:?}\n");
+            eprint!("{USAGE}");
+            2
+        }
     };
     Some(code)
 }
@@ -94,30 +116,36 @@ fn matches(t: &Target, sel: &str) -> bool {
 
 // --- handlers ---------------------------------------------------------------
 
-fn ls(json: bool) {
+fn ls(json: bool, selectors: &[&str]) -> i32 {
     let snap = snapshot(true);
+    let targets: Vec<&Target> = if selectors.is_empty() {
+        snap.targets.iter().collect()
+    } else {
+        select(&snap, selectors)
+    };
     if json {
-        let view: Vec<TargetJson> = snap.targets.iter().map(TargetJson::from).collect();
+        let view: Vec<TargetJson> = targets.iter().copied().map(TargetJson::from).collect();
         match serde_json::to_string_pretty(&view) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("marina: json error: {e}"),
         }
-        return;
+        return 0;
     }
-    if snap.targets.is_empty() {
+    if targets.is_empty() {
         println!("no dev targets running");
-        return;
+        return if selectors.is_empty() { 0 } else { 1 };
     }
     println!(
-        "{:<20} {:<16} {:<7} {:>6} {:>8} {:<14}",
+        "{:<20} {:<16} {:<8} {:>6} {:>8} {:<14}",
         "PROJECT", "COMMAND", "PORT", "CPU", "MEM", "URL"
     );
-    for t in &snap.targets {
-        let port = t
-            .ports
-            .first()
-            .map(|p| format!(":{p}"))
-            .unwrap_or_else(|| "—".into());
+    for t in &targets {
+        let port = match t.ports.first() {
+            // `!` marks a LAN-exposed bind (0.0.0.0 / ::)
+            Some(p) if t.exposed => format!(":{p}!"),
+            Some(p) => format!(":{p}"),
+            None => "—".into(),
+        };
         let (cpu, mem) = if t.pids.is_empty() {
             ("—".into(), "—".into())
         } else {
@@ -128,13 +156,14 @@ fn ls(json: bool) {
         };
         let url = t.url.as_ref().map(|u| u.value.as_str()).unwrap_or("");
         println!(
-            "{:<20} {:<16} {:<7} {:>6} {:>8} {:<14}",
+            "{:<20} {:<16} {:<8} {:>6} {:>8} {:<14}",
             t.project, t.command_label, port, cpu, mem, url
         );
     }
+    0
 }
 
-fn kill(selectors: &[&str]) -> i32 {
+fn kill(selectors: &[&str], json: bool) -> i32 {
     if selectors.is_empty() {
         eprintln!("kill: need a selector (project, port, or command)");
         return 2;
@@ -145,14 +174,38 @@ fn kill(selectors: &[&str]) -> i32 {
         eprintln!("no targets match {selectors:?}");
         return 1;
     }
-    let mut pids: Vec<u32> = Vec::new();
+    let mut pid_starts: Vec<verbs::PidStart> = Vec::new();
+    let mut killed: Vec<&Target> = Vec::new();
     for t in &targets {
+        killed.push(t);
+        if let Some(c) = &t.container {
+            if !json {
+                println!("stopping container {c}");
+            }
+            let _ = std::process::Command::new("docker")
+                .args(["stop", c])
+                .status();
+            continue;
+        }
         let port = t.ports.first().map(|p| format!(":{p}")).unwrap_or_default();
-        println!("killing {} {} ({} pids)", t.project, port, t.pids.len());
-        pids.extend(&t.pids);
+        if !json {
+            println!("killing {} {} ({} pids)", t.project, port, t.pids.len());
+        }
+        pid_starts.extend(&t.pid_starts);
     }
-    verbs::kill_blocking(&pids, Duration::from_millis(1500)); // SIGTERM -> guarded SIGKILL
-    println!("done.");
+    if !pid_starts.is_empty() {
+        // verified SIGTERM -> wait -> verified SIGKILL (recycled pids skipped)
+        verbs::kill_blocking(&pid_starts, Duration::from_millis(1500));
+    }
+    if json {
+        let view: Vec<TargetJson> = killed.into_iter().map(TargetJson::from).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).unwrap_or_default()
+        );
+    } else {
+        println!("done.");
+    }
     0
 }
 
@@ -169,9 +222,24 @@ fn restart(selectors: &[&str]) -> i32 {
     }
     // Capture commands, terminate everything, then re-exec.
     let mut plans: Vec<(String, Vec<String>, std::path::PathBuf)> = Vec::new();
-    let mut pids: Vec<u32> = Vec::new();
+    let mut pid_starts: Vec<verbs::PidStart> = Vec::new();
+    let mut code = 0;
     for t in &targets {
-        pids.extend(&t.pids);
+        if let Some(c) = &t.container {
+            let ok = std::process::Command::new("docker")
+                .args(["restart", c])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                println!("restarted container {c}");
+            } else {
+                eprintln!("docker restart {c} failed");
+                code = 1;
+            }
+            continue;
+        }
+        pid_starts.extend(&t.pid_starts);
         if t.anchor_argv.is_empty() {
             eprintln!("skipping {}: command not captured", t.project);
             continue;
@@ -179,15 +247,20 @@ fn restart(selectors: &[&str]) -> i32 {
         plans.push((t.project.clone(), t.anchor_argv.clone(), t.cwd.clone()));
     }
     if plans.is_empty() {
+        if targets.iter().any(|t| t.container.is_some()) {
+            return code; // docker-only selection — outcome already reported
+        }
         eprintln!("nothing restartable (command not captured)");
         return 1;
     }
-    let _ = verbs::signal_tree(&pids, "TERM");
-    thread::sleep(Duration::from_millis(1500));
-    let mut code = 0;
+    verbs::kill_blocking(&pid_starts, Duration::from_millis(1500));
     for (project, argv, cwd) in plans {
-        match verbs::respawn(&argv, &cwd) {
-            Ok(()) => println!("restarted {project}"),
+        let log = crate::logs::state_log_path(&project);
+        match verbs::respawn(&argv, &cwd, log.as_deref()) {
+            Ok(_child) => match &log {
+                Some(p) => println!("restarted {project} (output -> {})", p.display()),
+                None => println!("restarted {project}"),
+            },
             Err(e) => {
                 eprintln!("restart {project} failed: {e}");
                 code = 1;
@@ -197,12 +270,31 @@ fn restart(selectors: &[&str]) -> i32 {
     code
 }
 
-fn url(selectors: &[&str]) -> i32 {
+fn url(selectors: &[&str], json: bool) -> i32 {
     let snap = snapshot(false);
     let targets = select(&snap, selectors);
     if targets.is_empty() {
         eprintln!("no targets match {selectors:?}");
         return 1;
+    }
+    if json {
+        #[derive(Serialize)]
+        struct UrlJson<'a> {
+            project: &'a str,
+            url: Option<&'a str>,
+        }
+        let view: Vec<UrlJson> = targets
+            .iter()
+            .map(|t| UrlJson {
+                project: &t.project,
+                url: t.url.as_ref().map(|u| u.value.as_str()),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).unwrap_or_default()
+        );
+        return 0;
     }
     for t in targets {
         match &t.url {
@@ -229,6 +321,10 @@ struct TargetJson {
     anchor_pid: u32,
     cwd: String,
     branch: Option<String>,
+    /// Listening on 0.0.0.0 / :: — reachable from the LAN.
+    exposed: bool,
+    /// Docker container name, when the target is a published container port.
+    container: Option<String>,
 }
 
 impl From<&Target> for TargetJson {
@@ -255,6 +351,8 @@ impl From<&Target> for TargetJson {
             anchor_pid: t.anchor.pid,
             cwd: t.cwd.display().to_string(),
             branch: t.git_branch.clone(),
+            exposed: t.exposed,
+            container: t.container.clone(),
         }
     }
 }
@@ -277,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_commands_and_flags_error_instead_of_launching_the_tui() {
+        // a typo'd subcommand must not fall through to the TUI
+        assert_eq!(dispatch(&["lss".into()]), Some(2));
+        assert_eq!(dispatch(&["--jsonx".into()]), Some(2));
+        // no args -> None -> caller launches the TUI
+        assert_eq!(dispatch(&[]), None);
+    }
+
+    #[test]
+    fn version_prints_and_exits_zero() {
+        assert_eq!(dispatch(&["version".into()]), Some(0));
+        assert_eq!(dispatch(&["--version".into()]), Some(0));
+        assert_eq!(dispatch(&["-V".into()]), Some(0));
+    }
+
+    #[test]
     fn json_view_nulls_unmeasurable_fields() {
         use crate::model::{Anchor, Target, TargetKey, TargetKind};
         // a docker-style target: no pids, no start_time
@@ -289,6 +403,7 @@ mod tests {
                 start_time: 0,
             },
             anchor_argv: vec![],
+            pid_starts: vec![],
             pids: vec![],
             project: "db".into(),
             command_label: "postgres".into(),
@@ -297,10 +412,41 @@ mod tests {
             cpu_pct: 0.0,
             mem_bytes: 0,
             url: None,
+            exposed: true,
+            container: Some("myapp-db-1".into()),
         };
         let j = TargetJson::from(&t);
         assert_eq!(j.kind, "listener");
         assert!(j.cpu_pct.is_none() && j.mem_bytes.is_none() && j.uptime_secs.is_none());
         assert_eq!(j.ports, vec![5432]);
+        assert!(j.exposed);
+        assert_eq!(j.container.as_deref(), Some("myapp-db-1"));
+    }
+
+    #[test]
+    fn json_shape_is_stable() {
+        // Agents depend on `ls --json` — pin the field names.
+        let snap = Snapshot::sample();
+        let j = serde_json::to_value(TargetJson::from(&snap.targets[0])).unwrap();
+        let obj = j.as_object().unwrap();
+        for field in [
+            "project",
+            "command",
+            "kind",
+            "ports",
+            "url",
+            "cpu_pct",
+            "mem_bytes",
+            "uptime_secs",
+            "pids",
+            "anchor_pid",
+            "cwd",
+            "branch",
+            "exposed",
+            "container",
+        ] {
+            assert!(obj.contains_key(field), "missing JSON field {field}");
+        }
+        assert_eq!(obj.len(), 14, "unexpected extra/removed JSON fields");
     }
 }

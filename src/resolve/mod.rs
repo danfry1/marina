@@ -30,9 +30,14 @@ const MARKERS: &[&str] = &[
 ];
 
 /// Nearest project marker above `start` (any manifest, or `.git` as fallback).
-pub fn project_root(start: &Path) -> Option<PathBuf> {
+/// The walk stops *below* `stop` (typically `$HOME`) — a dotfiles repo or stray
+/// manifest in the home directory must not swallow every home-cwd process.
+pub fn project_root(start: &Path, stop: Option<&Path>) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
+        if stop == Some(d) {
+            return None;
+        }
         if MARKERS.iter().any(|m| d.join(m).exists()) || d.join(".git").exists() {
             return Some(d.to_path_buf());
         }
@@ -280,12 +285,34 @@ pub fn default_url(label: &str, port: u16) -> Option<Url> {
     Some(Url { scheme, value })
 }
 
-/// Current branch from `<root>/.git/HEAD`, if `root` is a git worktree.
+/// Current branch (or `@shortsha` when detached) for the repo at `root`.
+/// Handles `.git` being a directory or — for worktrees/submodules — a
+/// `gitdir: <path>` redirect file.
 pub fn git_branch(root: &Path) -> Option<String> {
-    let head = fs::read_to_string(root.join(".git/HEAD")).ok()?;
-    head.trim()
-        .strip_prefix("ref: refs/heads/")
-        .map(|s| s.to_string())
+    let head = fs::read_to_string(git_dir(root)?.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return Some(branch.to_string());
+    }
+    // Detached HEAD: the file holds a bare commit id — show it, shortened.
+    (head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("@{}", &head[..7]))
+}
+
+/// The actual git dir for `root`: `.git` itself, or the target of a
+/// `gitdir: <path>` redirect (worktrees, submodules).
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dotgit = root.join(".git");
+    if dotgit.is_dir() {
+        return Some(dotgit);
+    }
+    let text = fs::read_to_string(&dotgit).ok()?;
+    let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    })
 }
 
 fn basename(s: &str) -> String {
@@ -300,6 +327,25 @@ pub struct Resolver {
     watch_rules: Vec<WatchRule>,
     overrides: Vec<OverrideRule>,
     groups: Vec<GroupRule>,
+    ignores: Vec<IgnoreRule>,
+}
+
+/// User-declared "never show this" rule. Conditions AND together; a rule with
+/// no condition is inert (never matches).
+struct IgnoreRule {
+    port: Option<u16>,
+    cmd: Option<Regex>,
+}
+
+impl IgnoreRule {
+    fn matches(&self, ports: &[u16], cmd_text: &str) -> bool {
+        if self.port.is_none() && self.cmd.is_none() {
+            return false;
+        }
+        let port_ok = self.port.is_none_or(|p| ports.contains(&p));
+        let cmd_ok = self.cmd.as_ref().is_none_or(|re| re.is_match(cmd_text));
+        port_ok && cmd_ok
+    }
 }
 
 struct GroupRule {
@@ -356,14 +402,16 @@ struct OverrideRule {
 }
 
 impl Resolver {
-    /// A resolver with no config rules (built-in defaults only). Used as a
-    /// config-free baseline and in tests.
+    /// A resolver with no config rules (built-in defaults only) — the
+    /// config-independent baseline for tests.
+    #[cfg(test)]
     pub fn empty() -> Self {
         Resolver {
             cmd_rules: vec![],
             watch_rules: vec![],
             overrides: vec![],
             groups: vec![],
+            ignores: vec![],
         }
     }
 
@@ -412,7 +460,21 @@ impl Resolver {
                     selectors: g.members.into_iter().filter_map(parse_member).collect(),
                 })
                 .collect(),
+            ignores: cfg
+                .ignore
+                .into_iter()
+                .map(|i| IgnoreRule {
+                    port: i.match_port,
+                    cmd: i.match_cmd.as_deref().and_then(compile),
+                })
+                .collect(),
         }
+    }
+
+    /// True if a `[[ignore]]` rule hides this target. `cmd_text` is whatever
+    /// command-ish text we have: joined argv, label, or a docker image name.
+    pub fn is_ignored(&self, ports: &[u16], cmd_text: &str) -> bool {
+        self.ignores.iter().any(|r| r.matches(ports, cmd_text))
     }
 
     /// The declared group a target belongs to, if any — overrides its project
@@ -512,6 +574,7 @@ mod tests {
             cmd_rules: vec![],
             watch_rules: vec![],
             overrides: vec![],
+            ignores: vec![],
             groups: vec![GroupRule {
                 name: "client-portal".into(),
                 selectors: vec![
@@ -605,6 +668,7 @@ mod tests {
                 label: None,
             }],
             groups: vec![],
+            ignores: vec![],
         };
         let mut project = "orig".to_string();
         let mut label = "node".to_string();
@@ -624,9 +688,70 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("package.json"), r#"{"name":"acme"}"#).unwrap();
         // walks up from sub/ to the marker dir
-        assert_eq!(project_root(&dir.join("sub")), Some(dir.clone()));
+        assert_eq!(project_root(&dir.join("sub"), None), Some(dir.clone()));
         assert_eq!(project_name(&dir), "acme");
+        // the walk stops at the boundary dir — a marker *at* it doesn't count
+        // (a dotfiles repo in $HOME must not swallow every home-cwd process)
+        assert_eq!(project_root(&dir.join("sub"), Some(&dir)), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_branch_handles_worktrees_and_detached_head() {
+        let base = std::env::temp_dir().join(format!("marina-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // normal repo: .git/HEAD with a ref
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(git_branch(&repo).as_deref(), Some("main"));
+
+        // worktree: .git is a `gitdir:` redirect file
+        let gitdir = base.join("repo/.git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature-x\n").unwrap();
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        assert_eq!(git_branch(&wt).as_deref(), Some("feature-x"));
+
+        // detached HEAD: a bare commit id -> short sha
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(git_branch(&repo).as_deref(), Some("@0123456"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ignore_rules_hide_by_port_and_cmd() {
+        let r = Resolver {
+            cmd_rules: vec![],
+            watch_rules: vec![],
+            overrides: vec![],
+            groups: vec![],
+            ignores: vec![
+                IgnoreRule {
+                    port: Some(7000),
+                    cmd: None,
+                },
+                IgnoreRule {
+                    port: None,
+                    cmd: Some(Regex::new("OrbStack").unwrap()),
+                },
+                IgnoreRule {
+                    port: None,
+                    cmd: None, // inert — must never match
+                },
+            ],
+        };
+        assert!(r.is_ignored(&[7000], "anything"));
+        assert!(r.is_ignored(&[], "/Applications/OrbStack.app/agent"));
+        assert!(!r.is_ignored(&[3000], "node server.js"));
     }
 
     #[test]
@@ -654,6 +779,7 @@ mod tests {
             watch_rules: vec![],
             overrides: vec![],
             groups: vec![],
+            ignores: vec![],
         };
         let (label, url) = r.label_and_url(&[argv(&["node", "my-special-server.js"])], Some(8080));
         assert_eq!(label, "special");
