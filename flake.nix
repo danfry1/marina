@@ -12,7 +12,7 @@
         pkgs = import nixpkgs { inherit system; };
         marina = pkgs.rustPlatform.buildRustPackage {
           pname = "marina";
-          version = "0.1.0";
+          version = "0.2.0";
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
 

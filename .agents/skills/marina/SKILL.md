@@ -38,9 +38,12 @@ Each element:
 | `ports` | listening ports (array) |
 | `url` | e.g. `http://localhost:3000`, a `postgres://…`, or `null` |
 | `cpu_pct`, `mem_bytes` | resource use; `null` when not measurable (e.g. a docker container) |
+| `exposed` | `true` = bound to 0.0.0.0/:: — reachable from the LAN (worth flagging to the user) |
+| `container` | docker container name, or `null` for a native process |
 | `uptime_secs`, `pids`, `anchor_pid`, `cwd`, `branch` | process details |
 
-An empty array means nothing dev-relevant is running.
+An empty array means nothing dev-relevant is running. You can pre-filter with a
+selector: `marina ls api --json`.
 
 ## 2. Act on it
 
@@ -48,9 +51,12 @@ A **selector** matches by project name (exact or substring), a port (`3000` or
 `:3000`), or a command label.
 
 ```sh
-marina kill <selector>      # SIGTERM, then SIGKILL after a 4s grace period
-marina restart <selector>   # kill the subtree, wait, re-exec in the same cwd
-marina url <selector>       # print matching URLs (one per line)
+marina kill <selector>      # SIGTERM, then verified SIGKILL (docker: docker stop)
+marina restart <selector>   # kill the subtree, wait for the port to free, re-exec
+                            # in the same cwd; output is captured to
+                            # ~/.local/state/marina/logs/<project>.log
+marina url <selector>       # print matching URLs (add --json for structure)
+marina version              # version check (also proves the binary works)
 ```
 
 **Killing a project name stops every service under it.** If `client-portal` runs
@@ -74,6 +80,10 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 - marina only sees and touches the **current user's own** processes, and never
   lists or kills the shell/session it (or you) run in — so you can't accidentally
   kill your own terminal.
-- It makes no network calls and persists nothing.
+- It makes no network calls. The only file it writes is the per-project restart
+  log (`~/.local/state/marina/logs/<project>.log`) — read that when the user asks
+  why a restarted server is misbehaving.
+- Unknown subcommands/flags exit 2 immediately (they never fall through to the
+  blocking TUI), so it's safe to script against.
 - Resolution is heuristic; if a `project`/`command` looks wrong, fall back to the
   `port` selector, which is exact.

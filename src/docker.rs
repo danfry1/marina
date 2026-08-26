@@ -6,6 +6,7 @@
 //! Everything here is fail-silent: no docker, daemon down, or no matching
 //! container → an empty map → no docker rows (and no regression). Container
 //! cpu/mem isn't captured (it lives in the VM); those columns show `—`.
+//! Verbs on docker targets go through `docker stop/restart/logs` (see `verbs`).
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -22,9 +23,18 @@ pub fn is_binder(proc_name: &str) -> bool {
     BINDERS.iter().any(|b| proc_name.contains(b))
 }
 
-/// host port -> (container name, image name). Empty on any failure.
-pub fn port_map() -> HashMap<u16, (String, String)> {
-    let mut map = HashMap::new();
+/// What we know about a published container port.
+#[derive(Clone)]
+pub struct ContainerPort {
+    pub name: String,
+    pub image: String,
+    /// Published on 0.0.0.0 / :: — reachable from the LAN.
+    pub exposed: bool,
+}
+
+/// host port -> container. Empty on any failure.
+pub fn port_map() -> HashMap<u16, ContainerPort> {
+    let mut map: HashMap<u16, ContainerPort> = HashMap::new();
     let Ok(out) = Command::new("docker")
         .args(["ps", "--format", "{{.Names}}\t{{.Ports}}\t{{.Image}}"])
         .output()
@@ -40,17 +50,21 @@ pub fn port_map() -> HashMap<u16, (String, String)> {
         let (Some(name), Some(ports), Some(image)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
-        for port in parse_published_ports(ports) {
-            map.entry(port)
-                .or_insert_with(|| (name.to_string(), image_name(image)));
+        for (port, exposed) in parse_published_ports(ports) {
+            let entry = map.entry(port).or_insert_with(|| ContainerPort {
+                name: name.to_string(),
+                image: image_name(image),
+                exposed: false,
+            });
+            entry.exposed |= exposed;
         }
     }
     map
 }
 
-/// Host ports from a docker `Ports` field, e.g.
-/// `0.0.0.0:5432->5432/tcp, :::5432->5432/tcp` -> `[5432, 5432]`.
-fn parse_published_ports(ports: &str) -> Vec<u16> {
+/// Host `(port, lan-exposed)` pairs from a docker `Ports` field, e.g.
+/// `0.0.0.0:5432->5432/tcp, :::5432->5432/tcp` -> `[(5432, true), (5432, true)]`.
+fn parse_published_ports(ports: &str) -> Vec<(u16, bool)> {
     let mut out = Vec::new();
     for seg in ports.split(',') {
         let seg = seg.trim();
@@ -58,7 +72,9 @@ fn parse_published_ports(ports: &str) -> Vec<u16> {
             let host = &seg[..arrow];
             if let Some(colon) = host.rfind(':') {
                 if let Ok(p) = host[colon + 1..].parse::<u16>() {
-                    out.push(p);
+                    let addr = &host[..colon];
+                    let exposed = matches!(addr, "0.0.0.0" | "::" | "[::]" | "*");
+                    out.push((p, exposed));
                 }
             }
         }
@@ -77,15 +93,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_published_ports() {
+    fn parses_published_ports_with_exposure() {
         assert_eq!(
             parse_published_ports("0.0.0.0:5432->5432/tcp, :::5432->5432/tcp"),
-            vec![5432, 5432]
+            vec![(5432, true), (5432, true)]
         );
-        assert_eq!(parse_published_ports("0.0.0.0:8080->80/tcp"), vec![8080]);
-        assert_eq!(parse_published_ports(""), Vec::<u16>::new());
+        assert_eq!(
+            parse_published_ports("127.0.0.1:8080->80/tcp"),
+            vec![(8080, false)]
+        );
+        assert_eq!(parse_published_ports(""), Vec::<(u16, bool)>::new());
         // unpublished (no host mapping) -> nothing
-        assert_eq!(parse_published_ports("5432/tcp"), Vec::<u16>::new());
+        assert_eq!(parse_published_ports("5432/tcp"), Vec::<(u16, bool)>::new());
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct Target {
     pub anchor: Anchor,
     pub anchor_argv: Vec<String>, // captured for `restart`
     pub pids: Vec<u32>,           // in-boundary subtree
+    /// `(pid, start_time)` for every subtree pid — the fingerprint verbs check
+    /// before signalling, so a recycled pid number is never hit.
+    pub pid_starts: Vec<(u32, u64)>,
     pub project: String,
     pub command_label: String,
     pub cwd: PathBuf,
@@ -44,6 +47,11 @@ pub struct Target {
     pub cpu_pct: f32,   // EWMA-smoothed, subtree rollup
     pub mem_bytes: u64, // subtree rollup
     pub url: Option<Url>,
+    /// Listening on a non-loopback address (0.0.0.0 / ::) — reachable from the LAN.
+    pub exposed: bool,
+    /// Docker container name when this target is a published container port.
+    /// Verbs act via `docker stop/restart/logs` instead of signals.
+    pub container: Option<String>,
 }
 
 /// Typed, optional URL — the verb layer decides what "open" / "copy" mean per scheme.
@@ -76,6 +84,9 @@ impl UrlScheme {
 pub struct Snapshot {
     pub seq: u64,
     pub targets: Vec<Target>,
+    /// A data-source failure (e.g. the port scan errored). Shown persistently
+    /// in the UI — an empty cockpit must never silently mean "enumeration broke".
+    pub error: Option<String>,
 }
 
 impl Snapshot {
@@ -83,11 +94,13 @@ impl Snapshot {
         Snapshot {
             seq: 0,
             targets: Vec::new(),
+            error: None,
         }
     }
 
-    /// Placeholder data so the skeleton renders a realistic frame before the
-    /// sampler thread exists. Deliberately multi-ecosystem, not just Node.
+    /// Fixture data for tests (UI rendering, CLI selectors). Deliberately
+    /// multi-ecosystem, not just Node, with one multi-target project.
+    #[cfg(test)]
     pub fn sample() -> Self {
         let t = |project: &str,
                  label: &str,
@@ -112,6 +125,7 @@ impl Snapshot {
             },
             anchor_argv: vec![],
             pids: vec![],
+            pid_starts: vec![],
             project: project.into(),
             command_label: label.into(),
             cwd: PathBuf::from("/Users/dev").join(project),
@@ -119,6 +133,8 @@ impl Snapshot {
             cpu_pct: cpu,
             mem_bytes: mem_mb * 1024 * 1024,
             url,
+            exposed: false,
+            container: None,
         };
         let http = |p: u16| {
             Some(Url {
@@ -126,58 +142,61 @@ impl Snapshot {
                 value: format!("http://localhost:{p}"),
             })
         };
+        let mut targets = vec![
+            t(
+                "client-portal",
+                "next dev",
+                Some(3000),
+                3.4,
+                340,
+                http(3000),
+                TargetKind::Listener,
+            ),
+            t(
+                "billing-api",
+                "uvicorn",
+                Some(8000),
+                1.1,
+                96,
+                http(8000),
+                TargetKind::Listener,
+            ),
+            t(
+                "worker",
+                "celery",
+                Some(5555),
+                0.4,
+                72,
+                http(5555),
+                TargetKind::Listener,
+            ),
+            t(
+                "client-portal",
+                "postgres",
+                Some(5432),
+                0.2,
+                410,
+                Some(Url {
+                    scheme: UrlScheme::Postgres,
+                    value: "postgres://localhost:5432".into(),
+                }),
+                TargetKind::Listener,
+            ),
+            t(
+                "design-system",
+                "tsc --watch",
+                None,
+                0.8,
+                188,
+                None,
+                TargetKind::Watched,
+            ),
+        ];
+        targets[1].exposed = true; // billing-api on 0.0.0.0 — exercises the LAN badge
         Snapshot {
             seq: 0,
-            targets: vec![
-                t(
-                    "client-portal",
-                    "next dev",
-                    Some(3000),
-                    3.4,
-                    340,
-                    http(3000),
-                    TargetKind::Listener,
-                ),
-                t(
-                    "billing-api",
-                    "uvicorn",
-                    Some(8000),
-                    1.1,
-                    96,
-                    http(8000),
-                    TargetKind::Listener,
-                ),
-                t(
-                    "worker",
-                    "celery",
-                    Some(5555),
-                    0.4,
-                    72,
-                    http(5555),
-                    TargetKind::Listener,
-                ),
-                t(
-                    "client-portal",
-                    "postgres",
-                    Some(5432),
-                    0.2,
-                    410,
-                    Some(Url {
-                        scheme: UrlScheme::Postgres,
-                        value: "postgres://localhost:5432".into(),
-                    }),
-                    TargetKind::Listener,
-                ),
-                t(
-                    "design-system",
-                    "tsc --watch",
-                    None,
-                    0.8,
-                    188,
-                    None,
-                    TargetKind::Watched,
-                ),
-            ],
+            targets,
+            error: None,
         }
     }
 }

@@ -1,7 +1,7 @@
 [package]
 # crates.io package id (the name `marina` is taken); the binary stays `marina`.
 name = "marina-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
 license = "Apache-2.0"
@@ -25,6 +25,10 @@ serde = { version = "1", features = ["derive"] } # config structs
 serde_json = "1"          # parse package.json name
 toml = "1.1"              # parse config + Cargo.toml / pyproject.toml name
 regex = "1"               # config rule matching
+
+# Direct signalling (kill with per-pid errno) instead of shelling out to `kill`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS-only: accurate phys_footprint memory. On Linux marina falls back to RSS.
 [target.'cfg(target_os = "macos")'.dependencies]

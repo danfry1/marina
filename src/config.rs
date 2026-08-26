@@ -19,6 +19,11 @@
 //! [[group]]             # bundle targets that don't share a cwd (app + its db)
 //! name    = "client-portal"
 //! members = [3000, 5432, "worker"]   # ports, project names, or command labels
+//!
+//! [[ignore]]            # hide noise the heuristics keep picking up
+//! match_cmd  = "OrbStack|CloudSyncAgent"
+//! # and/or:
+//! match_port = 7000
 //! ```
 
 use std::path::PathBuf;
@@ -35,6 +40,8 @@ pub struct ConfigFile {
     pub overrides: Vec<OverrideCfg>,
     #[serde(default)]
     pub group: Vec<GroupCfg>,
+    #[serde(default)]
+    pub ignore: Vec<IgnoreCfg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,13 +73,21 @@ pub struct GroupCfg {
     pub members: Vec<toml::Value>,
 }
 
+/// Hide a target the curation heuristics keep surfacing. Conditions AND together;
+/// a rule with neither field is inert.
+#[derive(Debug, Deserialize)]
+pub struct IgnoreCfg {
+    pub match_cmd: Option<String>,
+    pub match_port: Option<u16>,
+}
+
+/// `$XDG_CONFIG_HOME/marina/config.toml`, falling back to `~/.config/...`.
 pub fn config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h)
-            .join(".config")
-            .join("marina")
-            .join("config.toml")
-    })
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("marina").join("config.toml"))
 }
 
 /// Load + parse the config file. Returns an empty config (and warns) on a parse
@@ -117,6 +132,12 @@ mod tests {
             [[group]]
             name = "client-portal"
             members = [3000, 5432, "worker"]
+
+            [[ignore]]
+            match_cmd = "OrbStack"
+
+            [[ignore]]
+            match_port = 7000
             "#,
         )
         .unwrap();
@@ -126,6 +147,8 @@ mod tests {
         assert_eq!(cfg.overrides[0].match_port, Some(3000));
         assert_eq!(cfg.group[0].name, "client-portal");
         assert_eq!(cfg.group[0].members.len(), 3);
+        assert_eq!(cfg.ignore.len(), 2);
+        assert_eq!(cfg.ignore[1].match_port, Some(7000));
     }
 
     #[test]

@@ -3,20 +3,22 @@
 //! Snapshot. Runs on its own thread; the UI never blocks on this work.
 //!
 //! Filesystem resolution (project root + name) is cached by path so the hot
-//! loop doesn't re-walk the tree every tick. The thread uses an adaptive
-//! cadence: ~1s while topology is changing, backing off toward ~5s once the set
-//! of targets is stable — so a cockpit left open all day idles near zero CPU.
+//! loop doesn't re-walk the tree every tick; the caches clear whenever the
+//! topology changes so renames are picked up. The thread uses an adaptive
+//! cadence: ~1s while topology is changing, backing off toward ~5s once the
+//! set of targets is stable — and the UI can demand an immediate rebuild over
+//! the control channel (e.g. right after a verb).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::model::{Anchor, Snapshot, Target, TargetKey, TargetKind};
-use crate::msg::SamplerMsg;
+use crate::msg::{SamplerCtl, SamplerMsg};
 use crate::resolve;
 use crate::sources::{Netstat2Ports, PortSource, ProcInfo, ProcSource, SysinfoProcs};
 
@@ -37,6 +39,10 @@ const NON_DEV_PARENTS: &[&str] = &[
     "systemd",
 ];
 
+/// How long a `docker ps` result is trusted before re-querying — the daemon
+/// call is a subprocess and must not run on every 1s tick.
+const DOCKER_TTL: Duration = Duration::from_secs(5);
+
 type RootCache = HashMap<PathBuf, Option<PathBuf>>;
 type NameCache = HashMap<PathBuf, String>;
 
@@ -44,10 +50,14 @@ pub struct Sampler {
     ports: Box<dyn PortSource + Send>,
     procs: Box<dyn ProcSource + Send>,
     resolver: resolve::Resolver,
-    ewma: HashMap<u32, f32>, // smoothed CPU keyed by anchor pid
-    root_cache: RootCache,   // cwd -> project root
-    name_cache: NameCache,   // project root -> project name
+    ewma: HashMap<(u32, u64), f32>, // smoothed CPU keyed by anchor fingerprint
+    root_cache: RootCache,          // cwd -> project root
+    name_cache: NameCache,          // project root -> project name
+    docker_cache: Option<(Instant, HashMap<u16, crate::docker::ContainerPort>)>,
     home: Option<PathBuf>,
+    last_topology: Vec<TargetKey>,
+    /// Did the last `build()` change the set of target keys? Drives cadence.
+    pub topology_changed: bool,
     seq: u64,
 }
 
@@ -60,7 +70,10 @@ impl Sampler {
             ewma: HashMap::new(),
             root_cache: HashMap::new(),
             name_cache: HashMap::new(),
+            docker_cache: None,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            last_topology: Vec::new(),
+            topology_changed: false,
             seq: 0,
         }
     }
@@ -68,24 +81,36 @@ impl Sampler {
     pub fn build(&mut self) -> Snapshot {
         self.procs.refresh();
 
+        // A port-scan failure must surface, never render as "no dev processes".
+        let (listeners, error) = match self.ports.listeners() {
+            Ok(l) => (l, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+
         // Pull caches out as locals so the closure doesn't borrow all of `self`
         // while `self.procs` is borrowed immutably.
         let mut root_cache = std::mem::take(&mut self.root_cache);
         let mut name_cache = std::mem::take(&mut self.name_cache);
         let home = self.home.clone();
 
+        // Docker host-proxy ports found this pass (resolved after the borrow ends).
+        let mut docker_ports: HashSet<u16> = HashSet::new();
+
         // Phase 1: build raw targets (CPU not yet smoothed).
         let mut targets: Vec<Target> = {
             let procs = self.procs.procs();
             let children = child_map(procs);
-            let listeners = self.ports.listeners();
             // Never list the session marina runs inside (its own ancestor chain:
             // shell, terminal/ttyd, sshd, …) — you'd never want to kill that.
             let own = ancestors(std::process::id(), procs);
+            // Any listener on a non-loopback address is LAN-reachable.
+            let mut exposed_ports: HashMap<u16, bool> = HashMap::new();
+            for l in &listeners {
+                *exposed_ports.entry(l.port).or_default() |= l.exposed;
+            }
 
             // Group listener ports by their (boundary-bounded) anchor.
             let mut by_anchor: HashMap<u32, AnchorAgg> = HashMap::new();
-            let mut docker_ports: HashSet<u16> = HashSet::new();
             for l in &listeners {
                 let Some(p) = procs.get(&l.pid) else { continue };
                 if own.contains(&l.pid) {
@@ -96,7 +121,10 @@ impl Sampler {
                     docker_ports.insert(l.port);
                     continue;
                 }
-                let root = p.cwd.as_deref().and_then(|c| root_of(c, &mut root_cache));
+                let root = p
+                    .cwd
+                    .as_deref()
+                    .and_then(|c| root_of(c, &mut root_cache, home.as_deref()));
                 if !is_dev_target(p.cwd.as_deref(), root.as_deref(), home.as_deref()) {
                     continue;
                 }
@@ -114,7 +142,9 @@ impl Sampler {
             let mut claimed: HashSet<u32> = HashSet::new();
             let mut out: Vec<Target> = Vec::new();
 
-            // Listener targets.
+            // Listener targets. Two anchors can share a port (SO_REUSEPORT,
+            // split v4/v6 binders) — merged below so TargetKey stays unique.
+            let mut by_port: HashMap<u16, usize> = HashMap::new();
             for (anchor, agg) in by_anchor {
                 let subtree = subtree(anchor, &children);
                 claimed.extend(subtree.iter().copied());
@@ -128,12 +158,18 @@ impl Sampler {
                 ports.dedup();
                 let key_port = *ports.first().expect("listener target has >=1 port");
 
+                let argv_joined = anchor_argv.join(" ");
                 let argvs = subtree_argvs(&subtree, procs);
                 let (mut label, url) = self.resolver.label_and_url(&argvs, Some(key_port));
+                if self.resolver.is_ignored(&ports, &argv_joined)
+                    || self.resolver.is_ignored(&ports, &label)
+                {
+                    continue; // user said: never show this (subtree stays claimed)
+                }
                 let mut project = project_name(agg.root.as_deref(), &cwd, &mut name_cache);
                 self.resolver.apply_override(
                     Some(key_port),
-                    &anchor_argv.join(" "),
+                    &argv_joined,
                     &mut project,
                     &mut label,
                 );
@@ -141,8 +177,11 @@ impl Sampler {
                     project = g;
                 }
                 let git_branch = agg.root.as_deref().and_then(resolve::git_branch);
+                let exposed = ports
+                    .iter()
+                    .any(|p| exposed_ports.get(p).copied().unwrap_or(false));
 
-                out.push(Target {
+                let target = Target {
                     key: TargetKey::Port(key_port),
                     kind: TargetKind::Listener,
                     ports,
@@ -151,6 +190,7 @@ impl Sampler {
                         start_time: anchor_p.map(|p| p.start_time).unwrap_or(0),
                     },
                     anchor_argv,
+                    pid_starts: pid_starts(&subtree, procs),
                     pids: subtree,
                     project,
                     command_label: label,
@@ -159,11 +199,22 @@ impl Sampler {
                     cpu_pct: cpu_raw,
                     mem_bytes: mem,
                     url,
-                });
+                    exposed,
+                    container: None,
+                };
+                match by_port.get(&key_port) {
+                    Some(&i) => merge_into(&mut out[i], target),
+                    None => {
+                        by_port.insert(key_port, out.len());
+                        out.push(target);
+                    }
+                }
             }
 
             // Watched targets: standalone port-less watchers not already claimed
-            // by a listener subtree (subtree absorption — ADR 0001).
+            // by a listener subtree (subtree absorption — ADR 0001). Pids are a
+            // set: a watcher that is a descendant of another with the same
+            // identity must not be double-counted.
             let mut watched: HashMap<(String, String, PathBuf), WatchAgg> = HashMap::new();
             for p in procs.values() {
                 if claimed.contains(&p.pid) || resolve::is_shell(&p.name) || own.contains(&p.pid) {
@@ -172,14 +223,19 @@ impl Sampler {
                 let Some(label) = self.resolver.watcher_label(&p.argv) else {
                     continue;
                 };
-                let root = p.cwd.as_deref().and_then(|c| root_of(c, &mut root_cache));
+                if self.resolver.is_ignored(&[], &p.argv.join(" ")) {
+                    continue;
+                }
+                let root = p
+                    .cwd
+                    .as_deref()
+                    .and_then(|c| root_of(c, &mut root_cache, home.as_deref()));
                 let cwd = p.cwd.clone().unwrap_or_default();
                 let mut project = project_name(root.as_deref(), &cwd, &mut name_cache);
                 if let Some(g) = self.resolver.group_name(&[], &project, &label) {
                     project = g;
                 }
                 let sub = subtree(p.pid, &children);
-                let (cpu, mem) = rollup(&sub, procs);
                 let agg = watched
                     .entry((project.clone(), label.clone(), cwd.clone()))
                     .or_insert_with(|| WatchAgg {
@@ -189,15 +245,13 @@ impl Sampler {
                         project,
                         label,
                         cwd,
-                        pids: Vec::new(),
-                        cpu: 0.0,
-                        mem: 0,
+                        pids: HashSet::new(),
                     });
-                agg.cpu += cpu;
-                agg.mem += mem;
                 agg.pids.extend(sub);
             }
             for w in watched.into_values() {
+                let pids: Vec<u32> = w.pids.into_iter().collect();
+                let (cpu, mem) = rollup(&pids, procs);
                 out.push(Target {
                     key: TargetKey::Command {
                         project: w.project.clone(),
@@ -211,50 +265,18 @@ impl Sampler {
                         start_time: w.start_time,
                     },
                     anchor_argv: w.argv,
-                    pids: w.pids,
+                    pid_starts: pid_starts(&pids, procs),
+                    pids,
                     project: w.project,
                     command_label: w.label,
                     cwd: w.cwd,
                     git_branch: None,
-                    cpu_pct: w.cpu,
-                    mem_bytes: w.mem,
+                    cpu_pct: cpu,
+                    mem_bytes: mem,
                     url: None,
+                    exposed: false,
+                    container: None,
                 });
-            }
-
-            // Docker targets: name host-bound container ports via `docker ps`.
-            // Container cpu/mem live in the VM and aren't captured (shown as `—`,
-            // since pids is empty). Fail-silent: no daemon -> no rows.
-            if !docker_ports.is_empty() {
-                let dmap = crate::docker::port_map();
-                let mut ports: Vec<u16> = docker_ports.into_iter().collect();
-                ports.sort_unstable();
-                for port in ports {
-                    if let Some((name, image)) = dmap.get(&port) {
-                        let project = self
-                            .resolver
-                            .group_name(&[port], name, image)
-                            .unwrap_or_else(|| name.clone());
-                        out.push(Target {
-                            key: TargetKey::Port(port),
-                            kind: TargetKind::Listener,
-                            ports: vec![port],
-                            anchor: Anchor {
-                                pid: 0,
-                                start_time: 0,
-                            },
-                            anchor_argv: Vec::new(),
-                            pids: Vec::new(),
-                            project,
-                            command_label: image.clone(),
-                            cwd: PathBuf::new(),
-                            git_branch: None,
-                            cpu_pct: 0.0,
-                            mem_bytes: 0,
-                            url: resolve::default_url(image, port),
-                        });
-                    }
-                }
             }
             out
         };
@@ -262,9 +284,54 @@ impl Sampler {
         self.root_cache = root_cache;
         self.name_cache = name_cache;
 
-        // Phase 2: smooth CPU (EWMA) keyed by anchor pid.
+        // Docker targets: name host-bound container ports via `docker ps`
+        // (cached — a subprocess must not run on every tick). Container cpu/mem
+        // live in the VM and aren't captured (shown as `—`, since pids is
+        // empty). Verbs go through `docker stop/restart/logs`.
+        if !docker_ports.is_empty() {
+            let dmap = self.docker_map().clone(); // small; frees &mut self
+            let mut ports: Vec<u16> = docker_ports.into_iter().collect();
+            ports.sort_unstable();
+            for port in ports {
+                if let Some(c) = dmap.get(&port) {
+                    if self.resolver.is_ignored(&[port], &c.image)
+                        || self.resolver.is_ignored(&[port], &c.name)
+                    {
+                        continue;
+                    }
+                    let project = self
+                        .resolver
+                        .group_name(&[port], &c.name, &c.image)
+                        .unwrap_or_else(|| c.name.clone());
+                    targets.push(Target {
+                        key: TargetKey::Port(port),
+                        kind: TargetKind::Listener,
+                        ports: vec![port],
+                        anchor: Anchor {
+                            pid: 0,
+                            start_time: 0,
+                        },
+                        anchor_argv: Vec::new(),
+                        pid_starts: Vec::new(),
+                        pids: Vec::new(),
+                        project,
+                        command_label: c.image.clone(),
+                        cwd: PathBuf::new(),
+                        git_branch: None,
+                        cpu_pct: 0.0,
+                        mem_bytes: 0,
+                        url: resolve::default_url(&c.image, port),
+                        exposed: c.exposed,
+                        container: Some(c.name.clone()),
+                    });
+                }
+            }
+        }
+
+        // Phase 2: smooth CPU (EWMA) keyed by the anchor *fingerprint*, so a
+        // recycled pid never inherits a dead process's smoothing history.
         for t in &mut targets {
-            t.cpu_pct = self.smooth(t.anchor.pid, t.cpu_pct);
+            t.cpu_pct = self.smooth(&t.anchor, t.cpu_pct);
         }
         self.prune_ewma(&targets);
 
@@ -276,22 +343,50 @@ impl Sampler {
             (None, None) => a.project.cmp(&b.project),
         });
 
+        // Track topology; on change, drop the path caches so a renamed project
+        // or moved root is re-resolved rather than served stale forever.
+        let topo: Vec<TargetKey> = targets.iter().map(|t| t.key.clone()).collect();
+        self.topology_changed = topo != self.last_topology;
+        if self.topology_changed {
+            self.root_cache.clear();
+            self.name_cache.clear();
+            self.last_topology = topo;
+        }
+
         self.seq += 1;
         Snapshot {
             seq: self.seq,
             targets,
+            error,
         }
     }
 
-    fn smooth(&mut self, anchor: u32, raw: f32) -> f32 {
-        let e = self.ewma.entry(anchor).or_insert(raw);
+    fn docker_map(&mut self) -> &HashMap<u16, crate::docker::ContainerPort> {
+        let stale = self
+            .docker_cache
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > DOCKER_TTL);
+        if stale {
+            self.docker_cache = Some((Instant::now(), crate::docker::port_map()));
+        }
+        &self.docker_cache.as_ref().expect("just set").1
+    }
+
+    fn smooth(&mut self, anchor: &Anchor, raw: f32) -> f32 {
+        let e = self
+            .ewma
+            .entry((anchor.pid, anchor.start_time))
+            .or_insert(raw);
         *e = 0.4 * raw + 0.6 * *e;
         *e
     }
 
     fn prune_ewma(&mut self, targets: &[Target]) {
-        let live: HashSet<u32> = targets.iter().map(|t| t.anchor.pid).collect();
-        self.ewma.retain(|pid, _| live.contains(pid));
+        let live: HashSet<(u32, u64)> = targets
+            .iter()
+            .map(|t| (t.anchor.pid, t.anchor.start_time))
+            .collect();
+        self.ewma.retain(|k, _| live.contains(k));
     }
 }
 
@@ -301,41 +396,62 @@ impl Default for Sampler {
     }
 }
 
-/// Topology fingerprint — the set of target keys. Used to detect "nothing
-/// structurally changed" so the cadence can back off.
-fn topology(snap: &Snapshot) -> Vec<TargetKey> {
-    snap.targets.iter().map(|t| t.key.clone()).collect()
+/// Fold `extra` into `base` when two anchors share a port (SO_REUSEPORT /
+/// split v4+v6). Rollups add; identity fields keep the first anchor's.
+fn merge_into(base: &mut Target, extra: Target) {
+    base.ports.extend(extra.ports);
+    base.ports.sort_unstable();
+    base.ports.dedup();
+    for p in extra.pids {
+        if !base.pids.contains(&p) {
+            base.pids.push(p);
+        }
+    }
+    for ps in extra.pid_starts {
+        if !base.pid_starts.contains(&ps) {
+            base.pid_starts.push(ps);
+        }
+    }
+    base.cpu_pct += extra.cpu_pct;
+    base.mem_bytes += extra.mem_bytes;
+    base.exposed |= extra.exposed;
 }
 
-/// Spawn the sampler thread; returns the channel the UI drains.
-/// Adaptive cadence: 1s while topology changes, doubling toward a 5s cap once
-/// stable. The thread also wakes immediately if the UI requests it (drop the
-/// returned sender to stop the thread).
-pub fn spawn() -> Receiver<SamplerMsg> {
+/// Spawn the sampler thread; returns the snapshot channel the UI drains and a
+/// control sender: `SamplerCtl::Refresh` forces an immediate rebuild, and
+/// dropping the sender shuts the thread down. Adaptive cadence: 1s while
+/// topology changes, doubling toward a 5s cap once stable.
+pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
     const FAST: Duration = Duration::from_millis(1000);
     const MAX: Duration = Duration::from_millis(5000);
 
     let (tx, rx) = mpsc::channel();
+    let (ctl_tx, ctl_rx) = mpsc::channel::<SamplerCtl>();
     thread::spawn(move || {
         let mut sampler = Sampler::new();
-        let mut prev_topology: Vec<TargetKey> = Vec::new();
         let mut delay = FAST;
         loop {
             let snap = sampler.build();
-            let topo = topology(&snap);
-            if topo == prev_topology {
-                delay = (delay * 2).min(MAX); // stable -> back off
+            delay = if sampler.topology_changed {
+                FAST // changed -> stay responsive
             } else {
-                delay = FAST; // changed -> stay responsive
-                prev_topology = topo;
-            }
+                (delay * 2).min(MAX) // stable -> back off
+            };
             if tx.send(SamplerMsg::Snapshot(Arc::new(snap))).is_err() {
                 break; // UI gone
             }
-            thread::sleep(delay);
+            match ctl_rx.recv_timeout(delay) {
+                Ok(SamplerCtl::Refresh) => {
+                    delay = FAST;
+                    // collapse a burst of refresh requests into one rebuild
+                    while ctl_rx.try_recv().is_ok() {}
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break, // UI shut down
+            }
         }
     });
-    rx
+    (rx, ctl_tx)
 }
 
 struct AnchorAgg {
@@ -350,9 +466,7 @@ struct WatchAgg {
     project: String,
     label: String,
     cwd: PathBuf,
-    pids: Vec<u32>,
-    cpu: f32,
-    mem: u64,
+    pids: HashSet<u32>,
 }
 
 /// Dev-centric curation: keep a listener only if it has a project root, or its
@@ -367,11 +481,11 @@ fn is_dev_target(cwd: Option<&Path>, root: Option<&Path>, home: Option<&Path>) -
     }
 }
 
-fn root_of(cwd: &Path, cache: &mut RootCache) -> Option<PathBuf> {
+fn root_of(cwd: &Path, cache: &mut RootCache, home: Option<&Path>) -> Option<PathBuf> {
     if let Some(r) = cache.get(cwd) {
         return r.clone();
     }
-    let r = resolve::project_root(cwd);
+    let r = resolve::project_root(cwd, home);
     cache.insert(cwd.to_path_buf(), r.clone());
     r
 }
@@ -396,6 +510,14 @@ fn project_name(root: Option<&Path>, cwd: &Path, cache: &mut NameCache) -> Strin
 fn subtree_argvs(pids: &[u32], procs: &HashMap<u32, ProcInfo>) -> Vec<Vec<String>> {
     pids.iter()
         .filter_map(|pid| procs.get(pid).map(|p| p.argv.clone()))
+        .collect()
+}
+
+/// `(pid, start_time)` fingerprints for a subtree — what verbs verify before
+/// signalling, so a recycled pid number is never hit.
+fn pid_starts(pids: &[u32], procs: &HashMap<u32, ProcInfo>) -> Vec<(u32, u64)> {
+    pids.iter()
+        .filter_map(|pid| procs.get(pid).map(|p| (p.pid, p.start_time)))
         .collect()
 }
 
@@ -485,6 +607,7 @@ fn rollup(pids: &[u32], procs: &HashMap<u32, ProcInfo>) -> (f32, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::Listener;
 
     fn proc(pid: u32, ppid: Option<u32>, name: &str, cwd: &str, argv: &[&str]) -> ProcInfo {
         ProcInfo {
@@ -596,16 +719,24 @@ mod tests {
 
     // --- full build() pipeline via fake sources -----------------------------
 
-    struct FakePorts(Vec<crate::sources::Listener>);
+    struct FakePorts(Vec<Listener>);
     impl PortSource for FakePorts {
-        fn listeners(&mut self) -> Vec<crate::sources::Listener> {
-            self.0
+        fn listeners(&mut self) -> Result<Vec<Listener>, String> {
+            Ok(self
+                .0
                 .iter()
-                .map(|l| crate::sources::Listener {
+                .map(|l| Listener {
                     port: l.port,
                     pid: l.pid,
+                    exposed: l.exposed,
                 })
-                .collect()
+                .collect())
+        }
+    }
+    struct FailingPorts;
+    impl PortSource for FailingPorts {
+        fn listeners(&mut self) -> Result<Vec<Listener>, String> {
+            Err("boom".into())
         }
     }
     struct FakeProcs(HashMap<u32, ProcInfo>);
@@ -616,7 +747,15 @@ mod tests {
         }
     }
 
-    fn sampler_with(listeners: Vec<crate::sources::Listener>, procs: Vec<ProcInfo>) -> Sampler {
+    fn listener(port: u16, pid: u32) -> Listener {
+        Listener {
+            port,
+            pid,
+            exposed: false,
+        }
+    }
+
+    fn sampler_with(listeners: Vec<Listener>, procs: Vec<ProcInfo>) -> Sampler {
         Sampler {
             ports: Box::new(FakePorts(listeners)),
             procs: Box::new(FakeProcs(map(procs))),
@@ -624,14 +763,16 @@ mod tests {
             ewma: HashMap::new(),
             root_cache: HashMap::new(),
             name_cache: HashMap::new(),
+            docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
             home: Some(PathBuf::from("/Users/me")),
+            last_topology: Vec::new(),
+            topology_changed: false,
             seq: 0,
         }
     }
 
     #[test]
     fn build_resolves_a_listener_end_to_end() {
-        use crate::sources::Listener;
         // a vite server under $HOME (no manifest on disk -> project = cwd basename)
         let procs = vec![proc(
             200,
@@ -640,13 +781,7 @@ mod tests {
             "/Users/me/web",
             &["node", "/x/.bin/vite", "dev"],
         )];
-        let mut s = sampler_with(
-            vec![Listener {
-                port: 3000,
-                pid: 200,
-            }],
-            procs,
-        );
+        let mut s = sampler_with(vec![listener(3000, 200)], procs);
         let snap = s.build();
         assert_eq!(snap.targets.len(), 1);
         let t = &snap.targets[0];
@@ -654,6 +789,85 @@ mod tests {
         assert_eq!(t.command_label, "vite"); // subtree label resolution
         assert_eq!(t.project, "web"); // cwd basename fallback
         assert!(t.url.as_ref().map(|u| u.value.as_str()) == Some("http://localhost:3000"));
+        assert_eq!(t.pid_starts, vec![(200, 0)]); // kill fingerprint captured
+        assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn build_surfaces_a_port_scan_failure() {
+        let mut s = sampler_with(vec![], vec![]);
+        s.ports = Box::new(FailingPorts);
+        let snap = s.build();
+        assert_eq!(snap.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn build_merges_two_anchors_on_one_port() {
+        // SO_REUSEPORT: two separate anchor processes both hold :4000.
+        let procs = vec![
+            proc(200, Some(1), "node", "/Users/me/a", &["node", "s.js"]),
+            proc(300, Some(1), "node", "/Users/me/a", &["node", "s.js"]),
+        ];
+        let mut s = sampler_with(vec![listener(4000, 200), listener(4000, 300)], procs);
+        let snap = s.build();
+        assert_eq!(
+            snap.targets.len(),
+            1,
+            "one row per port, not one per anchor"
+        );
+        let t = &snap.targets[0];
+        let mut pids = t.pids.clone();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![200, 300]);
+    }
+
+    #[test]
+    fn build_marks_lan_exposed_listeners() {
+        let procs = vec![proc(
+            200,
+            Some(1),
+            "node",
+            "/Users/me/web",
+            &["node", "s.js"],
+        )];
+        let mut s = sampler_with(
+            vec![Listener {
+                port: 3000,
+                pid: 200,
+                exposed: true,
+            }],
+            procs,
+        );
+        assert!(s.build().targets[0].exposed);
+    }
+
+    #[test]
+    fn nested_watchers_do_not_double_count() {
+        // nodemon spawns a nodemon child: same (project, label, cwd) identity —
+        // the child's pids must not be counted twice. (Pids far above any real
+        // pid, so the phys_footprint lookup in rollup can't hit a live process.)
+        let mut parent = proc(
+            900_500,
+            Some(1),
+            "node",
+            "/Users/me/lib",
+            &["node", "/x/.bin/nodemon"],
+        );
+        parent.mem_bytes = 100;
+        let mut child = proc(
+            900_501,
+            Some(900_500),
+            "node",
+            "/Users/me/lib",
+            &["node", "/x/.bin/nodemon"],
+        );
+        child.mem_bytes = 40;
+        let mut s = sampler_with(vec![], vec![parent, child]);
+        let snap = s.build();
+        assert_eq!(snap.targets.len(), 1);
+        let t = &snap.targets[0];
+        assert_eq!(t.pids.len(), 2, "both pids, once each");
+        assert_eq!(t.mem_bytes, 140, "memory counted once per pid");
     }
 
     #[test]
@@ -671,7 +885,6 @@ mod tests {
 
     #[test]
     fn build_excludes_marinas_own_session() {
-        use crate::sources::Listener;
         // a listener whose pid is marina's own pid (i.e. our session) is dropped
         let me = std::process::id();
         let procs = vec![proc(
@@ -681,28 +894,31 @@ mod tests {
             "/Users/me/web",
             &["node", "server.js"],
         )];
-        let mut s = sampler_with(
-            vec![Listener {
-                port: 4000,
-                pid: me,
-            }],
-            procs,
-        );
+        let mut s = sampler_with(vec![listener(4000, me)], procs);
         assert_eq!(s.build().targets.len(), 0);
     }
 
     #[test]
     fn build_drops_non_dev_listeners() {
-        use crate::sources::Listener;
         // cwd "/" with no project root, not under $HOME -> filtered out
         let procs = vec![proc(50, Some(1), "rapportd", "/", &["/usr/sbin/rapportd"])];
-        let mut s = sampler_with(
-            vec![Listener {
-                port: 50555,
-                pid: 50,
-            }],
-            procs,
-        );
+        let mut s = sampler_with(vec![listener(50555, 50)], procs);
         assert_eq!(s.build().targets.len(), 0);
+    }
+
+    #[test]
+    fn topology_change_is_flagged_then_settles() {
+        let procs = vec![proc(
+            200,
+            Some(1),
+            "node",
+            "/Users/me/web",
+            &["node", "s.js"],
+        )];
+        let mut s = sampler_with(vec![listener(3000, 200)], procs);
+        s.build();
+        assert!(s.topology_changed, "first build changes topology");
+        s.build();
+        assert!(!s.topology_changed, "same targets -> stable");
     }
 }
