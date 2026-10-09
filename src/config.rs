@@ -28,6 +28,9 @@
 //! [notify]
 //! desktop = false       # no desktop notification when an agent session
 //!                       # ends and leaves servers running (default: true)
+//!
+//! [ports]
+//! range = [4100, 4999]  # where `marina port` assigns from (default 3100-3999)
 //! ```
 
 use std::path::PathBuf;
@@ -48,6 +51,23 @@ pub struct ConfigFile {
     pub ignore: Vec<IgnoreCfg>,
     #[serde(default)]
     pub notify: NotifyCfg,
+    #[serde(default)]
+    pub ports: PortsCfg,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PortsCfg {
+    /// Inclusive `[low, high]` range for `marina port`.
+    pub range: Option<[u16; 2]>,
+}
+
+impl PortsCfg {
+    pub fn range(&self) -> std::ops::RangeInclusive<u16> {
+        match self.range {
+            Some([lo, hi]) if lo > 0 && lo <= hi => lo..=hi,
+            _ => crate::ports::DEFAULT_RANGE,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +200,18 @@ mod tests {
         let cfg: ConfigFile = toml::from_str("").unwrap();
         assert!(cfg.rule.is_empty() && cfg.group.is_empty());
         assert!(cfg.notify.desktop, "desktop notifications default on");
+    }
+
+    #[test]
+    fn ports_range_is_configurable_and_sanity_checked() {
+        let cfg: ConfigFile = toml::from_str("[ports]\nrange = [4100, 4199]").unwrap();
+        assert_eq!(cfg.ports.range(), 4100..=4199);
+        let bad: ConfigFile = toml::from_str("[ports]\nrange = [5000, 4000]").unwrap();
+        assert_eq!(bad.ports.range(), crate::ports::DEFAULT_RANGE);
+        assert_eq!(
+            ConfigFile::default().ports.range(),
+            crate::ports::DEFAULT_RANGE
+        );
     }
 
     #[test]

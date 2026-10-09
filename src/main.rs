@@ -7,6 +7,7 @@ mod launcher;
 mod logs;
 mod model;
 mod msg;
+mod ports;
 mod resolve;
 mod sampler;
 mod sources;

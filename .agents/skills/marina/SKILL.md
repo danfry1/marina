@@ -62,6 +62,10 @@ marina who <port>           # what's holding a port — a dev target, another
 marina free <port>          # stop the dev target on a port and wait until the
                             # port is released; already free = exit 0. Refuses
                             # (exit 1) if the holder isn't a dev target
+marina port [name]          # a stable, free port for the current project /
+                            # worktree — same every call, never shared with
+                            # another worktree. stdout is just the number
+marina port --list          # all assignments · `--release [name]` returns one
 marina version              # version check (also proves the binary works)
 ```
 
@@ -91,6 +95,12 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 - **"stop/kill the X project"** → `marina ls --json` to find the exact `project`
   value, then `marina kill <project>`. Prefer the exact name to avoid
   over-matching (a substring like `api` could match several).
+- **Starting a dev server** (especially in a git worktree, or when other agents
+  may be running the same project) → don't hard-code `:3000`; ask marina:
+  `pnpm dev --port $(marina port)` / `PORT=$(marina port) npm run dev`. Use a
+  name per service when starting several: `$(marina port web)`,
+  `$(marina port api)`. It's stable, so repeat calls (and restarts) get the same
+  port. When you're done with the worktree, `marina port --release`.
 - **"free up port 5432"** → `marina free 5432`. If it reports a holder that
   isn't a dev target, tell the user what it is rather than killing it yourself.
 - **"clean up" / end of a task where you started servers** → `marina kill --mine`.

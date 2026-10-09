@@ -146,8 +146,25 @@ marina restart <selector>     # output captured to ~/.local/state/marina/logs/
 marina url <selector> [--json]
 marina who <port>… [--json]   # what's holding a port — dev target or not
 marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
+marina port [name] [--json]   # a stable, collision-free port for this project/worktree
+marina port --list            # every assigned port · --release [name] gives one back
 marina version
 ```
+
+`port` is for running many copies of a project at once — parallel agents in
+parallel git worktrees all reaching for `:3000`:
+
+```sh
+pnpm dev --port $(marina port)        # in each worktree: its own port, every time
+PORT=$(marina port api) cargo run     # several services in one tree: name them
+```
+
+Each project root (each worktree, each package of a monorepo) gets its own port
+from `3100–3999` (`[ports] range` in config), chosen by a stable hash and
+remembered in `~/.local/state/marina/ports.json`. Assignments are made under a
+file lock, so concurrent callers never collide; a port taken over by another
+project's process is replaced (with a note on stderr), while this project's own
+server keeps it. Assignments for deleted worktrees are dropped automatically.
 
 `who` and `free` are for the `EADDRINUSE` moment:
 
@@ -223,10 +240,12 @@ marina is deliberately boring on this front:
   phone-home, no data leaves your machine. (`netstat2`/`libproc` *read* the OS's
   socket and process tables locally; `mio` polls the terminal for keystrokes.)
 - **Almost nothing is persisted.** marina reads, displays, and forgets. The only
-  optional file it *reads* is `~/.config/marina/config.toml`. The one write is
-  user-triggered: when **you** restart a process (`R` / `marina restart`), the
-  new process's stdout/stderr is captured to
-  `~/.local/state/marina/logs/<project>.log` so `T` can always tail it.
+  optional file it *reads* is `~/.config/marina/config.toml`. Its writes are
+  user-triggered and live under `~/.local/state/marina/`: when **you** restart a
+  process (`R` / `marina restart`), the new process's stdout/stderr is captured
+  to `logs/<project>.log` so `T` can always tail it; and `marina port` records
+  its assignments (port, project root, optional service name, timestamps) in
+  `ports.json`.
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
   ever inspects your own user's processes — system/root daemons and anything
   outside `$HOME` are filtered out (and the OS wouldn't let it read others
@@ -259,7 +278,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~8k LOC · 117 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~8.3k LOC · 127 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

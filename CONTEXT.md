@@ -90,6 +90,10 @@
   …), an *editor*, a *terminal*, or nobody any more (*detached*). Shown in the
   `VIA` column; the basis of the `--mine` / `--orphaned` scopes.
 
+- **Port lease** — a `marina port` assignment: (project root, optional service
+  name) → port, stable across calls and exclusive across worktrees. Stored in
+  `ports.json`; dropped when its root is deleted or on `--release`.
+
 - **Session view** — the `v` grouping mode: group headers are launchers (agent
   sessions, editors, terminals) instead of projects.
 
