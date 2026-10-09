@@ -409,20 +409,50 @@ pid, alive, session, cwd }`, resolved in `launcher.rs` from two signals:
    (`claude`, `codex`, `opencode`, `gemini`, `cursor-agent`, `aider`, …, also
    node-hosted CLIs) wins outright; else the nearest editor, then
    terminal/multiplexer. An unrecognized non-shell ancestor (some supervisor)
-   yields `None` — no guessing.
-2. **Agent env markers**, consulted only when the chain has no launcher (the
-   server was reparented to pid 1 after `&`/`nohup`). Claude Code exports
-   `CLAUDE_PID` + `CLAUDE_CODE_SESSION_ID` (and `AI_AGENT`) to everything it
-   spawns, and env survives reparenting. If that pid is no longer an agent
-   process the session has ended → **orphaned** (`claude·ended`, yellow). Env
-   is never consulted when a terminal/editor is in the chain: a tmux server
-   started from an agent would otherwise stamp its markers onto every pane.
+   yields `None` — no guessing. A live agent picks up its own session id from
+   the markers below (when they name the same agent).
+2. **Agent env markers** (`MARKERS` in `launcher.rs`), which agents export to
+   every command they run and which survive reparenting after `&`/`nohup`:
+
+   | agent | session / thread | pid | flags |
+   |---|---|---|---|
+   | Claude Code | `CLAUDE_CODE_SESSION_ID` | `CLAUDE_PID` | `CLAUDECODE` |
+   | Codex | `CODEX_THREAD_ID` | — | `CODEX_SANDBOX` |
+   | opencode | `OPENCODE_SESSION_ID` | — | `OPENCODE` |
+   | Copilot | `COPILOT_AGENT_SESSION_ID` | — | `COPILOT_AGENT`, `COPILOT_CLI` |
+   | Amp | `AMP_CURRENT_THREAD_ID` | — | — |
+   | Cline · Roo · Qwen · Pi | `CLINE_TASK_ID` · `ROO_CODE_TASK_ID` · `QWEN_CODE_SESSION_ID` · `PI_SESSION_ID` | — | `CLINE_ACTIVE` · `QWEN_CODE` · `PI_CODING_AGENT` |
+   | Cursor · Gemini · Goose · Augment · Crush · Kiro | — | — | `CURSOR_AGENT`/`CURSOR_SANDBOX` · `GEMINI_CLI` · `GOOSE_TERMINAL` · `AUGMENT_AGENT` · `CRUSH` · `KIRO_AGENT_PATH` |
+
+   The cross-agent `AI_AGENT` / `AGENT` values name an agent only when no
+   specific marker does. Sources: each agent's source or shipped binary
+   (Codex `exec_env.rs`, opencode's bash tool), cross-checked with the
+   `is-ai-agent` table. With markers from several agents (one agent launched
+   from another's shell) the table order decides — env can't say which is
+   innermost; the live chain, when present, always wins.
+
+   Markers are consulted when the chain has no launcher (reparented), and
+   when the nearest launcher is an *editor* — Cursor's and Copilot's agents
+   run commands inside the editor, so the markers mean the agent did it.
+   Never under a terminal/multiplexer: a tmux server started from an agent
+   would otherwise stamp its markers onto every later pane.
+
+   **Orphaned requires proof**: only a marker pid (`CLAUDE_PID` today) that is
+   no longer an agent process marks the session ended (`claude·ended`,
+   yellow). Agents that export only a session id are attributed and grouped
+   but never called ended.
+
+The anchor climb (ADR 0002) also stops at any launcher: an agent often runs
+*in* the project dir, and without the stop it would be absorbed as the anchor —
+mislabeling the row and putting the agent itself in the kill set.
 
 Reparented with no markers → `detached`. Docker targets have no launcher.
 
 Privacy: only the allowlisted keys above are extracted from a process env
-(`AgentEnv::from_environ`); other variables — including tokens agents export
-alongside them — are never stored. Session ids are validated as hex/dashes.
+(`AgentEnv::from_environ`); of those only pids and session ids are kept (flag
+values are never read), and other variables — including tokens agents export
+alongside them — are never stored. Session ids are validated as
+`[A-Za-z0-9_-]{1,80}`.
 Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
 hold auth tokens).
 
@@ -432,7 +462,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 109 tests
+## Testing — 117 tests
 
 Three layers:
 

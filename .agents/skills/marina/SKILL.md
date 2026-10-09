@@ -40,7 +40,7 @@ Each element:
 | `cpu_pct`, `mem_bytes` | resource use; `null` when not measurable (e.g. a docker container) |
 | `exposed` | `true` = bound to 0.0.0.0/:: — reachable from the LAN (worth flagging to the user) |
 | `container` | docker container name, or `null` for a native process |
-| `launcher` | who started it, or `null`: `{kind, name, pid, alive, orphaned, session, cwd}` — `kind` is `agent` / `editor` / `terminal` / `detached`; `name` e.g. `claude`, `codex`, `tmux`; `orphaned: true` = its agent session has ended |
+| `launcher` | who started it, or `null`: `{kind, name, pid, alive, orphaned, session, cwd}` — `kind` is `agent` / `editor` / `terminal` / `detached`; `name` e.g. `claude`, `codex`, `opencode`, `cursor`, `copilot`, `tmux`; `session` is the agent's session/thread id; `orphaned: true` = its agent session has ended |
 | `uptime_secs`, `pids`, `anchor_pid`, `cwd`, `branch` | process details |
 
 An empty array means nothing dev-relevant is running. You can pre-filter with a
@@ -74,7 +74,8 @@ marina ls --orphaned        # servers whose launching agent session has ended
 marina kill --orphaned      # clean up after finished sessions
 ```
 
-`--mine` exits 2 if marina isn't running inside an agent session.
+`--mine` matches by your session/thread id (Claude Code, Codex, opencode, Copilot,
+Amp, …) or agent pid, and exits 2 if marina isn't running inside an agent session.
 
 **Killing a project name stops every service under it.** If `client-portal` runs
 a `next dev` on :3000 and a `postgres` on :5432, `marina kill client-portal`

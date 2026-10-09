@@ -34,10 +34,14 @@ developer-process-centric.
   Docker rows stop/restart/tail via the docker CLI.
 - **Who started it** — a `VIA` column names the launcher of every server: the
   coding-agent session (`claude`, `codex`, `opencode`, `cursor-agent`, …), the
-  editor, or the terminal. Agent sessions are told apart by pid, working
-  directory and session id (`claude --resume <id>` is shown in the inspect
-  panel). A server whose agent session has **ended** is flagged `claude·ended`
-  — an orphan — and a server nobody owns any more reads `detached`.
+  editor, or the terminal — even after the agent backgrounded it with
+  `&`/`nohup`, via the marker variables agents export (Claude Code, Codex,
+  opencode, Cursor, Copilot, Gemini, Amp, Goose, Cline, Qwen, …). Agent sessions
+  are told apart by session/thread id, pid and working directory, and the
+  inspect panel shows how to get back in (`claude --resume <id>`,
+  `codex resume <id>`, `opencode --session <id>`). A server whose Claude Code
+  session has **ended** is flagged `claude·ended` — an orphan — and a server
+  nobody owns any more reads `detached`.
   `marina kill --orphaned` cleans up after finished sessions; an agent can run
   `marina kill --mine` to stop exactly the servers it started.
 - **Honest signals** — rows flash green when they appear, turn red while dying,
@@ -231,8 +235,11 @@ marina is deliberately boring on this front:
   of introspection `ps`, `lsof`, and your IDE already do.
 - **What it reads:** a process's `cwd`, argv, cpu/memory; a fixed allowlist of
   agent-marker environment variables (`CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID`,
-  `CLAUDECODE`, `AI_AGENT`), used to attribute a server to its agent session —
-  no other variable is kept, displayed, or serialized; the nearest project
+  `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `AI_AGENT`, `AGENT`, … — the full
+  list is `MARKERS` in [src/launcher.rs](src/launcher.rs)), used to attribute a
+  server to its agent session. Of those, only pids and validated session ids
+  are kept; flag values are never read, and no other variable is kept,
+  displayed, or serialized; the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
@@ -252,7 +259,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~7.5k LOC · 109 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~8k LOC · 117 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

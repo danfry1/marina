@@ -561,7 +561,10 @@ fn child_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>> {
 }
 
 /// Climb from the socket-holding PID to the top-most ancestor still inside the
-/// project root, stopping at shells / pid 1 / a cwd that leaves the root.
+/// project root, stopping at shells / pid 1 / a cwd that leaves the root — and
+/// at any launcher (agent, editor, terminal). An agent often runs *in* the
+/// project dir; without this it would be absorbed as the anchor, mislabeling
+/// the row and putting the agent itself in the kill set.
 fn climb(start: u32, procs: &HashMap<u32, ProcInfo>, root: Option<&Path>) -> u32 {
     let Some(root) = root else { return start };
     let mut cur = start;
@@ -576,7 +579,7 @@ fn climb(start: u32, procs: &HashMap<u32, ProcInfo>, root: Option<&Path>) -> u32
             break;
         }
         let Some(parent) = procs.get(&pp) else { break };
-        if NON_DEV_PARENTS.contains(&parent.name.as_str()) {
+        if NON_DEV_PARENTS.contains(&parent.name.as_str()) || launcher::classify(parent).is_some() {
             break;
         }
         match parent.cwd.as_deref() {
@@ -664,6 +667,22 @@ mod tests {
         ]);
         // anchors at next dev, NOT at the shared turbo parent (cwd leaves the root)
         assert_eq!(climb(300, &procs, Some(Path::new("/repo/apps/web"))), 200);
+    }
+
+    #[test]
+    fn climb_never_absorbs_the_agent_that_launched_the_server() {
+        // codex (cwd = project) spawned the server directly, no shell between
+        let procs = map(vec![
+            proc(100, Some(1), "codex", "/repo", &["codex"]),
+            proc(200, Some(100), "nc", "/repo", &["nc", "-l", "8791"]),
+        ]);
+        assert_eq!(climb(200, &procs, Some(Path::new("/repo"))), 200);
+        // same for Claude Code running node-hosted
+        let procs = map(vec![
+            proc(100, Some(1), "node", "/repo", &["node", "/x/bin/claude"]),
+            proc(200, Some(100), "node", "/repo", &["node", "vite"]),
+        ]);
+        assert_eq!(climb(200, &procs, Some(Path::new("/repo"))), 200);
     }
 
     #[test]

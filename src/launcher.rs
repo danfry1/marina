@@ -110,6 +110,8 @@ impl Launcher {
     pub fn resume_hint(&self) -> Option<String> {
         match (&self.session, self.name.as_str()) {
             (Some(s), "claude") => Some(format!("claude --resume {s}")),
+            (Some(s), "codex") => Some(format!("codex resume {s}")),
+            (Some(s), "opencode") => Some(format!("opencode --session {s}")),
             _ => None,
         }
     }
@@ -123,46 +125,146 @@ pub struct AgentEnv {
     pub session: Option<String>,
 }
 
+/// What a marker variable tells us. Only `Pid` and `Session` values are ever
+/// kept (parsed / validated); `Flag` values are never read.
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    Flag,
+    Session,
+    Pid,
+}
+
+/// Agent marker variables, as exported by each agent to the commands it runs
+/// (verified against the agents' source / binaries, and the cross-agent table
+/// maintained by `is-ai-agent`). An agent's position in this table is its
+/// precedence when markers from several agents are present (nested agents —
+/// env can't say which is innermost, so the order is fixed).
+const MARKERS: &[(&str, &str, Role)] = &[
+    ("CLAUDE_PID", "claude", Role::Pid),
+    ("CLAUDE_CODE_SESSION_ID", "claude", Role::Session),
+    ("CLAUDECODE", "claude", Role::Flag),
+    ("CODEX_THREAD_ID", "codex", Role::Session),
+    ("CODEX_SANDBOX", "codex", Role::Flag),
+    ("OPENCODE_SESSION_ID", "opencode", Role::Session),
+    ("OPENCODE", "opencode", Role::Flag),
+    ("CURSOR_SANDBOX", "cursor-agent", Role::Flag),
+    ("CURSOR_AGENT", "cursor", Role::Flag),
+    ("COPILOT_AGENT_SESSION_ID", "copilot", Role::Session),
+    ("COPILOT_AGENT", "copilot", Role::Flag),
+    ("COPILOT_CLI", "copilot", Role::Flag),
+    ("GEMINI_CLI", "gemini", Role::Flag),
+    ("AMP_CURRENT_THREAD_ID", "amp", Role::Session),
+    ("GOOSE_TERMINAL", "goose", Role::Flag),
+    ("CLINE_TASK_ID", "cline", Role::Session),
+    ("CLINE_ACTIVE", "cline", Role::Flag),
+    ("ROO_CODE_TASK_ID", "roo", Role::Session),
+    ("AUGMENT_AGENT", "augment", Role::Flag),
+    ("QWEN_CODE_SESSION_ID", "qwen", Role::Session),
+    ("QWEN_CODE", "qwen", Role::Flag),
+    ("PI_SESSION_ID", "pi", Role::Session),
+    ("PI_CODING_AGENT", "pi", Role::Flag),
+    ("CRUSH", "crush", Role::Flag),
+    ("KIRO_AGENT_PATH", "kiro", Role::Flag),
+];
+
 impl AgentEnv {
-    /// Pick the allowlisted keys out of a raw environ. Every other variable —
-    /// including tokens agents also export — is skipped without being stored.
+    /// Pick the allowlisted markers out of a raw environ. Every other variable
+    /// — including tokens agents also export — is skipped without being
+    /// stored; of the markers, only pids and validated session ids are kept.
     pub fn from_environ(environ: &[OsString]) -> Option<AgentEnv> {
-        let mut env = AgentEnv::default();
+        // agent -> (pid, session), for every agent with at least one marker
+        let mut hits: Vec<(&'static str, Option<u32>, Option<String>)> = Vec::new();
+        let mut generic: Option<String> = None;
         for kv in environ {
             let Some(kv) = kv.to_str() else { continue };
             let Some((k, v)) = kv.split_once('=') else {
                 continue;
             };
-            match k {
-                "CLAUDE_PID" => env.pid = v.parse().ok(),
-                "CLAUDE_CODE_SESSION_ID" if is_session_id(v) => env.session = Some(v.into()),
-                "CLAUDECODE" if env.agent.is_none() => env.agent = Some("claude".into()),
-                // Cross-agent convention, e.g. `claude-code_2-1-294_agent`.
-                "AI_AGENT" => env.agent = agent_from_marker(v),
+            if matches!(k, "AI_AGENT" | "AGENT") {
+                // cross-agent conventions: `AI_AGENT=claude-code_2-1-294_agent`,
+                // `AGENT=amp`; AI_AGENT wins over the bare `AGENT=1`.
+                if let Some(name) = agent_from_marker(v) {
+                    if k == "AI_AGENT" || generic.is_none() {
+                        generic = Some(name);
+                    }
+                }
+                continue;
+            }
+            let Some(&(_, agent, role)) = MARKERS.iter().find(|(key, _, _)| *key == k) else {
+                continue;
+            };
+            if v.is_empty() {
+                continue;
+            }
+            let i = match hits.iter().position(|h| h.0 == agent) {
+                Some(i) => i,
+                None => {
+                    hits.push((agent, None, None));
+                    hits.len() - 1
+                }
+            };
+            match role {
+                Role::Pid => hits[i].1 = v.parse().ok(),
+                Role::Session if is_session_id(v) => hits[i].2 = Some(v.into()),
                 _ => {}
             }
         }
-        if env.pid.is_some() && env.agent.is_none() {
-            env.agent = Some("claude".into());
+        let rank = |a: &str| MARKERS.iter().position(|(_, m, _)| *m == a);
+        if let Some((agent, pid, session)) = hits.into_iter().min_by_key(|h| rank(h.0)) {
+            return Some(AgentEnv {
+                agent: Some(agent.into()),
+                pid,
+                session,
+            });
         }
-        env.agent.is_some().then_some(env)
+        generic.map(|name| AgentEnv {
+            agent: Some(name),
+            pid: None,
+            session: None,
+        })
     }
 }
 
+/// Session/thread ids: `219af9f5-…` (Claude, Codex), `ses_3b0f…` (opencode),
+/// `T-…` (Amp). Anything else is dropped rather than displayed.
 fn is_session_id(v: &str) -> bool {
-    !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    !v.is_empty()
+        && v.len() <= 80
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// `claude-code_2-1-294_agent` -> `claude`; `codex` -> `codex`.
+/// A generic marker value -> agent name: `claude-code_2-1-294_agent` ->
+/// `claude`, `github_copilot_vscode_agent` -> `copilot`, `opencode`, `amp`;
+/// a bare `1`/`true` -> `agent`. Only short `[a-z0-9-]` names survive.
 fn agent_from_marker(v: &str) -> Option<String> {
-    let head = v.split('_').next()?.trim().to_lowercase();
-    if head.is_empty() {
+    let v = v.trim().to_lowercase();
+    if v.is_empty() || v == "0" || v == "false" {
         return None;
     }
-    Some(match head.as_str() {
-        "claude-code" | "claude" => "claude".into(),
-        _ => head,
-    })
+    if v == "1" || v == "true" {
+        return Some("agent".into());
+    }
+    for (needle, name) in [
+        ("claude", "claude"),
+        ("github_copilot", "copilot"),
+        ("copilot", "copilot"),
+        ("codex", "codex"),
+        ("opencode", "opencode"),
+        ("cursor", "cursor"),
+        ("gemini", "gemini"),
+    ] {
+        if v.starts_with(needle) {
+            return Some(name.into());
+        }
+    }
+    let head = v.split('_').next()?;
+    (!head.is_empty()
+        && head.len() <= 24
+        && head
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+    .then(|| head.to_string())
 }
 
 /// Known launchers by process name (or a node/bun script's basename).
@@ -182,6 +284,10 @@ const KNOWN: &[(&str, LauncherKind, &str)] = &[
     ("crush", LauncherKind::Agent, "crush"),
     ("droid", LauncherKind::Agent, "droid"),
     ("copilot", LauncherKind::Agent, "copilot"),
+    ("qwen", LauncherKind::Agent, "qwen"),
+    ("auggie", LauncherKind::Agent, "augment"),
+    ("kiro-cli", LauncherKind::Agent, "kiro"),
+    ("cline", LauncherKind::Agent, "cline"),
     // editors / IDEs
     ("cursor", LauncherKind::Editor, "cursor"),
     ("code helper", LauncherKind::Editor, "vscode"),
@@ -225,7 +331,7 @@ const KNOWN: &[(&str, LauncherKind, &str)] = &[
 /// programs (`code` vs `codesign`, `amp` vs `ampd`, `rio` vs `rioja`, …).
 const EXACT: &[&str] = &[
     "code", "amp", "zed", "idea", "vim", "rio", "foot", "stable", "hyper", "screen", "goose",
-    "crush", "droid", "terminal", "warp", "kitty", "rider", "clion",
+    "crush", "droid", "terminal", "warp", "cline", "kitty", "rider", "clion",
 ];
 
 /// Interpreters whose first argument is the real program (`node …/codex.js`).
@@ -286,10 +392,13 @@ pub fn find(anchor: u32, procs: &HashMap<u32, ProcInfo>) -> Option<Launcher> {
         let Some(p) = procs.get(&pid) else { break };
         match classify(p) {
             Some((LauncherKind::Agent, name)) => {
+                // The same agent's markers name its session (Claude, Codex,
+                // opencode, …) — unless they carry a pid that isn't this one.
                 let env = procs
                     .get(&anchor)
                     .and_then(|a| a.agent.as_ref())
-                    .filter(|e| e.pid == Some(pid));
+                    .filter(|e| e.agent.as_deref() == Some(name))
+                    .filter(|e| e.pid.is_none_or(|p| p == pid));
                 return Some(Launcher {
                     kind: LauncherKind::Agent,
                     name: name.into(),
@@ -309,7 +418,17 @@ pub fn find(anchor: u32, procs: &HashMap<u32, ProcInfo>) -> Option<Launcher> {
         }
         cur = p.ppid;
     }
+    let env = procs.get(&anchor).and_then(|a| a.agent.as_ref());
     if let Some((kind, name, p)) = nearest_other {
+        // An editor's own agent (Cursor agent, Copilot agent mode) runs its
+        // commands inside the editor — the markers say it was the agent, not
+        // the human. Terminals don't get this upgrade: a tmux server started
+        // from an agent would leak its markers onto every later pane.
+        if let (LauncherKind::Editor, Some(env)) = (kind, env) {
+            let mut l = from_env(env, procs);
+            l.cwd = l.cwd.or_else(|| p.cwd.clone());
+            return Some(l);
+        }
         return Some(Launcher {
             kind,
             name: name.into(),
@@ -322,26 +441,8 @@ pub fn find(anchor: u32, procs: &HashMap<u32, ProcInfo>) -> Option<Launcher> {
     }
     // No live launcher in the chain. Env markers survive reparenting, so a
     // backgrounded agent server can still be traced — and its session checked.
-    // (Only consulted here: inside a terminal, a tmux server started from an
-    // agent would otherwise leak its markers onto every later pane.)
-    if let Some(env) = procs.get(&anchor).and_then(|a| a.agent.as_ref()) {
-        let name = env.agent.clone().unwrap_or_else(|| "agent".into());
-        let live = env
-            .pid
-            .and_then(|pid| procs.get(&pid))
-            .filter(|p| matches!(classify(p), Some((LauncherKind::Agent, _))));
-        return Some(Launcher {
-            kind: LauncherKind::Agent,
-            name,
-            pid: env.pid,
-            // Orphaned only on proof: the marker names a pid and that pid is
-            // no longer an agent. Without a pid, liveness is unknown — never
-            // raise a false "session ended".
-            alive: env.pid.is_none() || live.is_some(),
-            session: env.session.clone(),
-            cwd: live.and_then(|p| p.cwd.clone()),
-            start_time: live.map(|p| p.start_time).unwrap_or(0),
-        });
+    if let Some(env) = env {
+        return Some(from_env(env, procs));
     }
     (reached_init && !unknown_owner).then(|| Launcher {
         kind: LauncherKind::Detached,
@@ -352,6 +453,26 @@ pub fn find(anchor: u32, procs: &HashMap<u32, ProcInfo>) -> Option<Launcher> {
         cwd: None,
         start_time: 0,
     })
+}
+
+/// A launcher from env markers alone (the launching process isn't in the
+/// chain). Orphaned only on proof: the marker names a pid and that pid is no
+/// longer an agent. Without a pid (most agents export only a session id),
+/// liveness is unknown — never raise a false "session ended".
+fn from_env(env: &AgentEnv, procs: &HashMap<u32, ProcInfo>) -> Launcher {
+    let live = env
+        .pid
+        .and_then(|pid| procs.get(&pid))
+        .filter(|p| matches!(classify(p), Some((LauncherKind::Agent, _))));
+    Launcher {
+        kind: LauncherKind::Agent,
+        name: env.agent.clone().unwrap_or_else(|| "agent".into()),
+        pid: env.pid,
+        alive: env.pid.is_none() || live.is_some(),
+        session: env.session.clone(),
+        cwd: live.and_then(|p| p.cwd.clone()),
+        start_time: live.map(|p| p.start_time).unwrap_or(0),
+    }
 }
 
 /// The agent session this process runs inside, if any — what `--mine`
@@ -438,9 +559,170 @@ mod tests {
         assert!(format!("{e:?}").find("secret").is_none());
         // no markers -> no agent
         assert!(AgentEnv::from_environ(&env(&["PATH=/bin", "HOME=/x"])).is_none());
-        // a malformed session id is dropped rather than shown
-        let e = AgentEnv::from_environ(&env(&["CLAUDE_CODE_SESSION_ID=$(rm -rf)"]));
-        assert!(e.is_none());
+        // a malformed session id is dropped rather than shown (the marker
+        // still says which agent it was)
+        let e = AgentEnv::from_environ(&env(&["CLAUDE_CODE_SESSION_ID=$(rm -rf)"])).unwrap();
+        assert_eq!((e.agent.as_deref(), e.session), (Some("claude"), None));
+    }
+
+    fn agent_of(kvs: &[&str]) -> Option<(String, Option<u32>, Option<String>)> {
+        AgentEnv::from_environ(&env(kvs)).map(|e| (e.agent.unwrap(), e.pid, e.session))
+    }
+
+    #[test]
+    fn codex_opencode_and_copilot_markers_are_recognized() {
+        // Codex: thread id is the resumable session
+        assert_eq!(
+            agent_of(&[
+                "CODEX_SANDBOX=seatbelt",
+                "CODEX_THREAD_ID=0199a213-81c0-7800-8aa1-bbab2a035a53",
+            ]),
+            Some((
+                "codex".into(),
+                None,
+                Some("0199a213-81c0-7800-8aa1-bbab2a035a53".into())
+            ))
+        );
+        // opencode's bash tool: AGENT=1, OPENCODE=1, AI_AGENT, OPENCODE_SESSION_ID
+        assert_eq!(
+            agent_of(&[
+                "AGENT=1",
+                "OPENCODE=1",
+                "AI_AGENT=opencode",
+                "OPENCODE_SESSION_ID=ses_3b0fcef09ffe1mWuat9ccxYaKv",
+            ]),
+            Some((
+                "opencode".into(),
+                None,
+                Some("ses_3b0fcef09ffe1mWuat9ccxYaKv".into())
+            ))
+        );
+        // Copilot agent mode in VS Code
+        assert_eq!(
+            agent_of(&["AI_AGENT=github_copilot_vscode_agent", "COPILOT_AGENT=1"]).map(|a| a.0),
+            Some("copilot".into())
+        );
+        assert_eq!(
+            agent_of(&["GEMINI_CLI=1"]).map(|a| a.0),
+            Some("gemini".into())
+        );
+        assert_eq!(
+            agent_of(&["AMP_CURRENT_THREAD_ID=T-5a7c"]).map(|a| (a.0, a.2)),
+            Some(("amp".into(), Some("T-5a7c".into())))
+        );
+    }
+
+    #[test]
+    fn generic_markers_name_an_agent_only_when_nothing_specific_does() {
+        assert_eq!(
+            agent_of(&["AGENT=goose"]).map(|a| a.0),
+            Some("goose".into())
+        );
+        assert_eq!(agent_of(&["AGENT=1"]).map(|a| a.0), Some("agent".into()));
+        assert_eq!(agent_of(&["AGENT=0"]), None);
+        // AI_AGENT beats a bare AGENT, specific markers beat both
+        assert_eq!(
+            agent_of(&["AGENT=1", "AI_AGENT=amp"]).map(|a| a.0),
+            Some("amp".into())
+        );
+        assert_eq!(
+            agent_of(&["AI_AGENT=opencode", "CODEX_THREAD_ID=abc"]).map(|a| a.0),
+            Some("codex".into())
+        );
+        // junk values never become a displayed name
+        assert_eq!(agent_of(&["AGENT=$(curl x)"]), None);
+    }
+
+    #[test]
+    fn nested_agents_resolve_by_fixed_precedence() {
+        // codex launched from a Claude Code shell: both sets of markers
+        let a = agent_of(&[
+            "CLAUDE_PID=20",
+            "CLAUDE_CODE_SESSION_ID=aaaa",
+            "CODEX_THREAD_ID=bbbb",
+        ])
+        .unwrap();
+        assert_eq!(
+            (a.0.as_str(), a.1, a.2.as_deref()),
+            ("claude", Some(20), Some("aaaa"))
+        );
+    }
+
+    #[test]
+    fn flag_values_are_never_kept() {
+        let e = AgentEnv::from_environ(&env(&["CURSOR_AGENT=hunter2", "KIRO_AGENT_PATH=/secret"]))
+            .unwrap();
+        assert_eq!(e.agent.as_deref(), Some("cursor"));
+        let dbg = format!("{e:?}");
+        assert!(!dbg.contains("hunter2") && !dbg.contains("secret"), "{dbg}");
+    }
+
+    #[test]
+    fn live_codex_in_chain_gets_its_thread_and_resume_hint() {
+        let mut server = p(30, 20, "node", &["node", "vite"]);
+        server.agent = Some(AgentEnv {
+            agent: Some("codex".into()),
+            pid: None,
+            session: Some("0199a213".into()),
+        });
+        let procs = map(vec![p(20, 1, "codex", &["codex"]), server]);
+        let l = find(30, &procs).unwrap();
+        assert_eq!((l.name.as_str(), l.pid), ("codex", Some(20)));
+        assert_eq!(l.resume_hint().as_deref(), Some("codex resume 0199a213"));
+        // opencode's hint
+        let oc = Launcher {
+            name: "opencode".into(),
+            session: Some("ses_1".into()),
+            ..l
+        };
+        assert_eq!(
+            oc.resume_hint().as_deref(),
+            Some("opencode --session ses_1")
+        );
+    }
+
+    #[test]
+    fn editor_agent_markers_upgrade_but_terminal_ones_do_not() {
+        let tagged = |pid: u32, ppid: u32| {
+            let mut s = p(pid, ppid, "node", &["node", "vite"]);
+            s.agent = Some(AgentEnv {
+                agent: Some("cursor".into()),
+                pid: None,
+                session: None,
+            });
+            s
+        };
+        // Cursor's agent ran it inside the editor -> the agent, not the editor
+        let procs = map(vec![
+            p(10, 1, "Cursor Helper (Plugin)", &["Cursor Helper"]),
+            p(20, 10, "zsh", &["-zsh"]),
+            tagged(30, 20),
+        ]);
+        let l = find(30, &procs).unwrap();
+        assert_eq!((l.kind, l.name.as_str()), (LauncherKind::Agent, "cursor"));
+        assert!(!l.is_orphaned());
+        // same markers under tmux (maybe leaked from the session that started
+        // the tmux server) -> stays the terminal
+        let procs = map(vec![
+            p(10, 1, "tmux: server", &["tmux"]),
+            p(20, 10, "zsh", &["-zsh"]),
+            tagged(30, 20),
+        ]);
+        assert_eq!(find(30, &procs).unwrap().kind, LauncherKind::Terminal);
+    }
+
+    #[test]
+    fn reparented_opencode_server_is_attributed_but_never_called_ended() {
+        let mut server = p(30, 1, "node", &["node", "vite"]);
+        server.agent = Some(AgentEnv {
+            agent: Some("opencode".into()),
+            pid: None,
+            session: Some("ses_abc".into()),
+        });
+        let l = find(30, &map(vec![server])).unwrap();
+        assert_eq!((l.kind, l.name.as_str()), (LauncherKind::Agent, "opencode"));
+        assert_eq!(l.session.as_deref(), Some("ses_abc"));
+        assert!(!l.is_orphaned());
     }
 
     #[test]
