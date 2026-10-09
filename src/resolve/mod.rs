@@ -146,6 +146,8 @@ const TOOLS: &[(&str, &str)] = &[
 /// (usually into the process subtree) to find the real tool.
 const WRAPPERS: &[&str] = &[
     "pnpm",
+    "pnpm-native",
+    "corepack",
     "npm",
     "npx",
     "yarn",
@@ -202,13 +204,11 @@ pub fn label_from_subtree(argvs: &[Vec<String>]) -> String {
             return label;
         }
     }
-    // 2. Otherwise the first non-wrapper, non-shell program.
+    // 2. Otherwise the first real program, looking through wrappers and
+    //    script hosts (`node …/.bin/vp dev` -> `vp dev`).
     for argv in argvs {
-        if let Some(prog) = argv.first() {
-            let b = basename(prog);
-            if !is_wrapper(&b) && !is_shell(&b) {
-                return single_label(argv);
-            }
+        if let Some(label) = program_label(argv) {
+            return label;
         }
     }
     // 3. Fall back to the first process.
@@ -216,6 +216,56 @@ pub fn label_from_subtree(argvs: &[Vec<String>]) -> String {
         .first()
         .map(|a| single_label(a))
         .unwrap_or_else(|| "?".into())
+}
+
+/// The program a process is really running, if it isn't just a launcher.
+/// `None` for shells, wrappers (`pnpm`, `npx`, …) and script hosts running a
+/// wrapper — those defer to a descendant in the subtree.
+fn program_label(argv: &[String]) -> Option<String> {
+    let first = basename(argv.first()?);
+    if is_shell(&first) {
+        return None;
+    }
+    if first.to_lowercase().starts_with("python") {
+        // `python -m http.server` -> `http.server`; `python app.py` -> `python app.py`
+        if let Some(i) = argv.iter().position(|a| a == "-m") {
+            return argv.get(i + 1).cloned();
+        }
+        return argv
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .map(|s| format!("python {}", basename(s)));
+    }
+    if matches!(first.as_str(), "node" | "bun" | "deno") {
+        // An extensionless bin script is a CLI (`…/.bin/vp`) — name it after
+        // itself. `server.js` and wrappers fall through to the fallback.
+        let script = basename(argv.get(1).filter(|a| !a.starts_with('-'))?);
+        if is_wrapper(&script) || script.contains('.') {
+            return None;
+        }
+        return Some(with_subcommand(&script, argv.get(2)));
+    }
+    if is_wrapper(&first) {
+        return None;
+    }
+    Some(single_label(argv))
+}
+
+/// `vp` + `dev` -> `vp dev`: keep a short plain subcommand, drop flags/paths.
+fn with_subcommand(prog: &str, next: Option<&String>) -> String {
+    match next {
+        Some(sub)
+            if sub.len() <= 12
+                && sub
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-' || c == ':')
+                && !sub.starts_with('-') =>
+        {
+            format!("{prog} {sub}")
+        }
+        _ => prog.to_string(),
+    }
 }
 
 /// Label for a single process when nothing better is recognized.
@@ -639,6 +689,36 @@ mod tests {
             label_from_subtree(&[argv(&["node", "server.js"])]),
             "node server.js"
         );
+    }
+
+    #[test]
+    fn label_names_the_cli_under_pnpm_and_corepack() {
+        // pnpm (corepack's native shim) exec'ing vite-plus's `vp` bin
+        let tree = vec![
+            argv(&["node", "/n/bin/pnpm", "exec", "vp", "dev", "--port", "5199"]),
+            argv(&["/c/corepack/v1/pnpm/12.10.1/pnpm-native"]),
+            argv(&[
+                "node",
+                "/app/node_modules/vite-plus/bin/vp",
+                "dev",
+                "--port",
+                "5199",
+            ]),
+            argv(&["sh", "-c", "trap '' INT TERM"]),
+        ];
+        assert_eq!(label_from_subtree(&tree), "vp dev");
+    }
+
+    #[test]
+    fn label_names_python_modules_and_scripts() {
+        let py = |a: &[&str]| label_from_subtree(&[argv(a)]);
+        assert_eq!(
+            py(&["/Library/Frameworks/Python", "-m", "http.server", "8000"]),
+            "http.server"
+        );
+        assert_eq!(py(&["python3", "-u", "app.py"]), "python app.py");
+        // a recognized tool behind -m still wins via the tool table
+        assert_eq!(py(&["python3", "-m", "uvicorn", "main:app"]), "uvicorn");
     }
 
     #[test]

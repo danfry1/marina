@@ -15,10 +15,11 @@ use ratatui::{
 
 use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify};
 use super::state::{App, Entry, SortMode};
+use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Target, TargetKey, TargetKind};
 
-/// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, UP, BRANCH).
-const COLW: [u16; 7] = [22, 16, 7, 7, 9, 6, 15];
+/// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
+const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
@@ -27,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let inspect_open = app.inspect;
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
     if inspect_open {
-        constraints.push(Constraint::Length(8));
+        constraints.push(Constraint::Length(9));
     }
     if log_open {
         constraints.push(Constraint::Length(app.log_height));
@@ -83,7 +84,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .block(block);
         frame.render_widget(hint, table_area);
     } else {
-        // Drop the rightmost columns (BRANCH, then UP) on narrow panes.
+        // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
         let cols = visible_columns(table_area.width);
         let arrow = |m: SortMode| if app.sort == m { " ▾" } else { "" };
         let head = [
@@ -92,6 +93,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             format!("PORT{}", arrow(SortMode::Port)),
             format!("CPU{}", arrow(SortMode::Cpu)),
             format!("MEM{}", arrow(SortMode::Mem)),
+            "VIA".to_string(),
             "UP".to_string(),
             "BRANCH".to_string(),
         ];
@@ -278,6 +280,12 @@ fn detail_line(app: &App) -> Line<'static> {
                         Style::new().fg(Color::Red),
                     ));
                 }
+                if let Some(l) = &t.launcher {
+                    spans.push(Span::styled(
+                        format!(" · via {}", l.describe()),
+                        launcher_style(l),
+                    ));
+                }
                 Line::from(spans)
             }
             None => Line::from(""),
@@ -351,6 +359,19 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                     ),
                 ),
             ];
+            lines.push(match &t.launcher {
+                Some(l) => {
+                    let mut spans = vec![
+                        Span::styled(" via    ".to_string(), key),
+                        Span::styled(l.describe(), launcher_style(l)),
+                    ];
+                    if let Some(hint) = l.resume_hint() {
+                        spans.push(Span::styled(format!(" · resume: {hint}"), val));
+                    }
+                    Line::from(spans)
+                }
+                None => kv("via", "—".into()),
+            });
             lines.push(match &t.container {
                 Some(c) => kv("dockr", format!("container {c}")),
                 None => kv(
@@ -423,6 +444,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
                 Cell::from(fmt_mem(mem)),
                 Cell::from(""),
                 Cell::from(""),
+                Cell::from(""),
             ])
             .style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
         }
@@ -491,6 +513,10 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         port_cell,
         Cell::from(cpu),
         Cell::from(mem),
+        match &t.launcher {
+            Some(l) => Cell::from(Span::styled(l.short(), launcher_style(l))),
+            None => Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
+        },
         Cell::from(fmt_uptime(t.anchor.start_time)),
         Cell::from(t.git_branch.clone().unwrap_or_else(|| "—".into())),
     ]);
@@ -516,10 +542,25 @@ fn infra_tag(label: &str) -> Option<&'static str> {
 }
 
 /// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
+/// Agents stand out (an orphan — its session ended — in yellow); editors and
+/// terminals are ordinary; detached is dim.
+fn launcher_style(l: &Launcher) -> Style {
+    match l.kind {
+        _ if l.is_orphaned() => Style::new().fg(Color::Yellow),
+        LauncherKind::Agent => Style::new().fg(Color::Magenta),
+        LauncherKind::Editor | LauncherKind::Terminal => Style::new().fg(Color::Gray),
+        LauncherKind::Detached => Style::new().fg(Color::DarkGray),
+    }
+}
+
+/// Columns that fit: each needs its width + 1 spacing, plus borders and the
+/// highlight gutter (4).
 fn visible_columns(width: u16) -> usize {
-    if width >= 92 {
+    if width >= 105 {
+        8
+    } else if width >= 89 {
         7
-    } else if width >= 76 {
+    } else if width >= 82 {
         6
     } else {
         5
@@ -542,7 +583,10 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Enter", "fold / unfold group"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
-        row("/", "filter (project · command · port · cwd · branch)"),
+        row(
+            "/",
+            "filter (project · command · port · cwd · branch · via)",
+        ),
         row("K · u", "kill · cancel force-kill"),
         row("R", "restart (output captured to a log)"),
         row("T", "tail logs"),
@@ -652,8 +696,9 @@ mod tests {
 
     #[test]
     fn visible_columns_drop_from_the_right_when_narrow() {
-        assert_eq!(visible_columns(120), 7);
-        assert_eq!(visible_columns(80), 6);
+        assert_eq!(visible_columns(120), 8);
+        assert_eq!(visible_columns(95), 7);
+        assert_eq!(visible_columns(85), 6);
         assert_eq!(visible_columns(60), 5);
     }
 
@@ -674,6 +719,44 @@ mod tests {
         let mut app = app_with_sample();
         app.set_sort(SortMode::Mem);
         assert!(render_to_string(&mut app, 120, 20).contains("MEM ▾"));
+    }
+
+    #[test]
+    fn via_column_and_inspect_show_the_launching_agent_session() {
+        use crate::launcher::{Launcher, LauncherKind};
+        use crate::model::TargetKey;
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let claude = Launcher {
+            kind: LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(35115),
+            alive: true,
+            session: Some("219af9f5-aaaa-4bbb-8ccc-dddddddddddd".into()),
+            cwd: None,
+            start_time: 0,
+        };
+        snap.targets[1].launcher = Some(claude.clone()); // billing-api :8000
+        snap.targets[2].launcher = Some(Launcher {
+            alive: false,
+            ..claude
+        }); // worker :5555 — its session ended
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("VIA"));
+        assert!(out.contains("claude·ended"), "orphan is marked in the row");
+
+        app.selected = Some(Entry::Target(TargetKey::Port(8000)));
+        app.toggle_inspect();
+        let out = render_to_string(&mut app, 160, 30);
+        assert!(out.contains("claude (pid 35115, session 219af9f5)"));
+        assert!(out.contains("claude --resume 219af9f5-aaaa-4bbb-8ccc-dddddddddddd"));
+
+        // `/ended` filters down to orphans
+        app.filter = "ended".into();
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("worker") && !out.contains("billing-api"));
     }
 
     #[test]

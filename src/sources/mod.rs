@@ -26,6 +26,8 @@ pub struct ProcInfo {
     pub cpu_pct: f32,
     pub mem_bytes: u64,
     pub start_time: u64,
+    /// Allowlisted agent markers from the process env (never the raw env).
+    pub agent: Option<crate::launcher::AgentEnv>,
 }
 
 /// Listening socket -> PID. macOS via `netstat2`; Linux impl later.
@@ -117,6 +119,7 @@ impl ProcSource for SysinfoProcs {
                     cpu_pct: p.cpu_usage(),
                     mem_bytes: p.memory(),
                     start_time: p.start_time(),
+                    agent: crate::launcher::AgentEnv::from_environ(p.environ()),
                 },
             );
         }

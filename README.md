@@ -25,20 +25,30 @@ developer-process-centric.
   wheel to move / scroll logs).
 - **Smart resolution** — infers project + tool from cwd, argv, package manifests
   (package.json / Cargo.toml / pyproject / go.mod / …) and git (worktrees and
-  detached HEADs included); sees through `pnpm`/`npm`/`yarn`/`node` wrappers
-  (`pnpm dev` → `vite`).
+  detached HEADs included); sees through `pnpm`/`npm`/`yarn`/`node`/corepack
+  wrappers to the real tool (`pnpm dev` → `vite`, `pnpm exec vp dev` → `vp dev`,
+  `python -m http.server` → `http.server`).
 - **First-class verbs** — kill (fingerprint-verified SIGTERM→SIGKILL escalation,
   `u` cancels the force-kill), restart (waits for the port to free, captures the
   new process's output to a log), tail logs inline, copy URL, open in browser.
   Docker rows stop/restart/tail via the docker CLI.
+- **Who started it** — a `VIA` column names the launcher of every server: the
+  coding-agent session (`claude`, `codex`, `opencode`, `cursor-agent`, …), the
+  editor, or the terminal. Agent sessions are told apart by pid, working
+  directory and session id (`claude --resume <id>` is shown in the inspect
+  panel). A server whose agent session has **ended** is flagged `claude·ended`
+  — an orphan — and a server nobody owns any more reads `detached`.
+  `marina kill --orphaned` cleans up after finished sessions; an agent can run
+  `marina kill --mine` to stop exactly the servers it started.
 - **Honest signals** — rows flash green when they appear, turn red while dying,
   and if a long-running server vanishes *without* you killing it, marina says so
   (`⚠ client-portal (:3000) exited unexpectedly`). A `:3000!` port badge warns
   when a server is bound to `0.0.0.0` (reachable from your LAN).
 - **Grouping** — a project's services collapse under one header, and one keystroke
   kills the whole project. Declared groups bundle an app with its database.
-- **Agent/script CLI** — `marina ls --json`, `marina kill <project>`, sharing the
-  exact same resolution engine as the TUI.
+- **Agent/script CLI** — `marina ls --json`, `marina kill <project>`,
+  `marina who 3000` / `marina free 3000`, sharing the exact same resolution
+  engine as the TUI.
 
 ## Install
 
@@ -100,8 +110,8 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a project group |
-| `i` | inspect the selection (command, ports, cwd, pids) |
-| `/` | filter (project / command / port / cwd / branch) |
+| `i` | inspect the selection (command, ports, cwd, launcher, pids) |
+| `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
 | `s` | cycle sort (port / cpu / mem) — or click a column header |
 | `K` · `u` | kill selection · cancel the pending force-kill |
 | `R` · `T` | restart (output captured to a log) · tail logs |
@@ -117,11 +127,29 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 
 ```sh
 marina ls [sel…] [--json]     # the snapshot — table, or a stable JSON contract
+marina ls --mine              # only servers started by the agent session running this
+marina kill --orphaned        # stop servers whose agent session has ended
 marina kill <selector>        # project name, port (3000 / :3000), or command
 marina restart <selector>     # output captured to ~/.local/state/marina/logs/
 marina url <selector> [--json]
+marina who <port>… [--json]   # what's holding a port — dev target or not
+marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
 marina version
 ```
+
+`who` and `free` are for the `EADDRINUSE` moment:
+
+```sh
+$ marina who 3000
+:3000  client-portal · next dev · pid 4121 · up 3d · feat/x · ~/dev/client-portal
+$ marina free 3000 && pnpm dev
+:3000  freed — stopped client-portal · next dev
+```
+
+Both take ports only (no name matching). `who` exits `1` when the port is free.
+`free` is idempotent — an already-free port is success — and it refuses to touch
+a holder that isn't a dev target (e.g. macOS ControlCenter on `:5000`), naming it
+instead.
 
 A selector matching a project name acts on **every** service under it. Exit
 codes: `0` ok, `1` no match, `2` usage error — and unknown commands/flags are
@@ -190,7 +218,10 @@ marina is deliberately boring on this front:
   anyway). It also never lists the session it runs in (your shell / terminal /
   `ssh`), so you can't accidentally kill your own connection. It's the same class
   of introspection `ps`, `lsof`, and your IDE already do.
-- **What it reads:** a process's `cwd`, argv, cpu/memory; the nearest project
+- **What it reads:** a process's `cwd`, argv, cpu/memory; a fixed allowlist of
+  agent-marker environment variables (`CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID`,
+  `CLAUDECODE`, `AI_AGENT`), used to attribute a server to its agent session —
+  no other variable is kept, displayed, or serialized; the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
@@ -208,7 +239,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~6k LOC · 84 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~7k LOC · 101 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

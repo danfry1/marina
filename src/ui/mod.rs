@@ -13,4 +13,4 @@ mod state;
 pub use render::render;
 pub use state::App;
 
-pub(crate) use format::tildify;
+pub(crate) use format::{fmt_uptime, tildify};

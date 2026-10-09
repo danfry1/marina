@@ -131,12 +131,17 @@ pub fn kill(
 }
 
 /// Synchronous verified SIGTERM → wait → verified SIGKILL, for the one-shot
-/// CLI. Returns (terminated, force-killed) counts.
+/// CLI. Returns as soon as everything has exited; only processes still alive
+/// after `grace` are force-killed. Returns (terminated, force-killed) counts.
 pub fn kill_blocking(pid_starts: &[PidStart], grace: Duration) -> (usize, usize) {
     let fresh = verified(pid_starts);
     signal_tree(&fresh, libc::SIGTERM);
-    thread::sleep(grace);
-    let stragglers = verified(pid_starts);
+    let deadline = Instant::now() + grace;
+    let mut stragglers = verified(pid_starts);
+    while !stragglers.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        stragglers = verified(pid_starts);
+    }
     signal_tree(&stragglers, libc::SIGKILL);
     (fresh.len(), stragglers.len())
 }

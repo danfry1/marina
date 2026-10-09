@@ -84,4 +84,12 @@
 
 - **Inspect panel** — the `i` pane showing everything about the selection that
   doesn't fit a row: program + arg count (never raw argv), all ports, url, cwd,
-  branch, pid count, container. Follows the cursor.
+  branch, launcher, pid count, container. Follows the cursor.
+
+- **Launcher** — who started a Target: an *agent* session (`claude`, `codex`,
+  …), an *editor*, a *terminal*, or nobody any more (*detached*). Shown in the
+  `VIA` column; the basis of the `--mine` / `--orphaned` scopes.
+
+- **Orphaned** — a Target whose launching agent session has ended while the
+  server kept running (`claude·ended`). Distinct from *detached*, which carries
+  no agent markers at all.

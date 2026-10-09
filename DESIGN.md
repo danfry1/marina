@@ -374,11 +374,57 @@ marina ls [sel…] [--json]   # the snapshot — table, or a stable JSON contrac
 marina kill <sel>… [--json] # verified SIGTERM -> SIGKILL matching targets
 marina restart <sel>…       # re-exec captured argv in cwd (output captured)
 marina url <sel>… [--json]  # print matching URLs
+marina who <port>… [--json] # who holds a port: a target, another process, or free
+marina free <port>… [--json] # verified-stop the target on a port, wait for release
 marina version
 ```
 
+**`who` / `free` take ports only** — exact identity, no substring matching, so
+"free :3000" can never take down an unrelated project. When no target holds the
+port, both name the actual holder (process name + pid, never argv) from the raw
+port scan rather than answering "unknown": curated-out processes, `[[ignore]]`d
+targets, another user's socket. `free` stops only dev targets — a non-target
+holder is reported and left alone (exit 1). It is idempotent (an already-free
+port exits 0, so `marina free 3000 && pnpm dev` re-runs safely) and waits until
+the port is actually released before returning. `who` exits 1 for a free port.
+
+**Scope flags** — `--mine` and `--orphaned` narrow `ls`/`kill`/`restart`/`url`
+by launcher (see *Launcher attribution*), with or without selectors. `--mine`
+is "started by the agent session running this command" (matched by session id,
+else agent pid; exit 2 outside an agent session), so an agent can clean up its
+own servers without touching the user's or another session's. `--orphaned` is
+"started by an agent session that has since ended".
+
 Unknown commands/flags are hard errors (exit 2) — a typo in a script must never
 fall through and block on the TUI.
+
+### Launcher attribution — IMPLEMENTED
+
+Coding agents start dev servers inside sessions, often backgrounded, so "what
+is this and who started it?" is the question a row has to answer. Each target
+carries an optional `Launcher { kind: agent|editor|terminal|detached, name,
+pid, alive, session, cwd }`, resolved in `launcher.rs` from two signals:
+
+1. **Live parent chain** from the anchor upward: the nearest *agent*
+   (`claude`, `codex`, `opencode`, `gemini`, `cursor-agent`, `aider`, …, also
+   node-hosted CLIs) wins outright; else the nearest editor, then
+   terminal/multiplexer. An unrecognized non-shell ancestor (some supervisor)
+   yields `None` — no guessing.
+2. **Agent env markers**, consulted only when the chain has no launcher (the
+   server was reparented to pid 1 after `&`/`nohup`). Claude Code exports
+   `CLAUDE_PID` + `CLAUDE_CODE_SESSION_ID` (and `AI_AGENT`) to everything it
+   spawns, and env survives reparenting. If that pid is no longer an agent
+   process the session has ended → **orphaned** (`claude·ended`, yellow). Env
+   is never consulted when a terminal/editor is in the chain: a tmux server
+   started from an agent would otherwise stamp its markers onto every pane.
+
+Reparented with no markers → `detached`. Docker targets have no launcher.
+
+Privacy: only the allowlisted keys above are extracted from a process env
+(`AgentEnv::from_environ`); other variables — including tokens agents export
+alongside them — are never stored. Session ids are validated as hex/dashes.
+Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
+hold auth tokens).
 
 A **selector** matches by project name (exact/substring), port (`3000`/`:3000`),
 or command label. **Killing a project selector stops every target under it** —
@@ -386,7 +432,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 84 tests
+## Testing — 101 tests
 
 Three layers:
 

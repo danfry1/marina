@@ -490,6 +490,10 @@ impl App {
             || t.git_branch
                 .as_deref()
                 .is_some_and(|b| b.to_lowercase().contains(&q))
+            // `/claude`, `/agent`, `/ended` (orphans), `/detached`
+            || t.launcher.as_ref().is_some_and(|l| {
+                l.short().to_lowercase().contains(&q) || l.kind.as_str().contains(&q)
+            })
     }
 
     /// Esc in normal mode: close the most intrusive thing first —

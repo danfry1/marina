@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::launcher;
 use crate::model::{Anchor, Snapshot, Target, TargetKey, TargetKind};
 use crate::msg::{SamplerCtl, SamplerMsg};
 use crate::resolve;
@@ -167,6 +168,9 @@ impl Sampler {
                     continue; // user said: never show this (subtree stays claimed)
                 }
                 let mut project = project_name(agg.root.as_deref(), &cwd, &mut name_cache);
+                if agg.root.is_none() && home.as_deref() == Some(cwd.as_path()) {
+                    project = home_project(&label);
+                }
                 self.resolver.apply_override(
                     Some(key_port),
                     &argv_joined,
@@ -201,6 +205,7 @@ impl Sampler {
                     url,
                     exposed,
                     container: None,
+                    launcher: launcher::find(anchor, procs),
                 };
                 match by_port.get(&key_port) {
                     Some(&i) => merge_into(&mut out[i], target),
@@ -232,6 +237,9 @@ impl Sampler {
                     .and_then(|c| root_of(c, &mut root_cache, home.as_deref()));
                 let cwd = p.cwd.clone().unwrap_or_default();
                 let mut project = project_name(root.as_deref(), &cwd, &mut name_cache);
+                if root.is_none() && home.as_deref() == Some(cwd.as_path()) {
+                    project = home_project(&label);
+                }
                 if let Some(g) = self.resolver.group_name(&[], &project, &label) {
                     project = g;
                 }
@@ -276,6 +284,7 @@ impl Sampler {
                     url: None,
                     exposed: false,
                     container: None,
+                    launcher: launcher::find(w.anchor, procs),
                 });
             }
             out
@@ -323,6 +332,7 @@ impl Sampler {
                         url: resolve::default_url(&c.image, port),
                         exposed: c.exposed,
                         container: Some(c.name.clone()),
+                        launcher: None,
                     });
                 }
             }
@@ -490,6 +500,12 @@ fn root_of(cwd: &Path, cache: &mut RootCache, home: Option<&Path>) -> Option<Pat
     r
 }
 
+/// A process running in `$HOME` itself has no project — its dir name is just
+/// the username. Name it after the tool instead (`opencode`, not `danielfry`).
+fn home_project(label: &str) -> String {
+    label.split_whitespace().next().unwrap_or(label).to_string()
+}
+
 fn project_name(root: Option<&Path>, cwd: &Path, cache: &mut NameCache) -> String {
     match root {
         Some(r) => {
@@ -619,6 +635,7 @@ mod tests {
             cpu_pct: 0.0,
             mem_bytes: 0,
             start_time: 0,
+            agent: None,
         }
     }
     fn map(ps: Vec<ProcInfo>) -> HashMap<u32, ProcInfo> {
@@ -791,6 +808,25 @@ mod tests {
         assert!(t.url.as_ref().map(|u| u.value.as_str()) == Some("http://localhost:3000"));
         assert_eq!(t.pid_starts, vec![(200, 0)]); // kill fingerprint captured
         assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn build_names_a_home_cwd_server_after_its_tool_and_attributes_it() {
+        // opencode serving from $HOME, reparented to launchd (detached)
+        let procs = vec![proc(
+            200,
+            Some(1),
+            "opencode",
+            "/Users/me",
+            &["/opt/bin/opencode", "serve"],
+        )];
+        let snap = sampler_with(vec![listener(49374, 200)], procs).build();
+        let t = &snap.targets[0];
+        assert_eq!(t.project, "opencode"); // not the username
+        assert_eq!(
+            t.launcher.as_ref().map(|l| l.kind),
+            Some(crate::launcher::LauncherKind::Detached)
+        );
     }
 
     #[test]
