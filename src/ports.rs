@@ -145,6 +145,15 @@ pub fn allocate(
     Err(AllocError::Exhausted)
 }
 
+/// The port already assigned to `root` + `name`, without assigning one.
+pub fn lookup(leases: &Leases, root: &Path, name: Option<&str>) -> Option<u16> {
+    leases
+        .leases
+        .iter()
+        .find(|l| l.is_for(root, name))
+        .map(|l| l.port)
+}
+
 /// Drop the lease for `root` + `name`. Returns the port it held.
 pub fn release(leases: &mut Leases, root: &Path, name: Option<&str>) -> Option<u16> {
     let i = leases.leases.iter().position(|l| l.is_for(root, name))?;

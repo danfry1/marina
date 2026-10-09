@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod docker;
+mod hooks;
 mod launcher;
 mod logs;
 mod model;

@@ -22,7 +22,7 @@ ratatui = "0.30"          # rendering (diff buffer) + re-exports crossterm
 sysinfo = "0.39"          # process cpu/mem/cwd/argv/parent (+ cpu delta math)
 netstat2 = "0.11"         # listening socket -> pid
 serde = { version = "1", features = ["derive"] } # config structs
-serde_json = "1"          # parse package.json name
+serde_json = { version = "1", features = ["preserve_order"] }  # package.json; key order kept when editing Claude settings
 toml = "1.1"              # parse config + Cargo.toml / pyproject.toml name
 regex = "1"               # config rule matching
 
