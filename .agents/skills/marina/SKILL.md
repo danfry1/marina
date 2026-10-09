@@ -116,6 +116,10 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 
 ## Good to know
 
+- If the user runs Claude Code, `marina hooks install` wires this in
+  automatically: running servers at session start, duplicate/port notes before
+  dev-server commands, and cleanup of your servers when the session ends.
+
 - marina only sees and touches the **current user's own** processes, and never
   lists or kills the shell/session it (or you) run in — so you can't accidentally
   kill your own terminal.

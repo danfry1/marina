@@ -8,6 +8,8 @@
 //!   marina free <port>… [--json] stop whatever dev target holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
 //!   marina port --list | --release [name]
+//!   marina hooks install|uninstall|status [--project] [--no-cleanup]
+//!   marina hook <event>          (internal: invoked by the installed hooks)
 //!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
@@ -49,6 +51,9 @@ USAGE:
                                  (pnpm dev --port $(marina port))
     marina port --list           show assigned ports
     marina port --release [name] give this project's port back
+    marina hooks install         wire marina into Claude Code sessions
+                                 [--project] [--no-cleanup]
+    marina hooks uninstall | status
     marina version               print the version
 
 SELECTOR:
@@ -79,7 +84,13 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if let Some(bad) = flags.iter().find(|f| {
         !matches!(
             **f,
-            "--json" | "--mine" | "--orphaned" | "--list" | "--release"
+            "--json"
+                | "--mine"
+                | "--orphaned"
+                | "--list"
+                | "--release"
+                | "--project"
+                | "--no-cleanup"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -109,6 +120,14 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         eprintln!("marina: --list / --release only apply to `marina port`");
         return Some(2);
     }
+    let (project, no_cleanup) = (
+        flags.contains(&"--project"),
+        flags.contains(&"--no-cleanup"),
+    );
+    if (project || no_cleanup) && cmd != "hooks" {
+        eprintln!("marina: --project / --no-cleanup only apply to `marina hooks`");
+        return Some(2);
+    }
     let code = match cmd {
         "ls" => ls(json, &selectors, &scope),
         "kill" => kill(&selectors, json, &scope),
@@ -117,6 +136,16 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
+        "hooks" => hooks(&selectors, project, no_cleanup),
+        "hook" => match selectors.as_slice() {
+            [event] if flags.is_empty() => crate::hooks::run(event),
+            _ => {
+                eprintln!(
+                    "hook: internal — usage: marina hook <session-start|pre-bash|session-end>"
+                );
+                2
+            }
+        },
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -890,6 +919,98 @@ fn port_list(leases: &crate::ports::Leases, json: bool) -> i32 {
     0
 }
 
+// --- hooks ------------------------------------------------------------------
+
+/// `marina hooks install | uninstall | status` — manage marina's Claude Code
+/// hooks in user settings (or the project's with `--project`).
+fn hooks(selectors: &[&str], project: bool, no_cleanup: bool) -> i32 {
+    use crate::hooks::{
+        install_into, installed, invocation, read_settings, settings_path, strip_settings,
+        write_settings,
+    };
+    let action = match selectors {
+        [a] if matches!(*a, "install" | "uninstall" | "status") => *a,
+        _ => {
+            eprintln!(
+                "hooks: usage: marina hooks <install|uninstall|status> [--project] [--no-cleanup]"
+            );
+            return 2;
+        }
+    };
+    if no_cleanup && action != "install" {
+        eprintln!("hooks: --no-cleanup only applies to install");
+        return 2;
+    }
+    let Some(path) = settings_path(project) else {
+        eprintln!(
+            "hooks: can't locate Claude Code settings{}",
+            if project {
+                " (not inside a project)"
+            } else {
+                ""
+            }
+        );
+        return 2;
+    };
+    let shown = tildify(&path.display().to_string());
+    let mut settings = match read_settings(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hooks: {e}");
+            return 1;
+        }
+    };
+    match action {
+        "status" => {
+            let found = installed(&settings);
+            if found.is_empty() {
+                println!("marina hooks: not installed in {shown}");
+                return 1;
+            }
+            println!("marina hooks in {shown}:");
+            for (event, name) in found {
+                println!("  {event:<13} marina hook {name}");
+            }
+            0
+        }
+        "install" => {
+            if let Err(e) = install_into(&mut settings, &invocation(), !no_cleanup) {
+                eprintln!("hooks: {e} — not touching {shown}");
+                return 1;
+            }
+            if let Err(e) = write_settings(&path, &settings) {
+                eprintln!("hooks: {e}");
+                return 1;
+            }
+            println!("installed marina hooks in {shown}:");
+            println!(
+                "  session start   tell the agent what's already running + this worktree's port"
+            );
+            println!("  before Bash     on dev-server starts: flag duplicates and hard-coded ports (never blocks)");
+            if no_cleanup {
+                println!("  session end     (skipped: --no-cleanup)");
+            } else {
+                println!("  session end     stop the servers that session started (not on /clear or /resume)");
+            }
+            println!("Takes effect in new Claude Code sessions. Undo: marina hooks uninstall");
+            0
+        }
+        _ => {
+            if installed(&settings).is_empty() {
+                println!("marina hooks: nothing to remove in {shown}");
+                return 0;
+            }
+            strip_settings(&mut settings);
+            if let Err(e) = write_settings(&path, &settings) {
+                eprintln!("hooks: {e}");
+                return 1;
+            }
+            println!("removed marina hooks from {shown}");
+            0
+        }
+    }
+}
+
 // --- JSON view --------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -1074,6 +1195,17 @@ mod tests {
         assert_eq!(d(&["port", "--mine"]), Some(2));
         assert_eq!(d(&["ls", "--list"]), Some(2)); // port-only flags
         assert_eq!(d(&["kill", "x", "--release"]), Some(2));
+    }
+
+    #[test]
+    fn hooks_usage_errors_exit_two() {
+        let d = |a: &[&str]| dispatch(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(d(&["hooks"]), Some(2));
+        assert_eq!(d(&["hooks", "instal"]), Some(2));
+        assert_eq!(d(&["hooks", "status", "--no-cleanup"]), Some(2));
+        assert_eq!(d(&["ls", "--project"]), Some(2));
+        assert_eq!(d(&["hook"]), Some(2));
+        assert_eq!(d(&["hook", "session-start", "--json"]), Some(2));
     }
 
     #[test]

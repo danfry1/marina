@@ -186,6 +186,31 @@ errors, they never fall through to the TUI.
 
 ## Use with AI agents
 
+### Claude Code hooks (automatic)
+
+```sh
+marina hooks install            # user-wide; --project for this repo only
+```
+
+After that, every Claude Code session works with marina without being asked:
+
+- **Session start** — the agent is told which dev servers are already running
+  for this project (so it reuses them instead of starting a duplicate) and
+  this worktree's `marina port`.
+- **Before a Bash command** — only when the command starts a dev server: a note
+  if this project's server is already up, or if the command hard-codes a port
+  that belongs to someone else. Context only — it never blocks or approves
+  anything, and costs ~20ms on non-matching commands.
+- **Session end** — the servers that session started are stopped, so agents
+  clean up after themselves. Not on `/clear` or `/resume`. Skip this part with
+  `marina hooks install --no-cleanup`.
+
+`marina hooks status` shows what's installed; `marina hooks uninstall` removes
+exactly marina's entries (your other settings and hooks are left as they were;
+a one-time `settings.json.marina-bak` is kept).
+
+### The skill (any agent)
+
 The CLI is built to be driven by coding agents. The usage instructions are a
 tool-neutral Markdown skill — [.agents/skills/marina/SKILL.md](.agents/skills/marina/SKILL.md).
 Install it into your agent's skills directory:
@@ -245,7 +270,8 @@ marina is deliberately boring on this front:
   process (`R` / `marina restart`), the new process's stdout/stderr is captured
   to `logs/<project>.log` so `T` can always tail it; and `marina port` records
   its assignments (port, project root, optional service name, timestamps) in
-  `ports.json`.
+  `ports.json`. `marina hooks install` edits Claude Code's `settings.json` —
+  only when you run it, and `uninstall` reverts it.
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
   ever inspects your own user's processes — system/root daemons and anything
   outside `$HOME` are filtered out (and the OS wouldn't let it read others
@@ -278,7 +304,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~8.3k LOC · 127 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~9k LOC · 136 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

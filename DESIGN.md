@@ -478,7 +478,27 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 127 tests
+### Agent hooks — IMPLEMENTED
+
+`marina hooks install [--project] [--no-cleanup]` registers three Claude Code
+command hooks (`marina hook <event>`), each with its own `timeout` (SessionEnd's
+default budget is 1.5s, too short to stop a server):
+
+| event | hook | does |
+|---|---|---|
+| `SessionStart` | `session-start` | `additionalContext`: this project's running servers (reuse, don't duplicate), its existing port lease (read-only — no lease is created), counts of other servers / orphans |
+| `PreToolUse` (`Bash`) | `pre-bash` | only for dev-server start commands (token rules: `pnpm dev`, `npm run dev`, `vite`, `cargo run`, …): duplicate-server and hard-coded-port notes as `additionalContext`. **No `permissionDecision`** — `allow` would silently auto-approve the command; verified in a headless run that context without a decision reaches the model and leaves permissions alone. Non-matching commands return in ~20ms without building a snapshot |
+| `SessionEnd` | `session-end` | stop targets whose launcher session id equals the hook's `session_id` (verified SIGTERM → 2s → SIGKILL; docker stop). Skipped for `reason` `clear` / `resume` — the id changes but the work continues |
+
+Hooks always exit 0; failures go to stderr (Claude's debug log), never in the
+agent's way. Settings are edited as JSON with key order preserved
+(`serde_json/preserve_order`), marina's entries identified by command, user
+hooks untouched; a malformed file is refused, writes are atomic, and the first
+write keeps `settings.json.marina-bak`. The hook command is plain `marina` when
+that resolves to the running binary on `PATH` (survives `brew upgrade`), else
+its absolute path. User scope honours `CLAUDE_CONFIG_DIR`.
+
+## Testing — 136 tests
 
 Three layers:
 
