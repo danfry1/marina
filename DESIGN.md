@@ -376,8 +376,24 @@ marina restart <sel>…       # re-exec captured argv in cwd (output captured)
 marina url <sel>… [--json]  # print matching URLs
 marina who <port>… [--json] # who holds a port: a target, another process, or free
 marina free <port>… [--json] # verified-stop the target on a port, wait for release
+marina port [name] [--json]  # stable, collision-free port for this project root
+marina port --list | --release [name]
 marina version
 ```
+
+**`port` — leases, not guesses.** Keyed on the project root of the canonical
+cwd (each worktree and each monorepo package is a root) plus an optional
+service name. First choice is FNV-1a(key) within the range (3100–3999 by
+default; `[ports] range`), so a key prefers the same port on every machine;
+the assignment is then recorded in `$XDG_STATE_HOME/marina/ports.json`. The
+read-modify-write runs under an exclusive `flock` on `ports.lock` and saves
+via temp-file rename, so concurrent agents serialize instead of racing.
+Probing skips ports leased to another key and ports busy with a *foreign*
+listener (netstat, plus a bind probe); a busy port whose listener is a dev
+target inside this root is this project's own server and is kept. A lease
+whose port is taken over moves (stderr note; `moved` in `--json`). Leases for
+roots that no longer exist are dropped on every call. The allocator
+(`ports::allocate`) is pure; I/O and the busy probe are injected.
 
 **`who` / `free` take ports only** — exact identity, no substring matching, so
 "free :3000" can never take down an unrelated project. When no target holds the
@@ -462,7 +478,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 117 tests
+## Testing — 127 tests
 
 Three layers:
 

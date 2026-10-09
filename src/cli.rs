@@ -6,6 +6,8 @@
 //!   marina url <sel>… [--json]  print matching targets' URLs
 //!   marina who <port>… [--json] what is holding a port (dev target or not)
 //!   marina free <port>… [--json] stop whatever dev target holds a port
+//!   marina port [name] [--json]  a stable free port for this project/worktree
+//!   marina port --list | --release [name]
 //!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
@@ -43,6 +45,10 @@ USAGE:
     marina url <sel>... [--json] print matching targets' URLs
     marina who <port>... [--json]  what is holding a port
     marina free <port>... [--json] stop the dev target holding a port
+    marina port [name] [--json]  stable free port for this project/worktree
+                                 (pnpm dev --port $(marina port))
+    marina port --list           show assigned ports
+    marina port --release [name] give this project's port back
     marina version               print the version
 
 SELECTOR:
@@ -70,10 +76,12 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         .map(String::as_str)
         .filter(|s| !s.starts_with('-'))
         .collect();
-    if let Some(bad) = flags
-        .iter()
-        .find(|f| !matches!(**f, "--json" | "--mine" | "--orphaned"))
-    {
+    if let Some(bad) = flags.iter().find(|f| {
+        !matches!(
+            **f,
+            "--json" | "--mine" | "--orphaned" | "--list" | "--release"
+        )
+    }) {
         eprintln!("marina: unknown flag {bad:?}\n");
         eprint!("{USAGE}");
         return Some(2);
@@ -92,8 +100,13 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
             }
         }
     }
-    if scope.active() && matches!(cmd, "who" | "free") {
-        eprintln!("marina: {cmd} takes ports only (no --mine / --orphaned)");
+    if scope.active() && matches!(cmd, "who" | "free" | "port") {
+        eprintln!("marina: {cmd} doesn't take --mine / --orphaned");
+        return Some(2);
+    }
+    let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
+    if (list || release) && cmd != "port" {
+        eprintln!("marina: --list / --release only apply to `marina port`");
         return Some(2);
     }
     let code = match cmd {
@@ -103,6 +116,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "url" => url(&selectors, json, &scope),
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
+        "port" => port(&selectors, json, list, release),
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -692,6 +706,190 @@ fn free(selectors: &[&str], json: bool) -> i32 {
     code
 }
 
+// --- port -------------------------------------------------------------------
+
+/// The project root `marina port` keys on: the nearest project marker above
+/// the (canonical) cwd — each worktree, and each package in a monorepo, is
+/// its own root.
+fn current_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    crate::resolve::project_root(&cwd, home.as_deref())
+}
+
+/// `marina port [name]`: print a stable port for this project (stdout is just
+/// the number, for `$(marina port)`); `--list` shows every assignment;
+/// `--release [name]` gives one back. Exit 1 when the range is exhausted or
+/// there is nothing to release.
+fn port(selectors: &[&str], json: bool, list: bool, release: bool) -> i32 {
+    use crate::ports::{allocate, AllocError, Outcome, Store};
+
+    if list && release {
+        eprintln!("port: use either --list or --release");
+        return 2;
+    }
+    if selectors.len() > 1 {
+        eprintln!("port: takes at most one service name");
+        return 2;
+    }
+    let name = selectors.first().copied();
+    if let Some(n) = name.filter(|n| !crate::ports::valid_name(n)) {
+        eprintln!("port: {n:?} is not a valid service name (letters, digits, - _ .)");
+        return 2;
+    }
+    let store = match Store::open() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("port: can't open the port registry: {e}");
+            return 1;
+        }
+    };
+    let mut leases = store.load();
+    if list {
+        return port_list(&leases, json);
+    }
+    let Some(root) = current_root() else {
+        eprintln!("port: not inside a project — run it from a project or worktree directory");
+        return 2;
+    };
+
+    if release {
+        let freed = crate::ports::release(&mut leases, &root, name);
+        if let Err(e) = store.save(&leases) {
+            eprintln!("port: can't save the port registry: {e}");
+            return 1;
+        }
+        return match freed {
+            Some(p) => {
+                println!("released :{p}");
+                0
+            }
+            None => {
+                eprintln!("no port assigned here");
+                1
+            }
+        };
+    }
+
+    // Busy ports are fine only when it's this project's own server on them.
+    let listening: std::collections::HashSet<u16> = Netstat2Ports
+        .listeners()
+        .map(|ls| ls.into_iter().map(|l| l.port).collect())
+        .unwrap_or_default();
+    let snap = std::cell::OnceCell::new();
+    let foreign_busy = |p: u16| {
+        let busy = listening.contains(&p) || std::net::TcpListener::bind(("127.0.0.1", p)).is_err();
+        busy && !snapshot_on(&snap)
+            .targets
+            .iter()
+            .any(|t| t.ports.contains(&p) && t.cwd.starts_with(&root))
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let range = crate::config::load().ports.range();
+    let result = allocate(
+        &mut leases,
+        &root,
+        name,
+        range.clone(),
+        now,
+        foreign_busy,
+        |r| r.exists(),
+    );
+    let (p, outcome) = match result {
+        Ok(r) => r,
+        Err(AllocError::Exhausted) => {
+            eprintln!(
+                "port: every port in {}-{} is assigned or busy (widen [ports] range, or --release unused ones)",
+                range.start(),
+                range.end()
+            );
+            return 1;
+        }
+    };
+    if let Err(e) = store.save(&leases) {
+        eprintln!("port: can't save the port registry: {e}");
+        return 1;
+    }
+    if json {
+        #[derive(Serialize)]
+        struct PortOut<'a> {
+            port: u16,
+            root: String,
+            name: Option<&'a str>,
+            /// `existing` | `new` | `moved`
+            status: &'static str,
+            moved_from: Option<u16>,
+        }
+        let (status, moved_from) = match outcome {
+            Outcome::Existing => ("existing", None),
+            Outcome::New => ("new", None),
+            Outcome::Moved { from } => ("moved", Some(from)),
+        };
+        let out = PortOut {
+            port: p,
+            root: root.display().to_string(),
+            name,
+            status,
+            moved_from,
+        };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        if let Outcome::Moved { from } = outcome {
+            eprintln!(
+                "marina: :{from} is now used by another process — moved this project to :{p}"
+            );
+        }
+        println!("{p}");
+    }
+    0
+}
+
+/// Build the snapshot at most once, and only if a busy port needs explaining.
+fn snapshot_on(cell: &std::cell::OnceCell<Snapshot>) -> &Snapshot {
+    cell.get_or_init(|| snapshot(false))
+}
+
+fn port_list(leases: &crate::ports::Leases, json: bool) -> i32 {
+    let mut rows: Vec<&crate::ports::Lease> = leases.leases.iter().collect();
+    rows.sort_by_key(|l| l.port);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_default()
+        );
+        return 0;
+    }
+    if rows.is_empty() {
+        println!("no ports assigned (run `marina port` in a project)");
+        return 0;
+    }
+    let listening: std::collections::HashSet<u16> = Netstat2Ports
+        .listeners()
+        .map(|ls| ls.into_iter().map(|l| l.port).collect())
+        .unwrap_or_default();
+    println!("{:<7} {:<10} {:<9} PROJECT ROOT", "PORT", "NAME", "STATE");
+    for l in rows {
+        let state = if !l.root.exists() {
+            "gone"
+        } else if listening.contains(&l.port) {
+            "listening"
+        } else {
+            "idle"
+        };
+        println!(
+            ":{:<6} {:<10} {:<9} {}",
+            l.port,
+            l.name.as_deref().unwrap_or("—"),
+            state,
+            tildify(&l.root.display().to_string())
+        );
+    }
+    0
+}
+
 // --- JSON view --------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -865,6 +1063,17 @@ mod tests {
         assert_eq!(dispatch(&["who".into(), port.clone()]), Some(0));
         assert_eq!(dispatch(&["free".into(), port]), Some(1));
         drop(l);
+    }
+
+    #[test]
+    fn port_usage_errors_exit_two_before_touching_the_registry() {
+        let d = |a: &[&str]| dispatch(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(d(&["port", "web", "api"]), Some(2)); // one name at most
+        assert_eq!(d(&["port", "a/b"]), Some(2)); // invalid name
+        assert_eq!(d(&["port", "--list", "--release"]), Some(2));
+        assert_eq!(d(&["port", "--mine"]), Some(2));
+        assert_eq!(d(&["ls", "--list"]), Some(2)); // port-only flags
+        assert_eq!(d(&["kill", "x", "--release"]), Some(2));
     }
 
     #[test]

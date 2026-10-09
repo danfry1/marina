@@ -31,14 +31,20 @@ pub fn discover(pids: &[u32], cwd: &Path, project: &str) -> Option<PathBuf> {
         .or_else(|| pm2_log(project))
 }
 
-/// `$XDG_STATE_HOME/marina/logs/<project>.log` (or `~/.local/state/…`) — where
-/// marina captures stdout/stderr of processes it restarts. Creates the dir.
-pub fn state_log_path(project: &str) -> Option<PathBuf> {
+/// `$XDG_STATE_HOME/marina` (or `~/.local/state/marina`) — marina's only
+/// writable location: restart logs and port assignments. Not created here.
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    let dir = base.join("marina").join("logs");
+    Some(base.join("marina"))
+}
+
+/// `$XDG_STATE_HOME/marina/logs/<project>.log` (or `~/.local/state/…`) — where
+/// marina captures stdout/stderr of processes it restarts. Creates the dir.
+pub fn state_log_path(project: &str) -> Option<PathBuf> {
+    let dir = state_dir()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     let safe: String = project
         .chars()
