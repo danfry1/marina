@@ -334,7 +334,10 @@ pub fn find(anchor: u32, procs: &HashMap<u32, ProcInfo>) -> Option<Launcher> {
             kind: LauncherKind::Agent,
             name,
             pid: env.pid,
-            alive: live.is_some(),
+            // Orphaned only on proof: the marker names a pid and that pid is
+            // no longer an agent. Without a pid, liveness is unknown — never
+            // raise a false "session ended".
+            alive: env.pid.is_none() || live.is_some(),
             session: env.session.clone(),
             cwd: live.and_then(|p| p.cwd.clone()),
             start_time: live.map(|p| p.start_time).unwrap_or(0),
@@ -503,6 +506,19 @@ mod tests {
         let gone = map(vec![p(20, 1, "postgres", &["postgres"]), server]);
         let l = find(30, &gone).unwrap();
         assert!(l.is_orphaned());
+    }
+
+    #[test]
+    fn markers_without_a_pid_are_never_called_orphaned() {
+        let mut server = p(30, 1, "node", &["node", "vite"]);
+        server.agent = Some(AgentEnv {
+            agent: Some("claude".into()),
+            pid: None,
+            session: Some("abc-123".into()),
+        });
+        let l = find(30, &map(vec![server])).unwrap();
+        assert_eq!(l.kind, LauncherKind::Agent);
+        assert!(!l.is_orphaned(), "can't prove the session ended");
     }
 
     #[test]

@@ -432,7 +432,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 101 tests
+## Testing — 109 tests
 
 Three layers:
 
@@ -499,6 +499,18 @@ non-issue — rows for system stuff may just be opaque.
 - **TUI grouping**: a project with several targets gets a collapsible header
   (`Enter` folds; `K`/`R` act on the whole group); a lone target stays a plain
   row. Group cpu/mem aggregate in the header; same project-matching as the CLI.
+- **Session view** (`v`): the same grouping machinery keyed by launcher instead
+  of project — one header per agent session (`claude·<dir>`, `claude·ended`),
+  editor, terminal, `detached`, or `unattributed`; distinct sessions that would
+  share a label get a short id suffix (`#219a`). Every session gets a header,
+  even with one member, because the session is the information. `K`/`R` on a
+  session header act on exactly that session's targets.
+- **Orphan notices**: the snapshot diff in `App::apply` reports each agent
+  session whose targets go alive→orphaned, once, grouped per session, as a
+  20s status notice plus a desktop notification (`osascript` / `notify-send`,
+  off via `[notify] desktop = false`). Orphans already present at startup get a
+  status-line count only. "Orphaned" requires proof — the env marker names a
+  pid that is no longer an agent; markers without a pid never count.
 - **Declared groups** (`config [[group]]`): bundle targets that don't share a
   cwd — an app + its database — under one name by port/project/command selectors.
   Applies to listener, watched, and docker targets; works in both TUI and CLI
@@ -523,4 +535,4 @@ non-issue — rows for system stuff may just be opaque.
   overmind. Needs an ADR (scope: monitor vs. supervisor).
 - Two-cadence split (optional — adaptive single-path suffices today).
 - Terminal-focus-based idle backoff; desktop notification on crash detection
-  (status line only today).
+  (status line only today — the notify plumbing now exists for orphans).

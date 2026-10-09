@@ -46,6 +46,13 @@ developer-process-centric.
   when a server is bound to `0.0.0.0` (reachable from your LAN).
 - **Grouping** — a project's services collapse under one header, and one keystroke
   kills the whole project. Declared groups bundle an app with its database.
+- **Session view** — press `v` to group by *who started it* instead: one header
+  per agent session (`claude·fal-app`, `codex·api`), editor, or terminal, across
+  projects. `K` on a session header stops everything that session started.
+- **Orphan notices** — when an agent session ends and leaves servers running,
+  marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
+  running (480MB)` — in the status line and as a desktop notification
+  (`osascript` / `notify-send`; turn off with `[notify] desktop = false`).
 - **Agent/script CLI** — `marina ls --json`, `marina kill <project>`,
   `marina who 3000` / `marina free 3000`, sharing the exact same resolution
   engine as the TUI.
@@ -110,6 +117,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a project group |
+| `v` | group by project ↔ by agent session / launcher |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
 | `s` | cycle sort (port / cpu / mem) — or click a column header |
@@ -197,6 +205,9 @@ members = [3000, 5432, "worker"]
 
 [[ignore]]                     # hide noise the heuristics keep picking up
 match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
+
+[notify]
+desktop = false                # no desktop notification for orphaned servers
 ```
 
 ## Privacy & security
@@ -232,6 +243,8 @@ marina is deliberately boring on this front:
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes.
+  The one unprompted action is a local desktop notification when an agent
+  session leaves servers behind (`[notify] desktop = false` disables it).
 
 ## Design
 
@@ -239,7 +252,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~7k LOC · 101 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~7.5k LOC · 109 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

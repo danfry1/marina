@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify};
-use super::state::{App, Entry, SortMode};
+use super::state::{App, Entry, GroupBy, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Target, TargetKey, TargetKind};
 
@@ -58,9 +58,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.log_rect = log_area;
 
     let title = format!(
-        " marina · {} targets · sort:{} ",
+        " marina · {} targets · sort:{}{} ",
         app.snapshot.targets.len(),
-        app.sort.label()
+        app.sort.label(),
+        match app.group_by {
+            GroupBy::Project => "",
+            GroupBy::Session => " · by:session",
+        }
     );
     let block = Block::bordered().title(title);
 
@@ -208,7 +212,7 @@ fn footer_line(app: &App) -> Line<'static> {
         )
     } else {
         Line::styled(
-            "  j/k move · / filter · s sort · i inspect · K kill · ? help · q quit",
+            "  j/k move · / filter · s sort · v by session · i inspect · K kill · ? help · q quit",
             Style::new().fg(Color::DarkGray),
         )
     }
@@ -217,12 +221,7 @@ fn footer_line(app: &App) -> Line<'static> {
 fn detail_line(app: &App) -> Line<'static> {
     match &app.selected {
         Some(Entry::Group(p)) => {
-            let members: Vec<&Target> = app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .collect();
+            let members: Vec<&Target> = app.group_members(p);
             let cpu: f32 = members
                 .iter()
                 .filter(|t| !t.pids.is_empty())
@@ -233,9 +232,17 @@ fn detail_line(app: &App) -> Line<'static> {
                 .filter(|t| !t.pids.is_empty())
                 .map(|t| t.mem_bytes)
                 .sum();
+            // In session view, name the session itself, not just its label.
+            let who = match (
+                app.group_by,
+                members.first().and_then(|t| t.launcher.as_ref()),
+            ) {
+                (GroupBy::Session, Some(l)) => format!("{} · ", l.describe()),
+                _ => String::new(),
+            };
             Line::styled(
                 format!(
-                    "  {} · {} services · {:.1}% · {} · K kills all",
+                    "  {who}{} · {} services · {:.1}% · {} · K kills all",
                     p,
                     members.len(),
                     cpu,
@@ -391,13 +398,21 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 format!(" {p} (group)"),
                 Style::new().add_modifier(Modifier::BOLD),
             ))];
-            for t in app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .take(5)
-            {
+            let first = app
+                .group_members(p)
+                .first()
+                .and_then(|t| t.launcher.clone());
+            if let (GroupBy::Session, Some(l)) = (app.group_by, first) {
+                let mut spans = vec![
+                    Span::styled(" via    ".to_string(), key),
+                    Span::styled(l.describe(), launcher_style(&l)),
+                ];
+                if let Some(hint) = l.resume_hint() {
+                    spans.push(Span::styled(format!(" · resume: {hint}"), val));
+                }
+                lines.push(Line::from(spans));
+            }
+            for t in app.group_members(p).into_iter().take(5) {
                 let port = t
                     .ports
                     .first()
@@ -415,12 +430,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
 fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) -> Row<'static> {
     match entry {
         Entry::Group(p) => {
-            let members: Vec<&Target> = app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .collect();
+            let members: Vec<&Target> = app.group_members(p);
             let cpu: f32 = members
                 .iter()
                 .filter(|t| !t.pids.is_empty())
@@ -436,8 +446,15 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             } else {
                 "▾"
             };
+            let header_style = match (
+                app.group_by,
+                members.first().and_then(|t| t.launcher.as_ref()),
+            ) {
+                (GroupBy::Session, Some(l)) => launcher_style(l).add_modifier(Modifier::BOLD),
+                _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            };
             Row::new(vec![
-                Cell::from(format!("{arrow} {p} ({})", members.len())),
+                Cell::from(group_header_text(arrow, p, members.len())),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format!("{cpu:.1}%")),
@@ -446,7 +463,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
                 Cell::from(""),
                 Cell::from(""),
             ])
-            .style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
+            .style(header_style)
         }
         Entry::Member(k) => match by_key.get(k) {
             Some(t) => target_row(t, true, app),
@@ -542,6 +559,20 @@ fn infra_tag(label: &str) -> Option<&'static str> {
 }
 
 /// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
+/// `▾ label (n)` sized to the PROJECT column: a long label is cut with `…`
+/// so the member count always stays visible.
+fn group_header_text(arrow: &str, label: &str, n: usize) -> String {
+    let suffix = format!(" ({n})");
+    let room = (COLW[0] as usize).saturating_sub(2 + suffix.chars().count());
+    let label = if label.chars().count() > room {
+        let cut: String = label.chars().take(room.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        label.to_string()
+    };
+    format!("{arrow} {label}{suffix}")
+}
+
 /// Agents stand out (an orphan — its session ended — in yellow); editors and
 /// terminals are ordinary; detached is dim.
 fn launcher_style(l: &Launcher) -> Style {
@@ -587,6 +618,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "/",
             "filter (project · command · port · cwd · branch · via)",
         ),
+        row("v", "group by project / agent session"),
         row("K · u", "kill · cancel force-kill"),
         row("R", "restart (output captured to a log)"),
         row("T", "tail logs"),
@@ -757,6 +789,17 @@ mod tests {
         app.filter = "ended".into();
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("worker") && !out.contains("billing-api"));
+    }
+
+    #[test]
+    fn long_group_labels_keep_their_count_visible() {
+        let t = group_header_text("▾", "claude·courts-portfolio-site", 3);
+        assert_eq!(t.chars().count(), COLW[0] as usize);
+        assert!(t.ends_with("… (3)"), "{t}");
+        assert_eq!(
+            group_header_text("▾", "client-portal", 2),
+            "▾ client-portal (2)"
+        );
     }
 
     #[test]

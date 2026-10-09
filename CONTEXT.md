@@ -90,6 +90,9 @@
   …), an *editor*, a *terminal*, or nobody any more (*detached*). Shown in the
   `VIA` column; the basis of the `--mine` / `--orphaned` scopes.
 
+- **Session view** — the `v` grouping mode: group headers are launchers (agent
+  sessions, editors, terminals) instead of projects.
+
 - **Orphaned** — a Target whose launching agent session has ended while the
   server kept running (`claude·ended`). Distinct from *detached*, which carries
   no agent markers at all.
