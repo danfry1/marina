@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod docker;
+mod launcher;
 mod logs;
 mod model;
 mod msg;
@@ -58,7 +59,16 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
-    let result = run(&mut terminal, &mut app, rx, ctl, ev_tx, ev_rx);
+    let desktop_notify = config::load().notify.desktop;
+    let result = run(
+        &mut terminal,
+        &mut app,
+        rx,
+        ctl,
+        ev_tx,
+        ev_rx,
+        desktop_notify,
+    );
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -71,6 +81,7 @@ fn run(
     ctl: Sender<SamplerCtl>,
     ev_tx: Sender<UiEvent>,
     ev_rx: Receiver<UiEvent>,
+    desktop_notify: bool,
 ) -> io::Result<()> {
     loop {
         // Draw only when something changed (or an animation is running) — an
@@ -116,6 +127,7 @@ fn run(
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('i') => app.toggle_inspect(),
+                            KeyCode::Char('v') => app.toggle_group_by(),
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Char('K') => verb_kill(app, &ev_tx, &ctl),
                             KeyCode::Char('u') => app.undo_kill(),
@@ -149,6 +161,13 @@ fn run(
                     app.sampler_died();
                     break;
                 }
+            }
+        }
+
+        // Agent sessions that ended and left servers running.
+        for msg in app.take_notifications() {
+            if desktop_notify {
+                verbs::notify("marina", &msg);
             }
         }
 

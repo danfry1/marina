@@ -52,6 +52,9 @@ pub struct Target {
     /// Docker container name when this target is a published container port.
     /// Verbs act via `docker stop/restart/logs` instead of signals.
     pub container: Option<String>,
+    /// Who started it — an agent session, editor, terminal, or nobody now
+    /// (detached). `None` when the owner can't be named.
+    pub launcher: Option<crate::launcher::Launcher>,
 }
 
 /// Typed, optional URL — the verb layer decides what "open" / "copy" mean per scheme.
@@ -135,6 +138,7 @@ impl Snapshot {
             url,
             exposed: false,
             container: None,
+            launcher: None,
         };
         let http = |p: u16| {
             Some(Url {

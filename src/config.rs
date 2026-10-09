@@ -24,6 +24,10 @@
 //! match_cmd  = "OrbStack|CloudSyncAgent"
 //! # and/or:
 //! match_port = 7000
+//!
+//! [notify]
+//! desktop = false       # no desktop notification when an agent session
+//!                       # ends and leaves servers running (default: true)
 //! ```
 
 use std::path::PathBuf;
@@ -42,6 +46,26 @@ pub struct ConfigFile {
     pub group: Vec<GroupCfg>,
     #[serde(default)]
     pub ignore: Vec<IgnoreCfg>,
+    #[serde(default)]
+    pub notify: NotifyCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotifyCfg {
+    /// Desktop notification when an agent session ends and leaves servers
+    /// running. The TUI status line always shows it either way.
+    #[serde(default = "yes")]
+    pub desktop: bool,
+}
+
+impl Default for NotifyCfg {
+    fn default() -> Self {
+        NotifyCfg { desktop: true }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,5 +179,14 @@ mod tests {
     fn empty_config_is_default() {
         let cfg: ConfigFile = toml::from_str("").unwrap();
         assert!(cfg.rule.is_empty() && cfg.group.is_empty());
+        assert!(cfg.notify.desktop, "desktop notifications default on");
+    }
+
+    #[test]
+    fn notify_can_be_turned_off() {
+        let cfg: ConfigFile = toml::from_str("[notify]\ndesktop = false").unwrap();
+        assert!(!cfg.notify.desktop);
+        let cfg: ConfigFile = toml::from_str("[notify]").unwrap();
+        assert!(cfg.notify.desktop);
     }
 }

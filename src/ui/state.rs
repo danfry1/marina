@@ -1,6 +1,8 @@
 //! View state lives only here and survives snapshot swaps. Targets are grouped
-//! by project: a project with several targets gets a collapsible header and a
-//! group-kill; a lone target renders as a plain row. Selection is held by value
+//! by project (or, with `v`, by the agent session / launcher that started
+//! them): a group with several targets gets a collapsible header and a
+//! group-kill; a lone target renders as a plain row. In session view every
+//! session gets a header, since the session *is* the information. Selection is held by value
 //! (`Entry`), not index, so the cursor doesn't jump when data refreshes; if the
 //! selected row vanishes the cursor falls to its nearest neighbor (the same
 //! list position), never back to the top. Volatile sorts freeze briefly after a
@@ -20,11 +22,13 @@ use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
-use super::format::unix_now;
+use super::format::{fmt_mem, tildify, unix_now};
 use crate::model::{Snapshot, Target, TargetKey};
 
 pub(crate) const FREEZE: Duration = Duration::from_secs(2);
 pub(crate) const STATUS_TTL: Duration = Duration::from_secs(4);
+/// Orphan notices outlive ordinary status messages — they ask for a decision.
+pub(crate) const NOTICE_TTL: Duration = Duration::from_secs(20);
 /// How long a newly-appeared row flashes.
 pub(crate) const FLASH: Duration = Duration::from_millis(1500);
 /// How long after a marina-initiated kill/restart a vanished target is NOT
@@ -59,6 +63,13 @@ impl SortMode {
     fn is_volatile(self) -> bool {
         !matches!(self, SortMode::Port)
     }
+}
+
+/// What group headers collect: a project, or the session that launched it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum GroupBy {
+    Project,
+    Session,
 }
 
 /// A visible row: a project group header, a member of an (expanded) group, or a
@@ -107,6 +118,12 @@ pub struct App {
     pub(crate) table_state: TableState,
     pub(crate) status: Option<String>,
     pub(crate) status_at: Instant,
+    pub(crate) status_ttl: Duration,
+    pub(crate) group_by: GroupBy,
+    /// Session-view group label per target, rebuilt on each snapshot.
+    pub(crate) session_of: HashMap<TargetKey, String>,
+    /// Messages for a desktop notification, drained by the main loop.
+    pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
     pub(crate) log_height: u16,
     /// A background log discovery is running (guards double-`T`).
@@ -145,6 +162,10 @@ impl App {
             table_state: TableState::default(),
             status: None,
             status_at: Instant::now(),
+            status_ttl: STATUS_TTL,
+            group_by: GroupBy::Project,
+            session_of: HashMap::new(),
+            notifications: Vec::new(),
             log: None,
             log_height: 12,
             log_pending: false,
@@ -197,7 +218,27 @@ impl App {
             if let Some(msg) = crashed {
                 self.set_status(msg);
             }
+            // An agent session that ended and left servers running: say so
+            // once, at the transition, and queue a desktop notification.
+            for msg in orphan_notices(&old, &self.snapshot) {
+                self.notifications.push(msg.clone());
+                self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
+            }
+        } else {
+            let n = self
+                .snapshot
+                .targets
+                .iter()
+                .filter(|t| t.launcher.as_ref().is_some_and(|l| l.is_orphaned()))
+                .count();
+            if n > 0 {
+                self.set_notice(format!(
+                    "⚠ {n} server{} left running by ended agent sessions · /ended to review",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
         }
+        self.session_of = session_groups(&self.snapshot.targets);
         self.data_warning = self.snapshot.error.clone();
         self.dirty = true;
     }
@@ -214,7 +255,7 @@ impl App {
     /// Per-loop upkeep: expire the status line, the kill-undo window, and row
     /// flashes. Sets `dirty` only when something actually changed.
     pub fn tick(&mut self) {
-        if self.status.is_some() && self.status_at.elapsed() > STATUS_TTL {
+        if self.status.is_some() && self.status_at.elapsed() > self.status_ttl {
             self.status = None;
             self.dirty = true;
         }
@@ -244,7 +285,52 @@ impl App {
     pub fn set_status(&mut self, s: impl Into<String>) {
         self.status = Some(s.into());
         self.status_at = Instant::now();
+        self.status_ttl = STATUS_TTL;
         self.dirty = true;
+    }
+
+    /// A status message that stays up long enough to act on.
+    pub fn set_notice(&mut self, s: impl Into<String>) {
+        self.set_status(s);
+        self.status_ttl = NOTICE_TTL;
+    }
+
+    /// Notification texts queued since the last call.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
+    }
+
+    // --- grouping (`v`) -----------------------------------------------------
+
+    pub fn toggle_group_by(&mut self) {
+        self.group_by = match self.group_by {
+            GroupBy::Project => GroupBy::Session,
+            GroupBy::Session => GroupBy::Project,
+        };
+        self.set_status(match self.group_by {
+            GroupBy::Project => "grouped by project",
+            GroupBy::Session => "grouped by agent session / launcher",
+        });
+    }
+
+    /// The group a target belongs to in the current view.
+    pub(crate) fn group_key<'a>(&'a self, t: &'a Target) -> &'a str {
+        match self.group_by {
+            GroupBy::Project => &t.project,
+            GroupBy::Session => self
+                .session_of
+                .get(&t.key)
+                .map(String::as_str)
+                .unwrap_or("unattributed"),
+        }
+    }
+
+    pub(crate) fn group_members(&self, g: &str) -> Vec<&Target> {
+        self.snapshot
+            .targets
+            .iter()
+            .filter(|t| self.group_key(t) == g)
+            .collect()
     }
 
     // --- help overlay (`?`) -------------------------------------------------
@@ -343,12 +429,7 @@ impl App {
     /// All targets the selection acts on: a whole group, or one target.
     pub fn selected_targets(&self) -> Vec<&Target> {
         match &self.selected {
-            Some(Entry::Group(p)) => self
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .collect(),
+            Some(Entry::Group(p)) => self.group_members(p),
             Some(Entry::Member(k)) | Some(Entry::Target(k)) => self
                 .snapshot
                 .targets
@@ -490,6 +571,10 @@ impl App {
             || t.git_branch
                 .as_deref()
                 .is_some_and(|b| b.to_lowercase().contains(&q))
+            // `/claude`, `/agent`, `/ended` (orphans), `/detached`
+            || t.launcher.as_ref().is_some_and(|l| {
+                l.short().to_lowercase().contains(&q) || l.kind.as_str().contains(&q)
+            })
     }
 
     /// Esc in normal mode: close the most intrusive thing first —
@@ -672,11 +757,11 @@ impl App {
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         for &i in &visible {
-            let p = &targets[i].project;
+            let p = self.group_key(&targets[i]);
             if !groups.contains_key(p) {
-                order.push(p.clone());
+                order.push(p.to_string());
             }
-            groups.entry(p.clone()).or_default().push(i);
+            groups.entry(p.to_string()).or_default().push(i);
         }
 
         let sort_members = |m: &mut Vec<usize>| match self.sort {
@@ -726,7 +811,7 @@ impl App {
 
         let mut entries = Vec::new();
         for (project, members) in &grouped {
-            if members.len() == 1 {
+            if members.len() == 1 && self.group_by == GroupBy::Project {
                 entries.push(Entry::Target(targets[members[0]].key.clone()));
             } else {
                 entries.push(Entry::Group(project.clone()));
@@ -780,6 +865,100 @@ fn key_of(e: &Entry) -> Option<&TargetKey> {
 
 /// Two entries are "the same selection" if they're the same target (ignoring
 /// Member/Target variant) or the same group.
+/// Session-view group label per target: `claude·fal-app`, `claude·ended`,
+/// `tmux`, `detached`, `unattributed`. Distinct sessions that would share a
+/// label get a short id suffix (`claude·fal-app #219a`).
+pub(crate) fn session_groups(targets: &[Target]) -> HashMap<TargetKey, String> {
+    use crate::launcher::LauncherKind;
+    let base_and_id = |t: &Target| -> (String, String) {
+        let Some(l) = &t.launcher else {
+            return ("unattributed".into(), String::new());
+        };
+        let id = l
+            .session
+            .clone()
+            .or_else(|| l.pid.map(|p| p.to_string()))
+            .unwrap_or_default();
+        let base = match l.kind {
+            LauncherKind::Detached => "detached".into(),
+            LauncherKind::Agent if l.is_orphaned() => format!("{}·ended", l.name),
+            LauncherKind::Agent => match l.cwd.as_ref().and_then(|c| c.file_name()) {
+                Some(dir) => format!("{}·{}", l.name, dir.to_string_lossy()),
+                None => l.name.clone(),
+            },
+            LauncherKind::Editor | LauncherKind::Terminal => l.name.clone(),
+        };
+        (base, id)
+    };
+    let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for t in targets {
+        let (base, id) = base_and_id(t);
+        ids.entry(base).or_default().insert(id);
+    }
+    targets
+        .iter()
+        .map(|t| {
+            let (base, id) = base_and_id(t);
+            let label = if ids[&base].len() > 1 && !id.is_empty() {
+                format!("{base} #{}", &id[..id.len().min(4)])
+            } else {
+                base
+            };
+            (t.key.clone(), label)
+        })
+        .collect()
+}
+
+/// One message per agent session that ended between `old` and `new` while its
+/// servers kept running: `claude session in ~/dev/app ended — left 2 servers
+/// running (480MB)`. Only the alive→orphaned transition counts, so each
+/// session is reported once.
+pub(crate) fn orphan_notices(old: &Snapshot, new: &Snapshot) -> Vec<String> {
+    use crate::launcher::LauncherKind;
+    let before: HashMap<&TargetKey, &Target> = old.targets.iter().map(|t| (&t.key, t)).collect();
+    // session identity -> (agent name, cwd while alive, targets left behind)
+    let mut ended: Vec<(String, String, Option<String>, Vec<&Target>)> = Vec::new();
+    for t in &new.targets {
+        let Some(l) = t.launcher.as_ref().filter(|l| l.is_orphaned()) else {
+            continue;
+        };
+        let Some(was) = before
+            .get(&t.key)
+            .and_then(|o| o.launcher.as_ref())
+            .filter(|ol| ol.kind == LauncherKind::Agent && ol.alive)
+        else {
+            continue;
+        };
+        let id = l
+            .session
+            .clone()
+            .or_else(|| l.pid.map(|p| p.to_string()))
+            .unwrap_or_default();
+        match ended.iter_mut().find(|e| e.0 == id) {
+            Some(e) => e.3.push(t),
+            None => ended.push((
+                id,
+                l.name.clone(),
+                was.cwd.as_ref().map(|c| tildify(&c.display().to_string())),
+                vec![t],
+            )),
+        }
+    }
+    ended
+        .into_iter()
+        .map(|(_, name, cwd, ts)| {
+            let n = ts.len();
+            let mem: u64 = ts.iter().map(|t| t.mem_bytes).sum();
+            let where_ = cwd.map(|c| format!(" in {c}")).unwrap_or_default();
+            format!(
+                "{name} session{where_} ended — left {n} server{} running ({})",
+                if n == 1 { "" } else { "s" },
+                fmt_mem(mem)
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn same_entry(a: &Entry, b: &Entry) -> bool {
     match (key_of(a), key_of(b)) {
         (Some(x), Some(y)) => x == y,
@@ -807,6 +986,127 @@ mod tests {
         snap.seq = 1; // a "real" snapshot, not the initial empty one
         app.apply(Arc::new(snap));
         app
+    }
+
+    use crate::launcher::{Launcher, LauncherKind};
+    use std::path::PathBuf;
+
+    fn agent(session: &str, cwd: &str, alive: bool) -> Option<Launcher> {
+        Some(Launcher {
+            kind: LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(100),
+            alive,
+            session: Some(session.into()),
+            cwd: alive.then(|| PathBuf::from(cwd)),
+            start_time: 0,
+        })
+    }
+
+    /// sample(): [0] client-portal :3000, [1] billing-api :8000,
+    /// [2] worker :5555, [3] client-portal :5432, [4] design-system watcher.
+    fn sessions_snapshot(seq: u64, alive: bool) -> Snapshot {
+        let mut snap = Snapshot::sample();
+        snap.seq = seq;
+        snap.targets[0].launcher = agent("aaaa1111", "/Users/me/dev/portal", alive);
+        snap.targets[1].launcher = agent("aaaa1111", "/Users/me/dev/portal", alive);
+        snap.targets[2].launcher = agent("bbbb2222", "/Users/me/dev/worker", true);
+        snap.targets[3].launcher = Some(Launcher {
+            kind: LauncherKind::Terminal,
+            name: "tmux".into(),
+            pid: Some(7),
+            alive: true,
+            session: None,
+            cwd: None,
+            start_time: 0,
+        });
+        snap
+    }
+
+    #[test]
+    fn session_groups_label_by_agent_and_dir_and_disambiguate() {
+        let snap = sessions_snapshot(1, true);
+        let g = session_groups(&snap.targets);
+        assert_eq!(g[&TargetKey::Port(3000)], "claude·portal");
+        assert_eq!(g[&TargetKey::Port(8000)], "claude·portal"); // same session
+        assert_eq!(g[&TargetKey::Port(5555)], "claude·worker");
+        assert_eq!(g[&TargetKey::Port(5432)], "tmux");
+        assert_eq!(g[&snap.targets[4].key], "unattributed");
+
+        // two different sessions in same-named dirs get a short id suffix
+        let mut snap = sessions_snapshot(1, true);
+        snap.targets[2].launcher = agent("cccc3333", "/Users/me/other/portal", true);
+        let g = session_groups(&snap.targets);
+        assert_eq!(g[&TargetKey::Port(3000)], "claude·portal #aaaa");
+        assert_eq!(g[&TargetKey::Port(5555)], "claude·portal #cccc");
+    }
+
+    #[test]
+    fn session_view_groups_across_projects_and_kills_the_session() {
+        let mut app = App::new();
+        app.apply(Arc::new(sessions_snapshot(1, true)));
+        app.toggle_group_by();
+        let entries = app.compute_entries();
+        // one session spanning two projects -> one header with both
+        assert!(entries
+            .iter()
+            .any(|e| matches!(e, Entry::Group(g) if g == "claude·portal")));
+        // a single-target session still gets a header in session view
+        assert!(entries
+            .iter()
+            .any(|e| matches!(e, Entry::Group(g) if g == "claude·worker")));
+        app.selected = Some(Entry::Group("claude·portal".into()));
+        let mut ports: Vec<u16> = app
+            .selected_targets()
+            .iter()
+            .flat_map(|t| t.ports.clone())
+            .collect();
+        ports.sort_unstable();
+        assert_eq!(ports, vec![3000, 8000], "K acts on exactly the session");
+        // back to project view
+        app.toggle_group_by();
+        assert!(app
+            .compute_entries()
+            .iter()
+            .any(|e| matches!(e, Entry::Group(p) if p == "client-portal")));
+    }
+
+    #[test]
+    fn ending_a_session_notifies_once_with_its_servers() {
+        let mut app = App::new();
+        app.apply(Arc::new(sessions_snapshot(1, true)));
+        assert!(app.take_notifications().is_empty());
+        app.apply(Arc::new(sessions_snapshot(2, false))); // session aaaa1111 ended
+        let n = app.take_notifications();
+        assert_eq!(n.len(), 1, "one notice per session, not per server: {n:?}");
+        assert!(
+            n[0].starts_with(
+                "claude session in /Users/me/dev/portal ended — left 2 servers running"
+            ),
+            "{}",
+            n[0]
+        );
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap_or("")
+            .contains("/ended to review"));
+        assert_eq!(app.status_ttl, NOTICE_TTL);
+        // still orphaned next tick: no repeat
+        app.apply(Arc::new(sessions_snapshot(3, false)));
+        assert!(app.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn orphans_already_present_at_startup_get_a_notice_but_no_desktop_ping() {
+        let mut app = App::new();
+        app.apply(Arc::new(sessions_snapshot(1, false)));
+        assert!(app.take_notifications().is_empty());
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap_or("")
+            .contains("2 servers left running by ended agent sessions"));
     }
 
     #[test]

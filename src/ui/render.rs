@@ -14,11 +14,12 @@ use ratatui::{
 };
 
 use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify};
-use super::state::{App, Entry, SortMode};
+use super::state::{App, Entry, GroupBy, SortMode};
+use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Target, TargetKey, TargetKind};
 
-/// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, UP, BRANCH).
-const COLW: [u16; 7] = [22, 16, 7, 7, 9, 6, 15];
+/// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
+const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
@@ -27,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let inspect_open = app.inspect;
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
     if inspect_open {
-        constraints.push(Constraint::Length(8));
+        constraints.push(Constraint::Length(9));
     }
     if log_open {
         constraints.push(Constraint::Length(app.log_height));
@@ -57,9 +58,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.log_rect = log_area;
 
     let title = format!(
-        " marina · {} targets · sort:{} ",
+        " marina · {} targets · sort:{}{} ",
         app.snapshot.targets.len(),
-        app.sort.label()
+        app.sort.label(),
+        match app.group_by {
+            GroupBy::Project => "",
+            GroupBy::Session => " · by:session",
+        }
     );
     let block = Block::bordered().title(title);
 
@@ -83,7 +88,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .block(block);
         frame.render_widget(hint, table_area);
     } else {
-        // Drop the rightmost columns (BRANCH, then UP) on narrow panes.
+        // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
         let cols = visible_columns(table_area.width);
         let arrow = |m: SortMode| if app.sort == m { " ▾" } else { "" };
         let head = [
@@ -92,6 +97,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             format!("PORT{}", arrow(SortMode::Port)),
             format!("CPU{}", arrow(SortMode::Cpu)),
             format!("MEM{}", arrow(SortMode::Mem)),
+            "VIA".to_string(),
             "UP".to_string(),
             "BRANCH".to_string(),
         ];
@@ -206,7 +212,7 @@ fn footer_line(app: &App) -> Line<'static> {
         )
     } else {
         Line::styled(
-            "  j/k move · / filter · s sort · i inspect · K kill · ? help · q quit",
+            "  j/k move · / filter · s sort · v by session · i inspect · K kill · ? help · q quit",
             Style::new().fg(Color::DarkGray),
         )
     }
@@ -215,12 +221,7 @@ fn footer_line(app: &App) -> Line<'static> {
 fn detail_line(app: &App) -> Line<'static> {
     match &app.selected {
         Some(Entry::Group(p)) => {
-            let members: Vec<&Target> = app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .collect();
+            let members: Vec<&Target> = app.group_members(p);
             let cpu: f32 = members
                 .iter()
                 .filter(|t| !t.pids.is_empty())
@@ -231,9 +232,17 @@ fn detail_line(app: &App) -> Line<'static> {
                 .filter(|t| !t.pids.is_empty())
                 .map(|t| t.mem_bytes)
                 .sum();
+            // In session view, name the session itself, not just its label.
+            let who = match (
+                app.group_by,
+                members.first().and_then(|t| t.launcher.as_ref()),
+            ) {
+                (GroupBy::Session, Some(l)) => format!("{} · ", l.describe()),
+                _ => String::new(),
+            };
             Line::styled(
                 format!(
-                    "  {} · {} services · {:.1}% · {} · K kills all",
+                    "  {who}{} · {} services · {:.1}% · {} · K kills all",
                     p,
                     members.len(),
                     cpu,
@@ -276,6 +285,12 @@ fn detail_line(app: &App) -> Line<'static> {
                     spans.push(Span::styled(
                         " · LAN-exposed (0.0.0.0)",
                         Style::new().fg(Color::Red),
+                    ));
+                }
+                if let Some(l) = &t.launcher {
+                    spans.push(Span::styled(
+                        format!(" · via {}", l.describe()),
+                        launcher_style(l),
                     ));
                 }
                 Line::from(spans)
@@ -351,6 +366,19 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                     ),
                 ),
             ];
+            lines.push(match &t.launcher {
+                Some(l) => {
+                    let mut spans = vec![
+                        Span::styled(" via    ".to_string(), key),
+                        Span::styled(l.describe(), launcher_style(l)),
+                    ];
+                    if let Some(hint) = l.resume_hint() {
+                        spans.push(Span::styled(format!(" · resume: {hint}"), val));
+                    }
+                    Line::from(spans)
+                }
+                None => kv("via", "—".into()),
+            });
             lines.push(match &t.container {
                 Some(c) => kv("dockr", format!("container {c}")),
                 None => kv(
@@ -370,13 +398,21 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 format!(" {p} (group)"),
                 Style::new().add_modifier(Modifier::BOLD),
             ))];
-            for t in app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .take(5)
-            {
+            let first = app
+                .group_members(p)
+                .first()
+                .and_then(|t| t.launcher.clone());
+            if let (GroupBy::Session, Some(l)) = (app.group_by, first) {
+                let mut spans = vec![
+                    Span::styled(" via    ".to_string(), key),
+                    Span::styled(l.describe(), launcher_style(&l)),
+                ];
+                if let Some(hint) = l.resume_hint() {
+                    spans.push(Span::styled(format!(" · resume: {hint}"), val));
+                }
+                lines.push(Line::from(spans));
+            }
+            for t in app.group_members(p).into_iter().take(5) {
                 let port = t
                     .ports
                     .first()
@@ -394,12 +430,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
 fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) -> Row<'static> {
     match entry {
         Entry::Group(p) => {
-            let members: Vec<&Target> = app
-                .snapshot
-                .targets
-                .iter()
-                .filter(|t| &t.project == p)
-                .collect();
+            let members: Vec<&Target> = app.group_members(p);
             let cpu: f32 = members
                 .iter()
                 .filter(|t| !t.pids.is_empty())
@@ -415,16 +446,24 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             } else {
                 "▾"
             };
+            let header_style = match (
+                app.group_by,
+                members.first().and_then(|t| t.launcher.as_ref()),
+            ) {
+                (GroupBy::Session, Some(l)) => launcher_style(l).add_modifier(Modifier::BOLD),
+                _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            };
             Row::new(vec![
-                Cell::from(format!("{arrow} {p} ({})", members.len())),
+                Cell::from(group_header_text(arrow, p, members.len())),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format!("{cpu:.1}%")),
                 Cell::from(fmt_mem(mem)),
                 Cell::from(""),
                 Cell::from(""),
+                Cell::from(""),
             ])
-            .style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
+            .style(header_style)
         }
         Entry::Member(k) => match by_key.get(k) {
             Some(t) => target_row(t, true, app),
@@ -491,6 +530,10 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         port_cell,
         Cell::from(cpu),
         Cell::from(mem),
+        match &t.launcher {
+            Some(l) => Cell::from(Span::styled(l.short(), launcher_style(l))),
+            None => Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
+        },
         Cell::from(fmt_uptime(t.anchor.start_time)),
         Cell::from(t.git_branch.clone().unwrap_or_else(|| "—".into())),
     ]);
@@ -516,10 +559,39 @@ fn infra_tag(label: &str) -> Option<&'static str> {
 }
 
 /// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
+/// `▾ label (n)` sized to the PROJECT column: a long label is cut with `…`
+/// so the member count always stays visible.
+fn group_header_text(arrow: &str, label: &str, n: usize) -> String {
+    let suffix = format!(" ({n})");
+    let room = (COLW[0] as usize).saturating_sub(2 + suffix.chars().count());
+    let label = if label.chars().count() > room {
+        let cut: String = label.chars().take(room.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        label.to_string()
+    };
+    format!("{arrow} {label}{suffix}")
+}
+
+/// Agents stand out (an orphan — its session ended — in yellow); editors and
+/// terminals are ordinary; detached is dim.
+fn launcher_style(l: &Launcher) -> Style {
+    match l.kind {
+        _ if l.is_orphaned() => Style::new().fg(Color::Yellow),
+        LauncherKind::Agent => Style::new().fg(Color::Magenta),
+        LauncherKind::Editor | LauncherKind::Terminal => Style::new().fg(Color::Gray),
+        LauncherKind::Detached => Style::new().fg(Color::DarkGray),
+    }
+}
+
+/// Columns that fit: each needs its width + 1 spacing, plus borders and the
+/// highlight gutter (4).
 fn visible_columns(width: u16) -> usize {
-    if width >= 92 {
+    if width >= 105 {
+        8
+    } else if width >= 89 {
         7
-    } else if width >= 76 {
+    } else if width >= 82 {
         6
     } else {
         5
@@ -542,7 +614,11 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Enter", "fold / unfold group"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
-        row("/", "filter (project · command · port · cwd · branch)"),
+        row(
+            "/",
+            "filter (project · command · port · cwd · branch · via)",
+        ),
+        row("v", "group by project / agent session"),
         row("K · u", "kill · cancel force-kill"),
         row("R", "restart (output captured to a log)"),
         row("T", "tail logs"),
@@ -652,8 +728,9 @@ mod tests {
 
     #[test]
     fn visible_columns_drop_from_the_right_when_narrow() {
-        assert_eq!(visible_columns(120), 7);
-        assert_eq!(visible_columns(80), 6);
+        assert_eq!(visible_columns(120), 8);
+        assert_eq!(visible_columns(95), 7);
+        assert_eq!(visible_columns(85), 6);
         assert_eq!(visible_columns(60), 5);
     }
 
@@ -674,6 +751,55 @@ mod tests {
         let mut app = app_with_sample();
         app.set_sort(SortMode::Mem);
         assert!(render_to_string(&mut app, 120, 20).contains("MEM ▾"));
+    }
+
+    #[test]
+    fn via_column_and_inspect_show_the_launching_agent_session() {
+        use crate::launcher::{Launcher, LauncherKind};
+        use crate::model::TargetKey;
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let claude = Launcher {
+            kind: LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(35115),
+            alive: true,
+            session: Some("219af9f5-aaaa-4bbb-8ccc-dddddddddddd".into()),
+            cwd: None,
+            start_time: 0,
+        };
+        snap.targets[1].launcher = Some(claude.clone()); // billing-api :8000
+        snap.targets[2].launcher = Some(Launcher {
+            alive: false,
+            ..claude
+        }); // worker :5555 — its session ended
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("VIA"));
+        assert!(out.contains("claude·ended"), "orphan is marked in the row");
+
+        app.selected = Some(Entry::Target(TargetKey::Port(8000)));
+        app.toggle_inspect();
+        let out = render_to_string(&mut app, 160, 30);
+        assert!(out.contains("claude (pid 35115, session 219af9f5)"));
+        assert!(out.contains("claude --resume 219af9f5-aaaa-4bbb-8ccc-dddddddddddd"));
+
+        // `/ended` filters down to orphans
+        app.filter = "ended".into();
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("worker") && !out.contains("billing-api"));
+    }
+
+    #[test]
+    fn long_group_labels_keep_their_count_visible() {
+        let t = group_header_text("▾", "claude·courts-portfolio-site", 3);
+        assert_eq!(t.chars().count(), COLW[0] as usize);
+        assert!(t.ends_with("… (3)"), "{t}");
+        assert_eq!(
+            group_header_text("▾", "client-portal", 2),
+            "▾ client-portal (2)"
+        );
     }
 
     #[test]

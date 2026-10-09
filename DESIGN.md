@@ -374,11 +374,87 @@ marina ls [sel…] [--json]   # the snapshot — table, or a stable JSON contrac
 marina kill <sel>… [--json] # verified SIGTERM -> SIGKILL matching targets
 marina restart <sel>…       # re-exec captured argv in cwd (output captured)
 marina url <sel>… [--json]  # print matching URLs
+marina who <port>… [--json] # who holds a port: a target, another process, or free
+marina free <port>… [--json] # verified-stop the target on a port, wait for release
 marina version
 ```
 
+**`who` / `free` take ports only** — exact identity, no substring matching, so
+"free :3000" can never take down an unrelated project. When no target holds the
+port, both name the actual holder (process name + pid, never argv) from the raw
+port scan rather than answering "unknown": curated-out processes, `[[ignore]]`d
+targets, another user's socket. `free` stops only dev targets — a non-target
+holder is reported and left alone (exit 1). It is idempotent (an already-free
+port exits 0, so `marina free 3000 && pnpm dev` re-runs safely) and waits until
+the port is actually released before returning. `who` exits 1 for a free port.
+
+**Scope flags** — `--mine` and `--orphaned` narrow `ls`/`kill`/`restart`/`url`
+by launcher (see *Launcher attribution*), with or without selectors. `--mine`
+is "started by the agent session running this command" (matched by session id,
+else agent pid; exit 2 outside an agent session), so an agent can clean up its
+own servers without touching the user's or another session's. `--orphaned` is
+"started by an agent session that has since ended".
+
 Unknown commands/flags are hard errors (exit 2) — a typo in a script must never
 fall through and block on the TUI.
+
+### Launcher attribution — IMPLEMENTED
+
+Coding agents start dev servers inside sessions, often backgrounded, so "what
+is this and who started it?" is the question a row has to answer. Each target
+carries an optional `Launcher { kind: agent|editor|terminal|detached, name,
+pid, alive, session, cwd }`, resolved in `launcher.rs` from two signals:
+
+1. **Live parent chain** from the anchor upward: the nearest *agent*
+   (`claude`, `codex`, `opencode`, `gemini`, `cursor-agent`, `aider`, …, also
+   node-hosted CLIs) wins outright; else the nearest editor, then
+   terminal/multiplexer. An unrecognized non-shell ancestor (some supervisor)
+   yields `None` — no guessing. A live agent picks up its own session id from
+   the markers below (when they name the same agent).
+2. **Agent env markers** (`MARKERS` in `launcher.rs`), which agents export to
+   every command they run and which survive reparenting after `&`/`nohup`:
+
+   | agent | session / thread | pid | flags |
+   |---|---|---|---|
+   | Claude Code | `CLAUDE_CODE_SESSION_ID` | `CLAUDE_PID` | `CLAUDECODE` |
+   | Codex | `CODEX_THREAD_ID` | — | `CODEX_SANDBOX` |
+   | opencode | `OPENCODE_SESSION_ID` | — | `OPENCODE` |
+   | Copilot | `COPILOT_AGENT_SESSION_ID` | — | `COPILOT_AGENT`, `COPILOT_CLI` |
+   | Amp | `AMP_CURRENT_THREAD_ID` | — | — |
+   | Cline · Roo · Qwen · Pi | `CLINE_TASK_ID` · `ROO_CODE_TASK_ID` · `QWEN_CODE_SESSION_ID` · `PI_SESSION_ID` | — | `CLINE_ACTIVE` · `QWEN_CODE` · `PI_CODING_AGENT` |
+   | Cursor · Gemini · Goose · Augment · Crush · Kiro | — | — | `CURSOR_AGENT`/`CURSOR_SANDBOX` · `GEMINI_CLI` · `GOOSE_TERMINAL` · `AUGMENT_AGENT` · `CRUSH` · `KIRO_AGENT_PATH` |
+
+   The cross-agent `AI_AGENT` / `AGENT` values name an agent only when no
+   specific marker does. Sources: each agent's source or shipped binary
+   (Codex `exec_env.rs`, opencode's bash tool), cross-checked with the
+   `is-ai-agent` table. With markers from several agents (one agent launched
+   from another's shell) the table order decides — env can't say which is
+   innermost; the live chain, when present, always wins.
+
+   Markers are consulted when the chain has no launcher (reparented), and
+   when the nearest launcher is an *editor* — Cursor's and Copilot's agents
+   run commands inside the editor, so the markers mean the agent did it.
+   Never under a terminal/multiplexer: a tmux server started from an agent
+   would otherwise stamp its markers onto every later pane.
+
+   **Orphaned requires proof**: only a marker pid (`CLAUDE_PID` today) that is
+   no longer an agent process marks the session ended (`claude·ended`,
+   yellow). Agents that export only a session id are attributed and grouped
+   but never called ended.
+
+The anchor climb (ADR 0002) also stops at any launcher: an agent often runs
+*in* the project dir, and without the stop it would be absorbed as the anchor —
+mislabeling the row and putting the agent itself in the kill set.
+
+Reparented with no markers → `detached`. Docker targets have no launcher.
+
+Privacy: only the allowlisted keys above are extracted from a process env
+(`AgentEnv::from_environ`); of those only pids and session ids are kept (flag
+values are never read), and other variables — including tokens agents export
+alongside them — are never stored. Session ids are validated as
+`[A-Za-z0-9_-]{1,80}`.
+Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
+hold auth tokens).
 
 A **selector** matches by project name (exact/substring), port (`3000`/`:3000`),
 or command label. **Killing a project selector stops every target under it** —
@@ -386,7 +462,7 @@ this selector resolution is the grouping primitive a future TUI group-kill reuse
 An agent can `ls --json` to see `client-portal → [3000, 5432]`, then
 `kill client-portal` to stop it precisely.
 
-## Testing — 84 tests
+## Testing — 117 tests
 
 Three layers:
 
@@ -453,6 +529,18 @@ non-issue — rows for system stuff may just be opaque.
 - **TUI grouping**: a project with several targets gets a collapsible header
   (`Enter` folds; `K`/`R` act on the whole group); a lone target stays a plain
   row. Group cpu/mem aggregate in the header; same project-matching as the CLI.
+- **Session view** (`v`): the same grouping machinery keyed by launcher instead
+  of project — one header per agent session (`claude·<dir>`, `claude·ended`),
+  editor, terminal, `detached`, or `unattributed`; distinct sessions that would
+  share a label get a short id suffix (`#219a`). Every session gets a header,
+  even with one member, because the session is the information. `K`/`R` on a
+  session header act on exactly that session's targets.
+- **Orphan notices**: the snapshot diff in `App::apply` reports each agent
+  session whose targets go alive→orphaned, once, grouped per session, as a
+  20s status notice plus a desktop notification (`osascript` / `notify-send`,
+  off via `[notify] desktop = false`). Orphans already present at startup get a
+  status-line count only. "Orphaned" requires proof — the env marker names a
+  pid that is no longer an agent; markers without a pid never count.
 - **Declared groups** (`config [[group]]`): bundle targets that don't share a
   cwd — an app + its database — under one name by port/project/command selectors.
   Applies to listener, watched, and docker targets; works in both TUI and CLI
@@ -477,4 +565,4 @@ non-issue — rows for system stuff may just be opaque.
   overmind. Needs an ADR (scope: monitor vs. supervisor).
 - Two-cadence split (optional — adaptive single-path suffices today).
 - Terminal-focus-based idle backoff; desktop notification on crash detection
-  (status line only today).
+  (status line only today — the notify plumbing now exists for orphans).

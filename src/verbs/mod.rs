@@ -131,12 +131,17 @@ pub fn kill(
 }
 
 /// Synchronous verified SIGTERM → wait → verified SIGKILL, for the one-shot
-/// CLI. Returns (terminated, force-killed) counts.
+/// CLI. Returns as soon as everything has exited; only processes still alive
+/// after `grace` are force-killed. Returns (terminated, force-killed) counts.
 pub fn kill_blocking(pid_starts: &[PidStart], grace: Duration) -> (usize, usize) {
     let fresh = verified(pid_starts);
     signal_tree(&fresh, libc::SIGTERM);
-    thread::sleep(grace);
-    let stragglers = verified(pid_starts);
+    let deadline = Instant::now() + grace;
+    let mut stragglers = verified(pid_starts);
+    while !stragglers.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        stragglers = verified(pid_starts);
+    }
     signal_tree(&stragglers, libc::SIGKILL);
     (fresh.len(), stragglers.len())
 }
@@ -335,9 +340,59 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Fire-and-forget desktop notification: `osascript` on macOS, `notify-send`
+/// on Linux. Runs on its own thread (and reaps the child); failures — no
+/// notification daemon, headless box — are silently ignored.
+pub fn notify(title: &str, body: &str) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("osascript");
+        c.arg("-e").arg(format!(
+            "display notification {} with title {}",
+            applescript_str(body),
+            applescript_str(title)
+        ));
+        c
+    } else {
+        let mut c = Command::new("notify-send");
+        c.arg(title).arg(body);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    thread::spawn(move || {
+        let _ = cmd.status();
+    });
+}
+
+/// An AppleScript string literal. Text comes from process/project names, so
+/// quotes and backslashes are escaped — it must never break out of the literal.
+fn applescript_str(s: &str) -> String {
+    let escaped: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            _ => vec![c],
+        })
+        .collect();
+    format!("\"{escaped}\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applescript_strings_cannot_break_out() {
+        assert_eq!(applescript_str("plain"), "\"plain\"");
+        assert_eq!(
+            applescript_str("a\" & do shell script \"x"),
+            "\"a\\\" & do shell script \\\"x\""
+        );
+        assert_eq!(applescript_str("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(applescript_str("new\nline"), "\"newline\"");
+    }
 
     #[test]
     fn survivors_excludes_exited_and_recycled_pids() {
