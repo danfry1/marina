@@ -116,8 +116,12 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   `resume` (e.g. `claude --resume <id>`), `state` (`working` / `idle` /
   `stale` = idle with no terminal input for over a day), `cwd`, `branch`, `cpu_pct`,
   `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
-  and `servers` (dev servers it started). It's read-only — marina has no way to
-  stop an agent session; tell the user which one and let them exit it.
+  and `servers` (dev servers it started), plus `title` (the task, under
+  herdr), `host` (`{kind, target}` — the herdr/tmux pane), `git` (uncommitted /
+  untracked / unpushed counts) and `looks_finished` (stale, no servers, clean
+  tree). `state` can also be `blocked` (waiting on a question). It's
+  read-only — marina has no way to stop an agent session; tell the user which
+  one and let them exit it.
 - **"restart the api"** → `marina restart api` (if ambiguous, list first and confirm).
 - **"open / give me the URL for the frontend"** → `marina url <project>`.
 

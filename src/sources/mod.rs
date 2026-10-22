@@ -156,10 +156,10 @@ pub struct TtyActivity {
     pub input: u64,
 }
 
-/// Terminal activity for `pid`'s controlling tty, if it has one.
-pub fn tty_activity(pid: u32) -> Option<TtyActivity> {
+/// Activity on the terminal device at `path` (see [`tty_path`]).
+pub fn tty_activity(path: &std::path::Path) -> Option<TtyActivity> {
     use std::time::UNIX_EPOCH;
-    let meta = std::fs::metadata(tty_path(pid)?).ok()?;
+    let meta = std::fs::metadata(path).ok()?;
     let secs = |t: std::io::Result<std::time::SystemTime>| {
         t.ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
     };
@@ -169,8 +169,9 @@ pub fn tty_activity(pid: u32) -> Option<TtyActivity> {
     })
 }
 
+/// `pid`'s controlling terminal device (`/dev/ttys004`, `/dev/pts/3`).
 #[cfg(target_os = "macos")]
-fn tty_path(pid: u32) -> Option<PathBuf> {
+pub fn tty_path(pid: u32) -> Option<PathBuf> {
     use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
     const NODEV: u32 = u32::MAX;
     let dev = pidinfo::<BSDInfo>(pid as i32, 0).ok()?.e_tdev;
@@ -188,7 +189,7 @@ fn tty_path(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn tty_path(pid: u32) -> Option<PathBuf> {
+pub fn tty_path(pid: u32) -> Option<PathBuf> {
     (0..3).find_map(|fd| {
         let p = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
         let s = p.to_str()?;
@@ -197,7 +198,7 @@ fn tty_path(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tty_path(_pid: u32) -> Option<PathBuf> {
+pub fn tty_path(_pid: u32) -> Option<PathBuf> {
     None
 }
 
@@ -236,7 +237,8 @@ mod tests {
 
     #[test]
     fn a_missing_process_has_no_tty_activity() {
-        assert_eq!(tty_activity(u32::MAX - 1), None);
+        assert_eq!(tty_path(u32::MAX - 1), None);
+        assert_eq!(tty_activity(std::path::Path::new("/nonexistent")), None);
     }
 
     #[cfg(target_os = "macos")]

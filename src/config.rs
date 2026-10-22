@@ -26,8 +26,9 @@
 //! match_port = 7000
 //!
 //! [notify]
-//! desktop = false       # no desktop notification when an agent session
-//!                       # ends and leaves servers running (default: true)
+//! desktop = false       # no desktop notifications at all (default: true)
+//! agents  = false       # no "finished" / "needs you" notices for agent
+//!                       # sessions (default: true)
 //!
 //! [ports]
 //! range = [4100, 4999]  # where `marina port` assigns from (default 3100-3999)
@@ -72,15 +73,22 @@ impl PortsCfg {
 
 #[derive(Debug, Deserialize)]
 pub struct NotifyCfg {
-    /// Desktop notification when an agent session ends and leaves servers
-    /// running. The TUI status line always shows it either way.
+    /// Desktop notifications (orphaned servers, agent finished / needs
+    /// you). The TUI status line shows them either way.
     #[serde(default = "yes")]
     pub desktop: bool,
+    /// Notices when an agent session finishes a stretch of work or starts
+    /// waiting on a question.
+    #[serde(default = "yes")]
+    pub agents: bool,
 }
 
 impl Default for NotifyCfg {
     fn default() -> Self {
-        NotifyCfg { desktop: true }
+        NotifyCfg {
+            desktop: true,
+            agents: true,
+        }
     }
 }
 
@@ -219,6 +227,8 @@ mod tests {
         let cfg: ConfigFile = toml::from_str("[notify]\ndesktop = false").unwrap();
         assert!(!cfg.notify.desktop);
         let cfg: ConfigFile = toml::from_str("[notify]").unwrap();
-        assert!(cfg.notify.desktop);
+        assert!(cfg.notify.desktop && cfg.notify.agents);
+        let cfg: ConfigFile = toml::from_str("[notify]\nagents = false").unwrap();
+        assert!(cfg.notify.desktop && !cfg.notify.agents);
     }
 }

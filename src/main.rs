@@ -3,6 +3,9 @@
 mod cli;
 mod config;
 mod docker;
+mod exec;
+mod git;
+mod hosts;
 mod launcher;
 mod logs;
 mod model;
@@ -60,7 +63,9 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
-    let desktop_notify = config::load().notify.desktop;
+    let notify = config::load().notify;
+    app.notify_agents = notify.agents;
+    let desktop_notify = notify.desktop;
     let result = run(
         &mut terminal,
         &mut app,
@@ -124,7 +129,11 @@ fn run(
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                             KeyCode::Char('g') => app.jump_top(),
                             KeyCode::Char('G') => app.jump_bottom(),
+                            KeyCode::Enter if app.selected_agent().is_some() => {
+                                verb_jump(app, &ev_tx)
+                            }
                             KeyCode::Enter => app.toggle_collapse(),
+                            KeyCode::Char('D') => verb_diff(app),
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('i') => app.toggle_inspect(),
@@ -165,7 +174,7 @@ fn run(
             }
         }
 
-        // Agent sessions that ended and left servers running.
+        // Orphaned servers; agent sessions finished or waiting on you.
         for msg in app.take_notifications() {
             if desktop_notify {
                 verbs::notify("marina", &msg);
@@ -272,6 +281,88 @@ fn on_agent_row(app: &mut ui::App, verb: &str) -> bool {
     };
     app.set_status(msg);
     true
+}
+
+/// Enter on an agent row: focus its pane in the multiplexer that hosts it
+/// (herdr, tmux). With no drivable host, copy a command that gets back into
+/// the session instead.
+fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
+    let Some(a) = app.selected_agent() else {
+        return;
+    };
+    match a.host.clone() {
+        Some(host) => {
+            let ev = ev.clone();
+            app.set_status(format!(
+                "jumping to {} pane {}…",
+                host.kind.as_str(),
+                host.target
+            ));
+            std::thread::spawn(move || {
+                let msg = hosts::jump(&host).unwrap_or_else(|e| e);
+                let _ = ev.send(UiEvent::Status(msg));
+            });
+        }
+        None => {
+            let resume = a
+                .as_launcher()
+                .resume_hint()
+                .unwrap_or_else(|| a.name.clone());
+            let cmd = format!(
+                "cd {} && {resume}",
+                shell_quote(&a.cwd.display().to_string())
+            );
+            match verbs::copy_url(&cmd) {
+                Ok(()) => app.set_status(format!(
+                    "no multiplexer pane to jump to — copied `{cmd}`; paste it in a terminal"
+                )),
+                Err(e) => app.set_status(format!("no pane to jump to ({e}) — run: {cmd}")),
+            }
+        }
+    }
+}
+
+/// Single-quote for a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-~".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// `D`: the uncommitted diff of the selected agent's (or target's) work tree,
+/// in the log pane.
+fn verb_diff(app: &mut ui::App) {
+    let dir = match (app.selected_agent(), app.selected_target()) {
+        (Some(a), _) => a.cwd.clone(),
+        (None, Some(t)) if !t.cwd.as_os_str().is_empty() => t.cwd.clone(),
+        _ => {
+            app.set_status("select an agent session or a server to see its diff");
+            return;
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::spawn(move || {
+        for line in git::diff_lines(&dir) {
+            if tx.send(line).is_err() {
+                break; // pane closed
+            }
+        }
+    });
+    let title = format!("diff {}", ui::tildify(&app_dir_label(app)));
+    app.open_log(title, rx, stop);
+    app.log_from_top();
+}
+
+fn app_dir_label(app: &ui::App) -> String {
+    app.selected_agent()
+        .map(|a| a.cwd.display().to_string())
+        .or_else(|| app.selected_target().map(|t| t.cwd.display().to_string()))
+        .unwrap_or_default()
 }
 
 fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) {
@@ -449,5 +540,17 @@ fn on_log_ready(app: &mut ui::App, project: String, path: Option<std::path::Path
         None => app.set_status(format!(
             "no log file found for {project} — logs may go to stdout (R restarts with capture)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_leaves_plain_paths_and_quotes_the_rest() {
+        assert_eq!(shell_quote("/Users/me/dev/app"), "/Users/me/dev/app");
+        assert_eq!(shell_quote("/tmp/my app"), "'/tmp/my app'");
+        assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
     }
 }

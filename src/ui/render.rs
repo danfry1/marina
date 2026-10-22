@@ -177,7 +177,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         let lines = help_lines();
-        let area = centered_rect(58, lines.len() as u16 + 2, frame.area());
+        let area = centered_rect(72, lines.len() as u16 + 2, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" keys ")),
@@ -283,37 +283,51 @@ fn detail_line(app: &App) -> Line<'static> {
             Some(a) => {
                 let l = a.as_launcher();
                 let now = unix_now();
-                let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
-                let doing = if !shells.is_empty() {
-                    format!("running {}", shells.join(", "))
-                } else if a.is_working(now) {
-                    "working".to_string()
-                } else if a.is_stale(now) {
+                let gray = Style::new().fg(Color::Gray);
+                let mut spans = Vec::new();
+                // the task title (from the host) says more than anything else
+                if let Some(t) = a.host.as_ref().and_then(|h| h.title.as_ref()) {
+                    spans.push(Span::styled(
+                        format!("  {t} · "),
+                        Style::new().fg(Color::White).add_modifier(Modifier::ITALIC),
+                    ));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                let doing = if a.is_stale(now) {
                     format!(
-                        "{}, no input for {} — stale",
+                        "{}, no input for {}{}",
                         a.activity(now),
-                        fmt_age(now.saturating_sub(a.last_input()))
+                        fmt_age(now.saturating_sub(a.last_input())),
+                        if app.closable(a, now) {
+                            " — looks finished"
+                        } else {
+                            " — stale"
+                        }
                     )
                 } else {
-                    "idle".to_string()
+                    let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+                    if shells.is_empty() {
+                        a.activity(now)
+                    } else {
+                        format!("running {}", shells.join(", "))
+                    }
                 };
-                let mut spans = vec![
-                    Span::styled(format!("  {}", l.describe()), launcher_style(&l)),
-                    Span::styled(
-                        format!(
-                            " · {} · {doing} · pids:{}",
-                            a.git_branch.as_deref().unwrap_or("—"),
-                            a.pids.len()
-                        ),
-                        Style::new().fg(Color::Gray),
-                    ),
-                ];
-                if let Some(hint) = l.resume_hint() {
-                    spans.push(Span::styled(
-                        format!(" · {hint}"),
-                        Style::new().fg(Color::DarkGray),
-                    ));
+                spans.push(Span::styled(doing, gray));
+                if let Some(g) = &a.git {
+                    spans.push(Span::styled(format!(" · {}", g.describe()), gray));
                 }
+                spans.push(Span::styled(
+                    format!(" · {}", l.describe()),
+                    launcher_style(&l),
+                ));
+                spans.push(Span::styled(
+                    match &a.host {
+                        Some(h) => format!(" · Enter jumps ({})", h.kind.as_str()),
+                        None => " · Enter copies resume".into(),
+                    },
+                    Style::new().fg(Color::DarkGray),
+                ));
                 Line::from(spans)
             }
             None => Line::from(""),
@@ -379,7 +393,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
     };
     let lines: Vec<Line> = match (&app.selected, app.selected_target()) {
         (Some(Entry::Agent(_)), _) => match app.selected_agent() {
-            Some(a) => agent_inspect(a, key, val),
+            Some(a) => agent_inspect(a, app, key, val),
             None => vec![Line::from(" nothing selected")],
         },
         (_, Some(t)) => {
@@ -566,7 +580,18 @@ fn agents_section_row(app: &App) -> Row<'static> {
     let (working, stale, cpu, mem) = agents_summary(app);
     let arrow = if app.agents_open { "▾" } else { "▸" };
     let n = app.snapshot.agents.len();
-    let busy = if working > 0 {
+    let blocked = app
+        .snapshot
+        .agents
+        .iter()
+        .filter(|a| a.is_blocked())
+        .count();
+    let busy = if blocked > 0 {
+        Span::styled(
+            format!("{blocked} need you"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if working > 0 {
         Span::styled(format!("{working} working"), Style::new().fg(Color::Yellow))
     } else {
         Span::styled("all idle", Style::new().fg(Color::DarkGray))
@@ -616,8 +641,15 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     let activity = a.activity(now);
     let command = if a.shells().next().is_some() {
         Span::styled(activity, Style::new().fg(Color::Yellow))
+    } else if a.is_blocked() {
+        Span::styled(
+            activity,
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
     } else if a.is_working(now) {
         Span::styled(activity, launcher_style(&l))
+    } else if activity == "done" {
+        Span::styled(activity, Style::new().fg(Color::Green))
     } else {
         Span::styled(activity, Style::new().fg(Color::DarkGray))
     };
@@ -635,7 +667,7 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
             Style::new().fg(Color::DarkGray),
         )),
         Cell::from(fmt_uptime(a.start_time)),
-        Cell::from(a.git_branch.clone().unwrap_or_else(|| "—".into())),
+        branch_cell(a),
     ]);
     // idle for days: dim the whole row, it's the one to go close
     if stale {
@@ -645,9 +677,37 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     }
 }
 
+/// `●4 ↑2 main` — what's uncommitted / unpushed (`✓` when clean), then the
+/// branch; the badge goes first so a long branch name can't hide it.
+fn branch_cell(a: &Agent) -> Cell<'static> {
+    let branch = a.git_branch.clone().unwrap_or_else(|| "—".into());
+    match &a.git {
+        Some(g) => {
+            let color = if g.is_clean() {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
+            Cell::from(Line::from(vec![
+                Span::styled(format!("{} ", g.short()), Style::new().fg(color)),
+                Span::raw(branch),
+            ]))
+        }
+        None => Cell::from(branch),
+    }
+}
+
+/// Where a session lives and what Enter does about it.
+fn where_line(a: &Agent) -> String {
+    match &a.host {
+        Some(h) => format!("{} pane {} · Enter jumps there", h.kind.as_str(), h.target),
+        None => "no multiplexer pane marina can drive · Enter copies the resume command".into(),
+    }
+}
+
 /// Inspect for an agent session: who/where, how to resume, and what it's
 /// running right now — shells first, then helpers (MCP servers, …).
-fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
+fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'static>> {
     let kv = |k: &str, v: String| {
         Line::from(vec![
             Span::styled(format!(" {k:<6} "), key),
@@ -655,56 +715,67 @@ fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
         ])
     };
     let l = a.as_launcher();
+    let now = unix_now();
     let cmd = if a.argc > 0 {
         format!("{} (+{} args)", a.argv0, a.argc)
     } else {
         a.argv0.clone()
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!(" {} session", a.name),
-                launcher_style(&l).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" · {}", a.project), val),
-        ]),
-        kv("cmd", cmd),
-        kv(
-            "cwd",
-            format!(
-                "{} · {}",
-                tildify(&a.cwd.display().to_string()),
-                a.git_branch.as_deref().unwrap_or("—")
-            ),
+    let mut head = vec![
+        Span::styled(
+            format!(" {} session", a.name),
+            launcher_style(&l).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!(" · {}", a.project), val),
+    ];
+    if let Some(t) = a.host.as_ref().and_then(|h| h.title.as_ref()) {
+        head.push(Span::styled(
+            format!(" — {t}"),
+            Style::new().add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let mut cwd = format!(
+        "{} · {}",
+        tildify(&a.cwd.display().to_string()),
+        a.git_branch.as_deref().unwrap_or("—")
+    );
+    if let Some(g) = &a.git {
+        cwd.push_str(&format!(" · {} · D shows the diff", g.describe()));
+    }
+    let state = match a.tty {
+        Some(t) => format!(
+            "{} · output {} ago · input {} ago",
+            a.activity(now),
+            fmt_age(now.saturating_sub(t.output)),
+            fmt_age(now.saturating_sub(t.input))
+        ),
+        None => format!("{} · no terminal (judged by CPU)", a.activity(now)),
+    };
+    let state = if app.closable(a, now) {
+        format!("{state} · looks finished: stale, no servers, clean tree")
+    } else {
+        state
+    };
+    let mut lines = vec![
+        Line::from(head),
+        kv("cwd", cwd),
         kv(
             "resume",
             l.resume_hint()
                 .unwrap_or_else(|| a.session.clone().unwrap_or_else(|| "—".into())),
         ),
+        kv("where", where_line(a)),
+        kv("state", state),
         kv(
             "procs",
             format!(
-                "{} pids · pid {} · up {} · marina never stops agents",
+                "{cmd} · {} pids · pid {} · up {} · marina never stops agents",
                 a.pids.len(),
                 a.pid,
                 fmt_uptime(a.start_time)
             ),
         ),
     ];
-    let now = unix_now();
-    lines.push(kv(
-        "tty",
-        match a.tty {
-            Some(t) => format!(
-                "{} · output {} ago · input {} ago",
-                a.activity(now),
-                fmt_age(now.saturating_sub(t.output)),
-                fmt_age(now.saturating_sub(t.input))
-            ),
-            None => format!("{} · no terminal (judged by CPU)", a.activity(now)),
-        },
-    ));
     if a.children.is_empty() {
         lines.push(kv("doing", "no shells or helpers".into()));
     }
@@ -868,7 +939,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         row("j / k", "move (mouse: click, wheel)"),
         row("g / G", "top / bottom"),
-        row("Enter", "fold / unfold group"),
+        row("Enter", "fold / unfold group · on an agent: jump to it"),
+        row("D", "uncommitted diff of the agent / server's tree"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row(
@@ -1082,6 +1154,60 @@ mod tests {
             out.contains("running cargo test"),
             "detail line says what it's doing"
         );
+    }
+
+    #[test]
+    fn agent_rows_show_host_title_git_and_blocked_state() {
+        use crate::git::GitStatus;
+        use crate::hosts::{HostInfo, HostKind, HostStatus};
+        use crate::model::Agent;
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let mut a = Agent::sample(4242, "41616c1a", "marina");
+        a.children.clear();
+        a.host = Some(HostInfo {
+            kind: HostKind::Herdr,
+            target: "w2S:p1".into(),
+            status: Some(HostStatus::Blocked),
+            title: Some("Agent visibility".into()),
+            session: None,
+        });
+        a.git = Some(GitStatus {
+            changed: 3,
+            untracked: 1,
+            insertions: 40,
+            deletions: 2,
+            ahead: Some(2),
+            behind: Some(0),
+        });
+        snap.agents = vec![a];
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(
+            out.contains("1 need you"),
+            "section header leads with it: {out}"
+        );
+
+        app.toggle_group_by();
+        app.selected = Some(Entry::Agent(4242));
+        let out = render_to_string(&mut app, 160, 20);
+        assert!(out.contains("needs you"));
+        assert!(
+            out.contains("●4 ↑2 main"),
+            "git badge before the branch: {out}"
+        );
+        assert!(
+            out.contains("Agent visibility"),
+            "task title in the detail line"
+        );
+        assert!(out.contains("3 files +40 −2 · 1 untracked · 2 unpushed"));
+        assert!(out.contains("Enter jumps (herdr)"));
+
+        app.toggle_inspect();
+        let out = render_to_string(&mut app, 160, 30);
+        assert!(out.contains("herdr pane w2S:p1 · Enter jumps there"));
+        assert!(out.contains("D shows the diff"));
     }
 
     #[test]

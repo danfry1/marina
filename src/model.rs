@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::hosts::HostStatus;
+
 /// Stable identity used to follow the cursor selection across snapshots.
 /// Port-primary for listeners (with the anchor-fingerprint reuse guard);
 /// command-based for port-less watched targets.
@@ -80,8 +82,13 @@ pub struct Agent {
     pub mem_bytes: u64, // rollup over `pids`
     /// Direct children: tool shells and helpers (MCP servers, …).
     pub children: Vec<AgentChild>,
-    /// Its terminal's last output / keystroke, when it has one.
+    /// Its terminal device, and that terminal's last output / input.
+    pub tty_path: Option<PathBuf>,
     pub tty: Option<crate::sources::TtyActivity>,
+    /// The multiplexer pane it runs in (herdr, tmux), if marina can drive it.
+    pub host: Option<crate::hosts::HostInfo>,
+    /// Its working tree: uncommitted / untracked / unpushed work.
+    pub git: Option<crate::git::GitStatus>,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -131,6 +138,10 @@ impl Agent {
         if self.shells().next().is_some() {
             return true;
         }
+        // A host that watches the screen knows better than timestamps.
+        if let Some(st) = self.host_status() {
+            return st == HostStatus::Working;
+        }
         match self.tty {
             Some(t) => now.saturating_sub(t.output) <= WORKING_OUTPUT_SECS,
             None => self.cpu_pct >= AGENT_BUSY_CPU,
@@ -144,12 +155,29 @@ impl Agent {
         self.tty.map(|t| t.input).unwrap_or(self.start_time)
     }
 
+    fn host_status(&self) -> Option<HostStatus> {
+        self.host.as_ref().and_then(|h| h.status)
+    }
+
+    /// Waiting on a human: an approval prompt or a question (host-reported).
+    pub fn is_blocked(&self) -> bool {
+        self.host_status() == Some(HostStatus::Blocked)
+    }
+
     /// Not working, and its terminal has had no input for over a day —
     /// likely a forgotten session holding memory.
     pub fn is_stale(&self, now: u64) -> bool {
         !self.is_working(now)
+            && !self.is_blocked()
             && self.last_input() != 0
             && now.saturating_sub(self.last_input()) >= STALE_AFTER_SECS
+    }
+
+    /// Stale, none of its servers still running, and nothing uncommitted or
+    /// unpushed: it looks finished. (Closing never loses files, and the
+    /// session can be resumed.)
+    pub fn looks_finished(&self, now: u64, servers: usize) -> bool {
+        self.is_stale(now) && servers == 0 && self.git.is_none_or(|g| g.is_clean())
     }
 
     /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
@@ -160,6 +188,8 @@ impl Agent {
             (Some(c), 0) => format!("$ {}", c.label),
             (Some(c), more) => format!("$ {} +{more}", c.label),
             (None, _) if self.is_working(now) => "working".into(),
+            (None, _) if self.is_blocked() => "needs you".into(),
+            (None, _) if self.host_status() == Some(HostStatus::Done) => "done".into(),
             (None, _) => match self.tty {
                 Some(t) => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t.output))),
                 None => "idle".into(),
@@ -195,7 +225,10 @@ impl Agent {
                 child(pid + 1, "cargo test", true),
                 child(pid + 2, "npm exec chrome-devtools-mcp", false),
             ],
+            tty_path: None,
             tty: None,
+            host: None,
+            git: None,
         }
     }
 }

@@ -55,6 +55,10 @@ pub struct Sampler {
     root_cache: RootCache,          // cwd -> project root
     name_cache: NameCache,          // project root -> project name
     docker_cache: Option<(Instant, HashMap<u16, crate::docker::ContainerPort>)>,
+    /// Multiplexer panes agents run in (herdr, tmux).
+    hosts: crate::hosts::Hosts,
+    /// Agents' working-tree status.
+    git: crate::git::Cache,
     home: Option<PathBuf>,
     last_topology: Vec<TargetKey>,
     /// Did the last `build()` change the set of target keys? Drives cadence.
@@ -72,6 +76,8 @@ impl Sampler {
             root_cache: HashMap::new(),
             name_cache: HashMap::new(),
             docker_cache: None,
+            hosts: Default::default(),
+            git: Default::default(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             last_topology: Vec::new(),
             topology_changed: false,
@@ -295,7 +301,7 @@ impl Sampler {
                 .flat_map(|t| t.pids.iter().copied())
                 .chain(claimed)
                 .collect();
-            let agents = build_agents(
+            let mut agents = build_agents(
                 procs,
                 &children,
                 &held,
@@ -304,6 +310,14 @@ impl Sampler {
                 &mut name_cache,
                 home.as_deref(),
             );
+            for a in &mut agents {
+                a.tty = a.tty_path.as_deref().and_then(crate::sources::tty_activity);
+                a.host = self.hosts.lookup(procs, a.pid, a.tty_path.as_deref());
+                // the host tracks /clear and resume; markers can lag
+                if let Some(s) = a.host.as_ref().and_then(|h| h.session.clone()) {
+                    a.session = Some(s);
+                }
+            }
             (out, agents)
         };
 
@@ -368,6 +382,13 @@ impl Sampler {
             a.cpu_pct = self.smooth(&anchor, a.cpu_pct);
         }
         self.prune_ewma(&targets, &agents);
+        let mut dirs: Vec<PathBuf> = agents.iter().map(|a| a.cwd.clone()).collect();
+        dirs.sort();
+        dirs.dedup();
+        let statuses = self.git.get(&dirs);
+        for a in &mut agents {
+            a.git = statuses.get(&a.cwd).copied();
+        }
         link_sessions(&mut targets, &mut agents);
 
         // Canonical order: listeners by port asc, watched after, by project.
@@ -395,6 +416,12 @@ impl Sampler {
             agents,
             error,
         }
+    }
+
+    /// Read every agent's git status on the next build instead of a few per
+    /// tick — the CLI builds only once or twice.
+    pub fn eager_git(&mut self) {
+        self.git.eager();
     }
 
     fn docker_map(&mut self) -> &HashMap<u16, crate::docker::ContainerPort> {
@@ -554,7 +581,10 @@ fn build_agents(
                 cpu_pct,
                 mem_bytes,
                 children: agent_children,
-                tty: crate::sources::tty_activity(pid),
+                tty_path: crate::sources::tty_path(pid),
+                tty: None, // filled with host + git after the procs borrow
+                host: None,
+                git: None,
             })
         })
         .collect();
@@ -973,6 +1003,8 @@ mod tests {
             root_cache: HashMap::new(),
             name_cache: HashMap::new(),
             docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
+            hosts: Default::default(),
+            git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),
             last_topology: Vec::new(),
             topology_changed: false,

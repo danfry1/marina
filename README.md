@@ -66,6 +66,21 @@ developer-process-centric.
   sessions are included; daemons and pty hosts are not. marina never stops an
   agent: `K` on an agent row explains why, and `K` on its header stops only
   its servers.
+- **Jump to a session** — `Enter` on an agent row focuses its pane in the
+  multiplexer it runs in: herdr (`herdr agent focus`) or tmux (switch to the
+  pane by its tty). Anywhere else it copies `cd <dir> && claude --resume <id>`
+  to paste into a terminal. Under herdr, marina also shows herdr's view of the
+  session: its task title, and **needs you** when the agent is waiting on an
+  approval or question.
+- **What each agent changed** — the BRANCH column leads with the work tree's
+  state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
+  and `D` opens the uncommitted diff (stat, untracked files, patch) in the
+  pane below. A stale session with no servers and a clean, pushed tree is
+  marked *looks finished* — the one to close first.
+- **Agent notices** — when a session finishes a stretch of work (30s+, then
+  quiet) or starts waiting on you: `claude·api finished after 12m`,
+  `claude·api needs you`, in the status line and as a desktop notification
+  (`[notify] agents = false` turns these off).
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification
@@ -133,7 +148,8 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | key | action |
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
-| `Enter` | fold / unfold a project group |
+| `Enter` | fold / unfold a group · on an agent row: jump to its pane |
+| `D` | uncommitted diff of the selected agent's / server's work tree |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -242,7 +258,8 @@ members = [3000, 5432, "worker"]
 match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 
 [notify]
-desktop = false                # no desktop notification for orphaned servers
+desktop = false                # no desktop notifications at all
+agents  = false                # no "finished" / "needs you" agent notices
 ```
 
 ## Privacy & security
@@ -273,7 +290,11 @@ marina is deliberately boring on this front:
   server to its agent session. Of those, only pids and validated session ids
   are kept; flag values are never read, and no other variable is kept,
   displayed, or serialized; for agent sessions, their terminal device's
-  last-written / last-read timestamps (never the screen contents); the nearest project
+  last-written / last-read timestamps (never the screen contents), their work
+  tree's `git status` / `git diff --shortstat` (run with
+  `GIT_OPTIONAL_LOCKS=0`, so marina never takes a lock an agent needs), and —
+  only when herdr or tmux is running — those tools' own pane listings
+  (`herdr agent list`, `tmux list-panes`); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
@@ -283,9 +304,10 @@ marina is deliberately boring on this front:
   panel shows just the program path and an arg count. argv is used for
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
-  browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes.
-  The one unprompted action is a local desktop notification when an agent
-  session leaves servers behind (`[notify] desktop = false` disables it).
+  browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
+  `Enter` on an agent asks herdr/tmux to focus its pane. The one unprompted
+  action is a local desktop notification when an agent session leaves servers
+  behind, finishes, or needs you (`[notify] desktop = false` disables it).
 
 ## Design
 

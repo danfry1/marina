@@ -227,7 +227,7 @@ impl AgentEnv {
 
 /// Session/thread ids: `219af9f5-…` (Claude, Codex), `ses_3b0f…` (opencode),
 /// `T-…` (Amp). Anything else is dropped rather than displayed.
-fn is_session_id(v: &str) -> bool {
+pub fn is_session_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 80
         && v.chars()

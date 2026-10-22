@@ -514,6 +514,32 @@ and open time. CPU alone was tried first and misread working sessions as
 idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
 are touched in idle sessions too, so marina reads nothing under `~/.claude`.
 
+**Terminal hosts** (`hosts.rs`): the multiplexer an agent's terminal lives
+in, when marina can drive it — herdr (matched by pid via `herdr pane
+process-info`, cached per pane) or tmux (matched by tty via `list-panes`).
+Queried only while the host's server process is running, every 3s at most,
+with a 1.5s deadline per call (`exec::output`). A host's status overrides the
+tty heuristic (herdr watches the screen, so it can report *blocked* on an
+approval or question, and *done*), its session id overrides env markers
+(those lag a `/clear`), and its terminal title is shown as the session's task.
+`Enter` on an agent row jumps: `herdr agent focus <pane>`, tmux
+`switch-client`/`select-window` + `select-pane`, else copy
+`cd <dir> && <resume command>`. Adding a host (WezTerm, kitty, iTerm) is a
+scan arm keyed by pid or tty plus a jump arm.
+
+**Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
+`diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached
+20s and refreshed at most 3 directories per tick (the CLI refreshes all).
+Shown as a badge before the branch (`●4 ↑2`, `✓`); `D` streams `diff --stat`,
+untracked files and the patch into the log pane. *Looks finished* = stale, no
+live servers, clean and pushed tree — closing it loses nothing, and the
+session can be resumed.
+
+**Agent notices** (`App::agent_notices`): a working streak of 30s+ followed by
+10s quiet → `<label> finished after <d>`; a host-reported blocked state →
+`<label> needs you`, once per transition. Status line plus desktop
+notification; `[notify] agents = false` disables.
+
 Surfaces: the project view ends with a folded `agents` section (its own
 `Entry::Agents`, so it can't collide with a project of that name; `Enter`
 unfolds, a filter opens it) summarising working/stale counts and memory. The

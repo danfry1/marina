@@ -33,6 +33,10 @@ pub(crate) const FREEZE: Duration = Duration::from_secs(2);
 pub(crate) const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Orphan notices outlive ordinary status messages — they ask for a decision.
 pub(crate) const NOTICE_TTL: Duration = Duration::from_secs(20);
+/// An agent working at least this long gets a "finished" notice when it stops.
+const AGENT_WORK_MIN: u64 = 30;
+/// ...once it has been quiet this long (rides out pauses between tool calls).
+const AGENT_QUIET: u64 = 10;
 /// How long a newly-appeared row flashes.
 pub(crate) const FLASH: Duration = Duration::from_millis(1500);
 /// How long after a marina-initiated kill/restart a vanished target is NOT
@@ -135,6 +139,12 @@ pub struct App {
     pub(crate) agent_session_of: HashMap<u32, String>,
     /// Project view's `agents` section is unfolded.
     pub(crate) agents_open: bool,
+    /// Notify when an agent finishes or starts waiting (`[notify] agents`).
+    pub notify_agents: bool,
+    /// Per agent pid: (started, last seen) working, unix seconds.
+    agent_streaks: HashMap<u32, (u64, u64)>,
+    /// Agents already reported as waiting on a question.
+    agent_blocked: HashSet<u32>,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -180,6 +190,9 @@ impl App {
             session_of: HashMap::new(),
             agent_session_of: HashMap::new(),
             agents_open: false,
+            notify_agents: true,
+            agent_streaks: HashMap::new(),
+            agent_blocked: HashSet::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -239,6 +252,12 @@ impl App {
                 self.notifications.push(msg.clone());
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
             }
+            if self.notify_agents {
+                for msg in self.agent_notices(unix_now()) {
+                    self.notifications.push(msg.clone());
+                    self.set_notice(format!("{msg} · Enter on its row jumps there"));
+                }
+            }
         } else {
             let n = self
                 .snapshot
@@ -257,6 +276,67 @@ impl App {
             session_groups(&self.snapshot.targets, &self.snapshot.agents);
         self.data_warning = self.snapshot.error.clone();
         self.dirty = true;
+    }
+
+    /// Agents that finished a stretch of work, or started waiting on a
+    /// question, since the last snapshot: `claude·api finished after 12m`,
+    /// `claude·api needs you`. Each transition is reported once.
+    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
+        self.agent_streaks.retain(|pid, _| live.contains(pid));
+        self.agent_blocked.retain(|pid| live.contains(pid));
+        for a in &self.snapshot.agents {
+            let label = self
+                .agent_session_of
+                .get(&a.pid)
+                .cloned()
+                .unwrap_or_else(|| a.name.clone());
+            if a.is_blocked() {
+                if self.agent_blocked.insert(a.pid) {
+                    out.push(format!("{label} needs you"));
+                }
+                self.agent_streaks.remove(&a.pid); // the question says it all
+                continue;
+            }
+            self.agent_blocked.remove(&a.pid);
+            if a.is_working(now) {
+                self.agent_streaks
+                    .entry(a.pid)
+                    .and_modify(|s| s.1 = now)
+                    .or_insert((now, now));
+            } else if let Some(&(start, last)) = self.agent_streaks.get(&a.pid) {
+                if now.saturating_sub(last) >= AGENT_QUIET {
+                    self.agent_streaks.remove(&a.pid);
+                    if last.saturating_sub(start) >= AGENT_WORK_MIN {
+                        out.push(format!(
+                            "{label} finished after {}",
+                            super::format::fmt_age(last - start)
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Servers this agent session started (its live launcher is the agent).
+    pub(crate) fn agent_servers(&self, a: &Agent) -> Vec<&Target> {
+        self.snapshot
+            .targets
+            .iter()
+            .filter(|t| {
+                t.launcher
+                    .as_ref()
+                    .is_some_and(|l| l.alive && l.name == a.name && l.pid == Some(a.pid))
+            })
+            .collect()
+    }
+
+    /// Stale, no servers, and nothing uncommitted or unpushed: it looks
+    /// finished. (Closing never loses files, and the session can be resumed.)
+    pub(crate) fn closable(&self, a: &Agent, now: u64) -> bool {
+        a.looks_finished(now, self.agent_servers(a).len())
     }
 
     /// The sampler channel disconnected — data is frozen; say so, loudly.
@@ -689,6 +769,14 @@ impl App {
             scroll: None,
         });
         self.dirty = true;
+    }
+
+    /// Read from the top instead of following the tail (a diff, not a log).
+    pub fn log_from_top(&mut self) {
+        if let Some(l) = &mut self.log {
+            l.scroll = Some(0);
+            self.dirty = true;
+        }
     }
 
     pub fn close_log(&mut self) {
@@ -1335,6 +1423,58 @@ mod tests {
         app.filter = "cargo test".into();
         let e = app.compute_entries();
         assert!(e.contains(&Entry::Agent(300)) && e.contains(&Entry::Agent(100)));
+    }
+
+    #[test]
+    fn agents_finishing_or_blocking_are_announced_once() {
+        use crate::hosts::{HostInfo, HostKind, HostStatus};
+        let snap_with = |seq: u64, working: bool, status: Option<HostStatus>| {
+            let mut snap = Snapshot::sample();
+            snap.seq = seq;
+            let mut a = Agent::sample(100, "s1", "api");
+            if !working {
+                a.children.clear(); // no shell; the host decides
+            }
+            a.host = Some(HostInfo {
+                kind: HostKind::Herdr,
+                target: "w1:p1".into(),
+                status,
+                title: None,
+                session: None,
+            });
+            snap.agents = vec![a];
+            Arc::new(snap)
+        };
+        let mut app = App::new();
+        app.apply(snap_with(1, true, Some(HostStatus::Working)));
+        let t0 = 1_000_000;
+        // working for two minutes...
+        app.snapshot = snap_with(2, true, Some(HostStatus::Working));
+        assert!(app.agent_notices(t0).is_empty());
+        assert!(app.agent_notices(t0 + 120).is_empty());
+        // ...then quiet: nothing until the quiet period passes
+        app.snapshot = snap_with(3, false, Some(HostStatus::Idle));
+        assert!(
+            app.agent_notices(t0 + 125).is_empty(),
+            "a pause, not done yet"
+        );
+        let n = app.agent_notices(t0 + 135);
+        assert_eq!(n, vec!["claude·api finished after 2m".to_string()]);
+        assert!(app.agent_notices(t0 + 200).is_empty(), "once");
+
+        // a short burst isn't worth a ping
+        app.snapshot = snap_with(4, true, Some(HostStatus::Working));
+        app.agent_notices(t0 + 300);
+        app.snapshot = snap_with(5, false, Some(HostStatus::Idle));
+        assert!(app.agent_notices(t0 + 320).is_empty());
+
+        // blocked: right away, once
+        app.snapshot = snap_with(6, false, Some(HostStatus::Blocked));
+        assert_eq!(
+            app.agent_notices(t0 + 400),
+            vec!["claude·api needs you".to_string()]
+        );
+        assert!(app.agent_notices(t0 + 410).is_empty());
     }
 
     #[test]
