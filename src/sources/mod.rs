@@ -147,6 +147,60 @@ pub fn phys_footprint(_pid: u32) -> Option<u64> {
     None
 }
 
+/// Last output to / input from a terminal, as unix seconds — the tty device's
+/// mtime (written to) and atime (read from: keystrokes). The same signal `w`
+/// uses for its IDLE column; no screen contents are read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TtyActivity {
+    pub output: u64,
+    pub input: u64,
+}
+
+/// Terminal activity for `pid`'s controlling tty, if it has one.
+pub fn tty_activity(pid: u32) -> Option<TtyActivity> {
+    use std::time::UNIX_EPOCH;
+    let meta = std::fs::metadata(tty_path(pid)?).ok()?;
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+    };
+    Some(TtyActivity {
+        output: secs(meta.modified())?,
+        input: secs(meta.accessed())?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn tty_path(pid: u32) -> Option<PathBuf> {
+    use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
+    const NODEV: u32 = u32::MAX;
+    let dev = pidinfo::<BSDInfo>(pid as i32, 0).ok()?.e_tdev;
+    if dev == NODEV {
+        return None;
+    }
+    // SAFETY: devname returns a pointer to a static buffer (or null); it is
+    // copied out immediately and never freed.
+    let name = unsafe { libc::devname(dev as libc::dev_t, libc::S_IFCHR) };
+    if name.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_str().ok()?;
+    (name.starts_with("tty") && name != "tty??").then(|| PathBuf::from("/dev").join(name))
+}
+
+#[cfg(target_os = "linux")]
+fn tty_path(pid: u32) -> Option<PathBuf> {
+    (0..3).find_map(|fd| {
+        let p = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+        let s = p.to_str()?;
+        (s.starts_with("/dev/pts/") || s.starts_with("/dev/tty")).then_some(p)
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tty_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +232,11 @@ mod tests {
         // bound to 127.0.0.1, so it must not be flagged LAN-exposed
         assert!(!ours.unwrap().exposed);
         drop(listener);
+    }
+
+    #[test]
+    fn a_missing_process_has_no_tty_activity() {
+        assert_eq!(tty_activity(u32::MAX - 1), None);
     }
 
     #[cfg(target_os = "macos")]

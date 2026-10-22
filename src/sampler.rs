@@ -554,6 +554,7 @@ fn build_agents(
                 cpu_pct,
                 mem_bytes,
                 children: agent_children,
+                tty: crate::sources::tty_activity(pid),
             })
         })
         .collect();

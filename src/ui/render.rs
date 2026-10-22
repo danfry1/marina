@@ -13,7 +13,7 @@ use ratatui::{
     Frame,
 };
 
-use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify, unix_now};
+use super::format::{centered_rect, fmt_age, fmt_mem, fmt_uptime, tildify, unix_now};
 use super::state::{App, Entry, GroupBy, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
@@ -282,13 +282,18 @@ fn detail_line(app: &App) -> Line<'static> {
         Some(Entry::Agent(_)) => match app.selected_agent() {
             Some(a) => {
                 let l = a.as_launcher();
+                let now = unix_now();
                 let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
                 let doing = if !shells.is_empty() {
                     format!("running {}", shells.join(", "))
-                } else if a.is_working() {
+                } else if a.is_working(now) {
                     "working".to_string()
-                } else if a.is_stale(unix_now()) {
-                    format!("idle, open {} — stale", fmt_uptime(a.start_time))
+                } else if a.is_stale(now) {
+                    format!(
+                        "{}, no input for {} — stale",
+                        a.activity(now),
+                        fmt_age(now.saturating_sub(a.last_input()))
+                    )
                 } else {
                     "idle".to_string()
                 };
@@ -549,7 +554,7 @@ fn agents_summary(app: &App) -> (usize, usize, f32, u64) {
     let now = unix_now();
     let agents = &app.snapshot.agents;
     (
-        agents.iter().filter(|a| a.is_working()).count(),
+        agents.iter().filter(|a| a.is_working(now)).count(),
         agents.iter().filter(|a| a.is_stale(now)).count(),
         agents.iter().map(|a| a.cpu_pct).sum(),
         agents.iter().map(|a| a.mem_bytes).sum(),
@@ -592,7 +597,8 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         .get(&a.pid)
         .cloned()
         .unwrap_or_else(|| a.name.clone());
-    let stale = a.is_stale(unix_now());
+    let now = unix_now();
+    let stale = a.is_stale(now);
     let l = a.as_launcher();
     let style = if stale {
         Style::new().fg(Color::DarkGray)
@@ -607,10 +613,10 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         GroupBy::Project => Cell::from(Span::styled(format!("  {label}"), style)),
     };
     // what it's doing, not which agent (the label says that)
-    let activity = a.activity();
+    let activity = a.activity(now);
     let command = if a.shells().next().is_some() {
         Span::styled(activity, Style::new().fg(Color::Yellow))
-    } else if a.is_working() {
+    } else if a.is_working(now) {
         Span::styled(activity, launcher_style(&l))
     } else {
         Span::styled(activity, Style::new().fg(Color::DarkGray))
@@ -686,14 +692,27 @@ fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
             ),
         ),
     ];
+    let now = unix_now();
+    lines.push(kv(
+        "tty",
+        match a.tty {
+            Some(t) => format!(
+                "{} · output {} ago · input {} ago",
+                a.activity(now),
+                fmt_age(now.saturating_sub(t.output)),
+                fmt_age(now.saturating_sub(t.input))
+            ),
+            None => format!("{} · no terminal (judged by CPU)", a.activity(now)),
+        },
+    ));
     if a.children.is_empty() {
-        lines.push(kv("doing", "idle — no shells or helpers".into()));
+        lines.push(kv("doing", "no shells or helpers".into()));
     }
-    // room for 5 child lines in the 12-row panel (10 inner, 5 used above)
-    let shown = if a.children.len() <= 5 {
+    // room for 4 child lines in the 12-row panel (10 inner, 6 used above)
+    let shown = if a.children.len() <= 4 {
         a.children.len()
     } else {
-        4
+        3
     };
     for c in a.children.iter().take(shown) {
         let k = if c.shell { "shell" } else { "helper" };

@@ -839,7 +839,7 @@ impl App {
         // working, then idle, then stale; alphabetical within each
         let now = unix_now();
         let rank = |a: &Agent| {
-            if a.is_working() {
+            if a.is_working(now) {
                 0
             } else if a.is_stale(now) {
                 2

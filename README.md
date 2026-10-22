@@ -57,10 +57,12 @@ developer-process-centric.
   opencode, Codex, …) is listed, even one with no servers: a folded
   `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
   project view, and a row per session in the session view. Each shows what it
-  is doing (`$ cargo test`, `working`, `idle`), its cpu/mem (agent + MCP
+  is doing (`$ cargo test`, `working`, `idle 12m`), its cpu/mem (agent + MCP
   helpers), dir, branch and session id; `i` lists its shells and helpers and
-  the resume command. Sessions idle and open for over a day are dimmed as
-  *stale* — usually a forgotten terminal holding memory. Background Claude Code
+  the resume command. Working vs idle comes from when its terminal was last
+  written to, like `w`'s IDLE column. Sessions whose terminal has had no input
+  for over a day are dimmed as *stale* — usually a forgotten session holding
+  memory. Background Claude Code
   sessions are included; daemons and pty hosts are not. marina never stops an
   agent: `K` on an agent row explains why, and `K` on its header stops only
   its servers.
@@ -270,7 +272,8 @@ marina is deliberately boring on this front:
   list is `MARKERS` in [src/launcher.rs](src/launcher.rs)), used to attribute a
   server to its agent session. Of those, only pids and validated session ids
   are kept; flag values are never read, and no other variable is kept,
-  displayed, or serialized; the nearest project
+  displayed, or serialized; for agent sessions, their terminal device's
+  last-written / last-read timestamps (never the screen contents); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.

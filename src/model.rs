@@ -80,11 +80,16 @@ pub struct Agent {
     pub mem_bytes: u64, // rollup over `pids`
     /// Direct children: tool shells and helpers (MCP servers, …).
     pub children: Vec<AgentChild>,
+    /// Its terminal's last output / keystroke, when it has one.
+    pub tty: Option<crate::sources::TtyActivity>,
 }
 
-/// Smoothed CPU% at or above which an agent with no shell counts as working.
+/// Smoothed CPU% at or above which an agent with no shell and no terminal
+/// counts as working.
 pub const AGENT_BUSY_CPU: f32 = 4.0;
-/// An idle agent open at least this long is called stale.
+/// Terminal output this recent means the agent is working.
+pub const WORKING_OUTPUT_SECS: u64 = 5;
+/// An idle agent whose terminal has had no input this long is called stale.
 pub const STALE_AFTER_SECS: u64 = 24 * 3600;
 
 /// One direct child of an agent, labelled like a target (never raw argv).
@@ -118,30 +123,47 @@ impl Agent {
         self.children.iter().filter(|c| c.shell)
     }
 
-    /// Doing something right now: a shell is running a command, or it's
-    /// burning CPU (streaming a reply). An idle agent TUI sits around 1%.
-    pub fn is_working(&self) -> bool {
-        self.shells().next().is_some() || self.cpu_pct >= AGENT_BUSY_CPU
+    /// Doing something right now: a shell is running a command, or its
+    /// terminal is being written to (a working agent animates its spinner and
+    /// streams; an idle one leaves the screen alone). Without a terminal, CPU
+    /// is the fallback: an idle agent TUI sits around 1%.
+    pub fn is_working(&self, now: u64) -> bool {
+        if self.shells().next().is_some() {
+            return true;
+        }
+        match self.tty {
+            Some(t) => now.saturating_sub(t.output) <= WORKING_OUTPUT_SECS,
+            None => self.cpu_pct >= AGENT_BUSY_CPU,
+        }
     }
 
-    /// Idle and open for over a day — likely a forgotten terminal holding
-    /// memory. Open time stands in for last activity, which isn't observable
-    /// from the process (and transcript mtimes get touched by idle sessions).
+    /// When its terminal last had input (keystrokes, or focus events from
+    /// switching to it), else when it started. Transcript mtimes are no substitute: idle sessions' files
+    /// get touched too.
+    pub fn last_input(&self) -> u64 {
+        self.tty.map(|t| t.input).unwrap_or(self.start_time)
+    }
+
+    /// Not working, and its terminal has had no input for over a day —
+    /// likely a forgotten session holding memory.
     pub fn is_stale(&self, now: u64) -> bool {
-        !self.is_working()
-            && self.start_time != 0
-            && now.saturating_sub(self.start_time) >= STALE_AFTER_SECS
+        !self.is_working(now)
+            && self.last_input() != 0
+            && now.saturating_sub(self.last_input()) >= STALE_AFTER_SECS
     }
 
     /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
-    /// `idle`.
-    pub fn activity(&self) -> String {
+    /// `idle 12m` (since its terminal last changed).
+    pub fn activity(&self, now: u64) -> String {
         let mut shells = self.shells();
         match (shells.next(), shells.count()) {
             (Some(c), 0) => format!("$ {}", c.label),
             (Some(c), more) => format!("$ {} +{more}", c.label),
-            (None, _) if self.is_working() => "working".into(),
-            (None, _) => "idle".into(),
+            (None, _) if self.is_working(now) => "working".into(),
+            (None, _) => match self.tty {
+                Some(t) => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t.output))),
+                None => "idle".into(),
+            },
         }
     }
 
@@ -173,6 +195,7 @@ impl Agent {
                 child(pid + 1, "cargo test", true),
                 child(pid + 2, "npm exec chrome-devtools-mcp", false),
             ],
+            tty: None,
         }
     }
 }
@@ -343,24 +366,42 @@ mod tests {
 
     #[test]
     fn agent_activity_working_idle_and_stale() {
+        use crate::sources::TtyActivity;
         let now = 10 * STALE_AFTER_SECS;
         let mut a = Agent::sample(1, "s", "app");
-        a.start_time = now - 2 * STALE_AFTER_SECS;
-        assert!(a.is_working() && !a.is_stale(now)); // a shell is running
-        assert_eq!(a.activity(), "$ cargo test");
+        a.start_time = now - 5 * STALE_AFTER_SECS;
+        a.tty = Some(TtyActivity {
+            output: now - 600,
+            input: now - 2 * STALE_AFTER_SECS,
+        });
+        assert!(a.is_working(now) && !a.is_stale(now)); // a shell is running
+        assert_eq!(a.activity(now), "$ cargo test");
         a.children[1].shell = true;
-        assert_eq!(a.activity(), "$ cargo test +1");
+        assert_eq!(a.activity(now), "$ cargo test +1");
 
         a.children.clear();
-        a.cpu_pct = AGENT_BUSY_CPU + 1.0; // streaming a reply
-        assert_eq!(a.activity(), "working");
+        assert_eq!(a.activity(now), "idle 10m");
+        assert!(a.is_stale(now), "nobody typed in two days");
+        a.tty = Some(TtyActivity {
+            output: now - 1, // spinner / streaming
+            input: now - 2 * STALE_AFTER_SECS,
+        });
+        assert_eq!(a.activity(now), "working");
         assert!(!a.is_stale(now));
+        // a busy CPU doesn't count when the terminal is quiet
+        a.tty = Some(TtyActivity {
+            output: now - 60,
+            input: now - 30,
+        });
+        a.cpu_pct = AGENT_BUSY_CPU + 10.0;
+        assert!(!a.is_working(now) && !a.is_stale(now), "typed 30s ago");
 
+        // no terminal: CPU decides, open time stands in for input
+        a.tty = None;
+        assert_eq!(a.activity(now), "working");
         a.cpu_pct = 0.3;
-        assert_eq!(a.activity(), "idle");
-        assert!(a.is_stale(now), "idle and open two days");
-        a.start_time = now - 60;
-        assert!(!a.is_stale(now), "idle but just opened");
+        assert_eq!(a.activity(now), "idle");
+        assert!(a.is_stale(now), "open five days, no terminal to ask");
         a.start_time = 0;
         assert!(!a.is_stale(now), "unknown age is never stale");
     }

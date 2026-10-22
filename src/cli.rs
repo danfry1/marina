@@ -335,10 +335,11 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
                 .iter()
                 .flat_map(|t| t.ports.iter().map(|p| format!(":{p}"))),
         );
+        let now = now_secs();
         let doing = if doing.is_empty() {
-            match a.is_stale(now_secs()) {
-                true => format!("{} (stale)", a.activity()),
-                false => a.activity(),
+            match a.is_stale(now) {
+                true => format!("{} (stale)", a.activity(now)),
+                false => a.activity(now),
             }
         } else {
             doing.join(" · ")
@@ -1050,8 +1051,8 @@ struct AgentJson {
     session: Option<String>,
     /// How to get back into it (`claude --resume <id>`, …).
     resume: Option<String>,
-    /// `working` (a shell running, or busy CPU), `idle`, or `stale` (idle
-    /// and open over a day).
+    /// `working` (a shell running, or recent terminal output), `idle`, or
+    /// `stale` (idle, no terminal input for over a day).
     state: &'static str,
     cwd: String,
     project: String,
@@ -1102,7 +1103,7 @@ impl AgentJson {
             pid: a.pid,
             session: a.session.clone(),
             resume: a.as_launcher().resume_hint(),
-            state: if a.is_working() {
+            state: if a.is_working(now) {
                 "working"
             } else if a.is_stale(now) {
                 "stale"

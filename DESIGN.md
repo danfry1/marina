@@ -500,12 +500,19 @@ after targets:
   the targets the agent launched, so a session and its servers group together
   and both show the resume command.
 
-**Activity** (`Agent::is_working` / `is_stale` / `activity`): *working* = a
-shell is running a command, or smoothed CPU ≥ 4% (an idle agent TUI sits
-around 0.1–1.5%; streaming a reply is above). *Stale* = not working and open
-over a day. Last activity itself isn't observable from the process, and
-Claude Code transcript mtimes are no substitute — idle sessions' files get
-touched too — so marina reads nothing under `~/.claude`.
+**Activity** (`Agent::is_working` / `is_stale` / `activity`) comes from the
+agent's controlling terminal (`sources::tty_activity`: libproc `e_tdev` +
+`devname` on macOS, `/proc/<pid>/fd` on Linux), whose device timestamps say
+when it was last written to (mtime) and read from (atime) — the signal `w`
+uses for IDLE. No screen contents are read. A working agent animates its
+spinner and streams; an idle one leaves the screen alone. So *working* = a
+shell is running a command, or terminal output within the last 5s; *idle*
+shows how long the screen has been still (`idle 12m`); *stale* = not working
+and no terminal input (keystrokes, or focus events from switching to it) for
+over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
+and open time. CPU alone was tried first and misread working sessions as
+idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
+are touched in idle sessions too, so marina reads nothing under `~/.claude`.
 
 Surfaces: the project view ends with a folded `agents` section (its own
 `Entry::Agents`, so it can't collide with a project of that name; `Enter`
