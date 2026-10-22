@@ -53,13 +53,17 @@ developer-process-centric.
 - **Session view** — press `v` to group by *who started it* instead: one header
   per agent session (`claude·fal-app`, `codex·api`), editor, or terminal, across
   projects. `K` on a session header stops everything that session started.
-- **Agent sessions** — the session view also lists every running coding-agent
-  session (Claude Code, opencode, Codex, …) as a row of its own, even one with
-  no servers: its cpu/mem (agent + MCP helpers), working dir, branch, session
-  id, and the shells it is running a command in right now (`claude ·2 sh`; `i`
-  names them — `cargo test`, `xcodebuild`). Background Claude Code sessions are
-  included; daemons and pty hosts are not. marina never stops an agent: `K` on
-  an agent row explains why, and `K` on its header stops only its servers.
+- **Agent sessions** — every running coding-agent session (Claude Code,
+  opencode, Codex, …) is listed, even one with no servers: a folded
+  `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
+  project view, and a row per session in the session view. Each shows what it
+  is doing (`$ cargo test`, `working`, `idle`), its cpu/mem (agent + MCP
+  helpers), dir, branch and session id; `i` lists its shells and helpers and
+  the resume command. Sessions idle and open for over a day are dimmed as
+  *stale* — usually a forgotten terminal holding memory. Background Claude Code
+  sessions are included; daemons and pty hosts are not. marina never stops an
+  agent: `K` on an agent row explains why, and `K` on its header stops only
+  its servers.
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification

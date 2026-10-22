@@ -113,7 +113,8 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   user, then `marina kill --orphaned`.
 - **"what are my agents doing" / "which Claude sessions are running"** →
   `marina agents --json`: one entry per live agent session with `session`,
-  `resume` (e.g. `claude --resume <id>`), `cwd`, `branch`, `cpu_pct`,
+  `resume` (e.g. `claude --resume <id>`), `state` (`working` / `idle` /
+  `stale` = idle and open over a day), `cwd`, `branch`, `cpu_pct`,
   `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
   and `servers` (dev servers it started). It's read-only — marina has no way to
   stop an agent session; tell the user which one and let them exit it.

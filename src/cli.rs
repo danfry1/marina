@@ -290,6 +290,13 @@ fn servers_of<'a>(snap: &'a Snapshot, a: &Agent) -> Vec<&'a Target> {
         .collect()
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn agents(selectors: &[&str], json: bool) -> i32 {
     let snap = snapshot(true);
     let picked: Vec<&Agent> = snap
@@ -329,7 +336,10 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
                 .flat_map(|t| t.ports.iter().map(|p| format!(":{p}"))),
         );
         let doing = if doing.is_empty() {
-            "idle".to_string()
+            match a.is_stale(now_secs()) {
+                true => format!("{} (stale)", a.activity()),
+                false => a.activity(),
+            }
         } else {
             doing.join(" · ")
         };
@@ -1040,6 +1050,9 @@ struct AgentJson {
     session: Option<String>,
     /// How to get back into it (`claude --resume <id>`, …).
     resume: Option<String>,
+    /// `working` (a shell running, or busy CPU), `idle`, or `stale` (idle
+    /// and open over a day).
+    state: &'static str,
     cwd: String,
     project: String,
     branch: Option<String>,
@@ -1089,6 +1102,13 @@ impl AgentJson {
             pid: a.pid,
             session: a.session.clone(),
             resume: a.as_launcher().resume_hint(),
+            state: if a.is_working() {
+                "working"
+            } else if a.is_stale(now) {
+                "stale"
+            } else {
+                "idle"
+            },
             cwd: a.cwd.display().to_string(),
             project: a.project.clone(),
             branch: a.git_branch.clone(),
@@ -1301,6 +1321,7 @@ mod tests {
             "pid",
             "session",
             "resume",
+            "state",
             "cwd",
             "project",
             "branch",
@@ -1314,7 +1335,7 @@ mod tests {
         ] {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
-        assert_eq!(obj.len(), 14);
+        assert_eq!(obj.len(), 15);
         assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
         assert_eq!(j["shells"][0]["command"], "cargo test");
         assert_eq!(j["servers"][0]["ports"][0], 3000);

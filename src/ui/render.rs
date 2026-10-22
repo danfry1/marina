@@ -13,7 +13,7 @@ use ratatui::{
     Frame,
 };
 
-use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify};
+use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify, unix_now};
 use super::state::{App, Entry, GroupBy, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
@@ -65,8 +65,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let agents = match (app.snapshot.agents.len(), app.group_by) {
         (0, _) => String::new(),
-        (n, GroupBy::Session) => format!(" · {n} agents"),
-        (n, GroupBy::Project) => format!(" · {n} agents (v)"),
+        (n, _) => {
+            let mem: u64 = app.snapshot.agents.iter().map(|a| a.mem_bytes).sum();
+            format!(" · {n} agents {}", fmt_mem(mem))
+        }
     };
     let title = format!(
         " marina · {} targets{agents} · sort:{}{} ",
@@ -89,20 +91,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         } else {
             "No targets match the filter."
         };
-        let n = app.snapshot.agents.len();
-        let sub = if n > 0 && app.group_by == GroupBy::Project && app.filter.is_empty() {
-            format!(
-                "{n} agent session{} running · press v to list them",
-                if n == 1 { "" } else { "s" }
-            )
-        } else {
-            "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here."
-                .into()
-        };
         let hint = Paragraph::new(vec![
             Line::from(""),
             Line::from(msg).centered(),
-            Line::styled(sub, dim).centered(),
+            Line::styled(
+                "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here.",
+                dim,
+            )
+            .centered(),
         ])
         .block(block);
         frame.render_widget(hint, table_area);
@@ -264,14 +260,37 @@ fn detail_line(app: &App) -> Line<'static> {
                 Style::new().fg(Color::Gray),
             )
         }
+        Some(Entry::Agents) => {
+            let (working, stale, _, mem) = agents_summary(app);
+            let n = app.snapshot.agents.len();
+            let stale_mem: u64 = app
+                .snapshot
+                .agents
+                .iter()
+                .filter(|a| a.is_stale(unix_now()))
+                .map(|a| a.mem_bytes)
+                .sum();
+            Line::styled(
+                format!(
+                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
+                    fmt_mem(stale_mem),
+                    fmt_mem(mem)
+                ),
+                Style::new().fg(Color::Gray),
+            )
+        }
         Some(Entry::Agent(_)) => match app.selected_agent() {
             Some(a) => {
                 let l = a.as_launcher();
                 let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
-                let doing = if shells.is_empty() {
-                    "idle".to_string()
-                } else {
+                let doing = if !shells.is_empty() {
                     format!("running {}", shells.join(", "))
+                } else if a.is_working() {
+                    "working".to_string()
+                } else if a.is_stale(unix_now()) {
+                    format!("idle, open {} — stale", fmt_uptime(a.start_time))
+                } else {
+                    "idle".to_string()
                 };
                 let mut spans = vec![
                     Span::styled(format!("  {}", l.describe()), launcher_style(&l)),
@@ -521,7 +540,48 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             Some(a) => agent_row(a, app),
             None => Row::new(Vec::<Cell>::new()),
         },
+        Entry::Agents => agents_section_row(app),
     }
+}
+
+/// Counts for the project view's agents section: (working, stale, cpu, mem).
+fn agents_summary(app: &App) -> (usize, usize, f32, u64) {
+    let now = unix_now();
+    let agents = &app.snapshot.agents;
+    (
+        agents.iter().filter(|a| a.is_working()).count(),
+        agents.iter().filter(|a| a.is_stale(now)).count(),
+        agents.iter().map(|a| a.cpu_pct).sum(),
+        agents.iter().map(|a| a.mem_bytes).sum(),
+    )
+}
+
+/// `▸ agents (21)  2 working  …  14 stale` — the folded section header.
+fn agents_section_row(app: &App) -> Row<'static> {
+    let (working, stale, cpu, mem) = agents_summary(app);
+    let arrow = if app.agents_open { "▾" } else { "▸" };
+    let n = app.snapshot.agents.len();
+    let busy = if working > 0 {
+        Span::styled(format!("{working} working"), Style::new().fg(Color::Yellow))
+    } else {
+        Span::styled("all idle", Style::new().fg(Color::DarkGray))
+    };
+    let stale = if stale > 0 {
+        Span::styled(format!("{stale} stale"), Style::new().fg(Color::DarkGray))
+    } else {
+        Span::raw("")
+    };
+    Row::new(vec![
+        Cell::from(group_header_text(arrow, "agents", n)),
+        Cell::from(busy),
+        Cell::from(""),
+        Cell::from(format!("{cpu:.1}%")),
+        Cell::from(fmt_mem(mem)),
+        Cell::from(stale),
+        Cell::from(""),
+        Cell::from(""),
+    ])
+    .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
 }
 
 /// An agent session: under its group header when it has servers, else a row
@@ -532,25 +592,32 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         .get(&a.pid)
         .cloned()
         .unwrap_or_else(|| a.name.clone());
-    let headed = !app.group_members(&label).is_empty();
+    let stale = a.is_stale(unix_now());
     let l = a.as_launcher();
-    let style = launcher_style(&l);
-    let project = if headed {
-        Cell::from("  ↳")
+    let style = if stale {
+        Style::new().fg(Color::DarkGray)
     } else {
-        Cell::from(Span::styled(label, style))
+        launcher_style(&l)
     };
-    let shells = a.shells().count();
-    let mut command = vec![Span::styled(a.name.clone(), style)];
-    if shells > 0 {
-        command.push(Span::styled(
-            format!(" ·{shells} sh"),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-    Row::new(vec![
+    let project = match app.group_by {
+        // under its session header, which already names it
+        GroupBy::Session if !app.group_members(&label).is_empty() => Cell::from("  ↳"),
+        GroupBy::Session => Cell::from(Span::styled(label, style)),
+        // inside the agents section
+        GroupBy::Project => Cell::from(Span::styled(format!("  {label}"), style)),
+    };
+    // what it's doing, not which agent (the label says that)
+    let activity = a.activity();
+    let command = if a.shells().next().is_some() {
+        Span::styled(activity, Style::new().fg(Color::Yellow))
+    } else if a.is_working() {
+        Span::styled(activity, launcher_style(&l))
+    } else {
+        Span::styled(activity, Style::new().fg(Color::DarkGray))
+    };
+    let row = Row::new(vec![
         project,
-        Cell::from(Line::from(command)),
+        Cell::from(command),
         Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
         Cell::from(format!("{:.1}%", a.cpu_pct)),
         Cell::from(fmt_mem(a.mem_bytes)),
@@ -563,7 +630,13 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         )),
         Cell::from(fmt_uptime(a.start_time)),
         Cell::from(a.git_branch.clone().unwrap_or_else(|| "—".into())),
-    ])
+    ]);
+    // idle for days: dim the whole row, it's the one to go close
+    if stale {
+        row.style(Style::new().fg(Color::DarkGray))
+    } else {
+        row
+    }
 }
 
 /// Inspect for an agent session: who/where, how to resume, and what it's
@@ -964,14 +1037,19 @@ mod tests {
         snap.agents = vec![Agent::sample(4242, "41616c1a-c2d3-4845", "marina")];
         let mut app = App::new();
         app.apply(Arc::new(snap));
-        // project view only counts them
+        // project view: a folded section with the totals
         let out = render_to_string(&mut app, 120, 20);
-        assert!(out.contains("1 agents (v)"), "{out}");
+        assert!(out.contains("1 agents 500MB"), "{out}");
+        assert!(
+            out.contains("▸ agents (1)") && out.contains("1 working"),
+            "{out}"
+        );
+        assert!(!out.contains("claude·marina"), "folded by default");
 
         app.toggle_group_by();
         let out = render_to_string(&mut app, 120, 20);
         assert!(out.contains("claude·marina"), "idle agent row is labelled");
-        assert!(out.contains("claude ·1 sh"), "live shells are counted");
+        assert!(out.contains("$ cargo test"), "COMMAND says what it's doing");
         assert!(out.contains("41616c1a"), "session id in the VIA column");
 
         app.selected = Some(Entry::Agent(4242));

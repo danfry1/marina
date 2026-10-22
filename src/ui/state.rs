@@ -85,6 +85,9 @@ pub(crate) enum Entry {
     Member(TargetKey),
     Target(TargetKey),
     Agent(u32),
+    /// Project view: the folded `agents` section at the bottom. Its own
+    /// variant, so it can never collide with (or kill) a project named so.
+    Agents,
 }
 
 pub(crate) struct LogView {
@@ -130,6 +133,8 @@ pub struct App {
     pub(crate) session_of: HashMap<TargetKey, String>,
     /// Session-view group label per agent pid, rebuilt alongside.
     pub(crate) agent_session_of: HashMap<u32, String>,
+    /// Project view's `agents` section is unfolded.
+    pub(crate) agents_open: bool,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -174,6 +179,7 @@ impl App {
             group_by: GroupBy::Project,
             session_of: HashMap::new(),
             agent_session_of: HashMap::new(),
+            agents_open: false,
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -436,6 +442,11 @@ impl App {
     }
 
     pub fn toggle_collapse(&mut self) {
+        if self.selected == Some(Entry::Agents) {
+            self.agents_open = !self.agents_open;
+            self.dirty = true;
+            return;
+        }
         if let Some(Entry::Group(p)) = &self.selected {
             let p = p.clone();
             if !self.collapsed.remove(&p) {
@@ -480,7 +491,7 @@ impl App {
                 .iter()
                 .filter(|t| &t.key == k)
                 .collect(),
-            Some(Entry::Agent(_)) | None => Vec::new(),
+            Some(Entry::Agent(_)) | Some(Entry::Agents) | None => Vec::new(),
         }
     }
 
@@ -498,6 +509,7 @@ impl App {
                 .selected_agent()
                 .map(|a| format!("{} session", a.name))
                 .unwrap_or_default(),
+            Some(Entry::Agents) => "agent sessions".into(),
             None => String::new(),
         }
     }
@@ -777,7 +789,7 @@ impl App {
                         let e = self.display[idx].clone();
                         let already = self.selected.as_ref().is_some_and(|s| same_entry(s, &e));
                         if already {
-                            if matches!(e, Entry::Group(_)) {
+                            if matches!(e, Entry::Group(_) | Entry::Agents) {
                                 self.toggle_collapse();
                             }
                         } else {
@@ -818,16 +830,34 @@ impl App {
         let visible: Vec<usize> = (0..targets.len())
             .filter(|&i| self.matches(&targets[i]))
             .collect();
-        // Agent sessions only list in session view, where they're the groups.
-        let visible_agents: Vec<usize> = match self.group_by {
-            GroupBy::Session => (0..agents.len())
-                .filter(|&i| self.matches_agent(&agents[i]))
-                .collect(),
-            GroupBy::Project => Vec::new(),
-        };
+        let visible_agents: Vec<usize> = (0..agents.len())
+            .filter(|&i| self.matches_agent(&agents[i]))
+            .collect();
         if visible.is_empty() && visible_agents.is_empty() {
             return Vec::new();
         }
+        // working, then idle, then stale; alphabetical within each
+        let now = unix_now();
+        let rank = |a: &Agent| {
+            if a.is_working() {
+                0
+            } else if a.is_stale(now) {
+                2
+            } else {
+                1
+            }
+        };
+        let agent_label = |i: usize| {
+            self.agent_session_of
+                .get(&agents[i].pid)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        // Project view: agents fold into one section at the bottom.
+        let (visible_agents, section): (Vec<usize>, Vec<usize>) = match self.group_by {
+            GroupBy::Session => (visible_agents, Vec::new()),
+            GroupBy::Project => (Vec::new(), visible_agents),
+        };
 
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -883,11 +913,13 @@ impl App {
                         .filter_map(|&i| targets[i].ports.iter().min().copied())
                         .min()
                 };
+                // port-less groups: live agents before idle and stale ones
+                let r = |g: &str| agents_of(g).iter().map(|&i| rank(&agents[i])).min();
                 match (mp(&a.1), mp(&b.1)) {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.0.cmp(&b.0),
+                    (None, None) => r(&a.0).cmp(&r(&b.0)).then_with(|| a.0.cmp(&b.0)),
                 }
             }),
             SortMode::Cpu => grouped.sort_by(|a, b| {
@@ -920,6 +952,19 @@ impl App {
                         entries.push(Entry::Member(targets[i].key.clone()));
                     }
                 }
+            }
+        }
+        if !section.is_empty() {
+            entries.push(Entry::Agents);
+            // a filter that hits an agent opens the section
+            if self.agents_open || !self.filter.is_empty() {
+                let mut section = section;
+                section.sort_by(|&a, &b| {
+                    rank(&agents[a])
+                        .cmp(&rank(&agents[b]))
+                        .then_with(|| agent_label(a).cmp(agent_label(b)))
+                });
+                entries.extend(section.iter().map(|&i| Entry::Agent(agents[i].pid)));
             }
         }
 
@@ -959,7 +1004,7 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
         Entry::Member(k) | Entry::Target(k) => Some(k),
-        Entry::Group(_) | Entry::Agent(_) => None,
+        Entry::Group(_) | Entry::Agent(_) | Entry::Agents => None,
     }
 }
 
@@ -1235,7 +1280,20 @@ mod tests {
         ];
         let mut app = App::new();
         app.apply(Arc::new(snap));
-        // project view: agents don't list
+        // project view: one folded section at the bottom
+        let e = app.compute_entries();
+        assert_eq!(e.last(), Some(&Entry::Agents));
+        assert!(!e.iter().any(|e| matches!(e, Entry::Agent(_))));
+        app.selected = Some(Entry::Agents);
+        assert!(
+            app.selected_targets().is_empty(),
+            "K on the section: nothing"
+        );
+        app.toggle_collapse();
+        let e = app.compute_entries();
+        let pos = e.iter().position(|x| x == &Entry::Agents).unwrap();
+        assert_eq!(e[pos + 1..].len(), 2, "unfolded: both agents follow");
+        app.toggle_collapse();
         assert!(!app
             .compute_entries()
             .iter()
@@ -1347,7 +1405,7 @@ mod tests {
         snap.targets.retain(|t| match &victim {
             Entry::Target(k) | Entry::Member(k) => &t.key != k,
             Entry::Group(p) => &t.project != p,
-            Entry::Agent(_) => true,
+            Entry::Agent(_) | Entry::Agents => true,
         });
         app.apply(Arc::new(snap));
         app.reconcile();

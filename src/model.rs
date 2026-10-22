@@ -82,6 +82,11 @@ pub struct Agent {
     pub children: Vec<AgentChild>,
 }
 
+/// Smoothed CPU% at or above which an agent with no shell counts as working.
+pub const AGENT_BUSY_CPU: f32 = 4.0;
+/// An idle agent open at least this long is called stale.
+pub const STALE_AFTER_SECS: u64 = 24 * 3600;
+
 /// One direct child of an agent, labelled like a target (never raw argv).
 #[derive(Clone)]
 pub struct AgentChild {
@@ -111,6 +116,33 @@ impl Agent {
 
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
         self.children.iter().filter(|c| c.shell)
+    }
+
+    /// Doing something right now: a shell is running a command, or it's
+    /// burning CPU (streaming a reply). An idle agent TUI sits around 1%.
+    pub fn is_working(&self) -> bool {
+        self.shells().next().is_some() || self.cpu_pct >= AGENT_BUSY_CPU
+    }
+
+    /// Idle and open for over a day — likely a forgotten terminal holding
+    /// memory. Open time stands in for last activity, which isn't observable
+    /// from the process (and transcript mtimes get touched by idle sessions).
+    pub fn is_stale(&self, now: u64) -> bool {
+        !self.is_working()
+            && self.start_time != 0
+            && now.saturating_sub(self.start_time) >= STALE_AFTER_SECS
+    }
+
+    /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
+    /// `idle`.
+    pub fn activity(&self) -> String {
+        let mut shells = self.shells();
+        match (shells.next(), shells.count()) {
+            (Some(c), 0) => format!("$ {}", c.label),
+            (Some(c), more) => format!("$ {} +{more}", c.label),
+            (None, _) if self.is_working() => "working".into(),
+            (None, _) => "idle".into(),
+        }
     }
 
     /// Fixture: a claude session in `/Users/me/dev/<dir>` running one shell
@@ -307,6 +339,30 @@ mod tests {
         assert!(UrlScheme::Https.is_web());
         assert!(!UrlScheme::Postgres.is_web());
         assert!(!UrlScheme::Redis.is_web());
+    }
+
+    #[test]
+    fn agent_activity_working_idle_and_stale() {
+        let now = 10 * STALE_AFTER_SECS;
+        let mut a = Agent::sample(1, "s", "app");
+        a.start_time = now - 2 * STALE_AFTER_SECS;
+        assert!(a.is_working() && !a.is_stale(now)); // a shell is running
+        assert_eq!(a.activity(), "$ cargo test");
+        a.children[1].shell = true;
+        assert_eq!(a.activity(), "$ cargo test +1");
+
+        a.children.clear();
+        a.cpu_pct = AGENT_BUSY_CPU + 1.0; // streaming a reply
+        assert_eq!(a.activity(), "working");
+        assert!(!a.is_stale(now));
+
+        a.cpu_pct = 0.3;
+        assert_eq!(a.activity(), "idle");
+        assert!(a.is_stale(now), "idle and open two days");
+        a.start_time = now - 60;
+        assert!(!a.is_stale(now), "idle but just opened");
+        a.start_time = 0;
+        assert!(!a.is_stale(now), "unknown age is never stale");
     }
 
     #[test]

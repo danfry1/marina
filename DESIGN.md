@@ -500,10 +500,22 @@ after targets:
   the targets the agent launched, so a session and its servers group together
   and both show the resume command.
 
-Surfaces: session view lists agents (a live agent with servers is the first
-row under its header; one without is a standalone row labelled like a
-header), the title counts them in both views, `i` lists shells/helpers, and
-`marina agents [sel…] [--json]` prints them with the servers each started.
+**Activity** (`Agent::is_working` / `is_stale` / `activity`): *working* = a
+shell is running a command, or smoothed CPU ≥ 4% (an idle agent TUI sits
+around 0.1–1.5%; streaming a reply is above). *Stale* = not working and open
+over a day. Last activity itself isn't observable from the process, and
+Claude Code transcript mtimes are no substitute — idle sessions' files get
+touched too — so marina reads nothing under `~/.claude`.
+
+Surfaces: the project view ends with a folded `agents` section (its own
+`Entry::Agents`, so it can't collide with a project of that name; `Enter`
+unfolds, a filter opens it) summarising working/stale counts and memory. The
+session view lists agents (a live agent with servers is the first row under
+its header; one without is a standalone row labelled like a header; working
+before idle before stale). Agent rows show the activity in COMMAND and dim
+when stale; the title totals agent count and memory; `i` lists
+shells/helpers; and `marina agents [sel…] [--json]` prints them with a
+`state` and the servers each started.
 Verbs never reach an agent: `selected_targets` is empty on an agent row (K/R/T/
 Y/O explain instead), a session header's `K` stops only its servers, and the
 CLI command is read-only.
