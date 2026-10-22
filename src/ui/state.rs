@@ -2,7 +2,11 @@
 //! by project (or, with `v`, by the agent session / launcher that started
 //! them): a group with several targets gets a collapsible header and a
 //! group-kill; a lone target renders as a plain row. In session view every
-//! session gets a header, since the session *is* the information. Selection is held by value
+//! session gets a header, since the session *is* the information. Session
+//! view also lists the agent sessions themselves (`Entry::Agent`) — a live
+//! agent with servers heads its group; one without is a row of its own.
+//! Agents are never in `selected_targets`, so no verb can reach one.
+//! Selection is held by value
 //! (`Entry`), not index, so the cursor doesn't jump when data refreshes; if the
 //! selected row vanishes the cursor falls to its nearest neighbor (the same
 //! list position), never back to the top. Volatile sorts freeze briefly after a
@@ -23,7 +27,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
 use super::format::{fmt_mem, tildify, unix_now};
-use crate::model::{Snapshot, Target, TargetKey};
+use crate::model::{Agent, Snapshot, Target, TargetKey};
 
 pub(crate) const FREEZE: Duration = Duration::from_secs(2);
 pub(crate) const STATUS_TTL: Duration = Duration::from_secs(4);
@@ -72,13 +76,18 @@ pub(crate) enum GroupBy {
     Session,
 }
 
-/// A visible row: a project group header, a member of an (expanded) group, or a
-/// standalone single-target project.
+/// A visible row: a project group header, a member of an (expanded) group, a
+/// standalone single-target project, or (session view) an agent session,
+/// keyed by pid.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Entry {
     Group(String),
     Member(TargetKey),
     Target(TargetKey),
+    Agent(u32),
+    /// Project view: the folded `agents` section at the bottom. Its own
+    /// variant, so it can never collide with (or kill) a project named so.
+    Agents,
 }
 
 pub(crate) struct LogView {
@@ -122,6 +131,10 @@ pub struct App {
     pub(crate) group_by: GroupBy,
     /// Session-view group label per target, rebuilt on each snapshot.
     pub(crate) session_of: HashMap<TargetKey, String>,
+    /// Session-view group label per agent pid, rebuilt alongside.
+    pub(crate) agent_session_of: HashMap<u32, String>,
+    /// Project view's `agents` section is unfolded.
+    pub(crate) agents_open: bool,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -165,6 +178,8 @@ impl App {
             status_ttl: STATUS_TTL,
             group_by: GroupBy::Project,
             session_of: HashMap::new(),
+            agent_session_of: HashMap::new(),
+            agents_open: false,
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -238,7 +253,8 @@ impl App {
                 ));
             }
         }
-        self.session_of = session_groups(&self.snapshot.targets);
+        (self.session_of, self.agent_session_of) =
+            session_groups(&self.snapshot.targets, &self.snapshot.agents);
         self.data_warning = self.snapshot.error.clone();
         self.dirty = true;
     }
@@ -333,6 +349,31 @@ impl App {
             .collect()
     }
 
+    /// The agent sessions heading group `g` (session view only).
+    pub(crate) fn group_agents(&self, g: &str) -> Vec<&Agent> {
+        if self.group_by != GroupBy::Session {
+            return Vec::new();
+        }
+        self.snapshot
+            .agents
+            .iter()
+            .filter(|a| self.agent_session_of.get(&a.pid).map(String::as_str) == Some(g))
+            .collect()
+    }
+
+    /// Who group `g` belongs to: its live agent, else its first member's
+    /// launcher. Styles and describes session headers.
+    pub(crate) fn group_launcher(&self, g: &str) -> Option<crate::launcher::Launcher> {
+        self.group_agents(g)
+            .first()
+            .map(|a| a.as_launcher())
+            .or_else(|| {
+                self.group_members(g)
+                    .first()
+                    .and_then(|t| t.launcher.clone())
+            })
+    }
+
     // --- help overlay (`?`) -------------------------------------------------
 
     pub fn help_open(&self) -> bool {
@@ -401,6 +442,11 @@ impl App {
     }
 
     pub fn toggle_collapse(&mut self) {
+        if self.selected == Some(Entry::Agents) {
+            self.agents_open = !self.agents_open;
+            self.dirty = true;
+            return;
+        }
         if let Some(Entry::Group(p)) = &self.selected {
             let p = p.clone();
             if !self.collapsed.remove(&p) {
@@ -426,7 +472,16 @@ impl App {
         }
     }
 
+    /// The agent session under the cursor, if the cursor is on one.
+    pub fn selected_agent(&self) -> Option<&Agent> {
+        match &self.selected {
+            Some(Entry::Agent(pid)) => self.snapshot.agents.iter().find(|a| a.pid == *pid),
+            _ => None,
+        }
+    }
+
     /// All targets the selection acts on: a whole group, or one target.
+    /// Never an agent session — on an agent row this is empty.
     pub fn selected_targets(&self) -> Vec<&Target> {
         match &self.selected {
             Some(Entry::Group(p)) => self.group_members(p),
@@ -436,7 +491,7 @@ impl App {
                 .iter()
                 .filter(|t| &t.key == k)
                 .collect(),
-            None => Vec::new(),
+            Some(Entry::Agent(_)) | Some(Entry::Agents) | None => Vec::new(),
         }
     }
 
@@ -450,6 +505,11 @@ impl App {
                 .find(|t| &t.key == k)
                 .map(|t| t.project.clone())
                 .unwrap_or_default(),
+            Some(Entry::Agent(_)) => self
+                .selected_agent()
+                .map(|a| format!("{} session", a.name))
+                .unwrap_or_default(),
+            Some(Entry::Agents) => "agent sessions".into(),
             None => String::new(),
         }
     }
@@ -575,6 +635,25 @@ impl App {
             || t.launcher.as_ref().is_some_and(|l| {
                 l.short().to_lowercase().contains(&q) || l.kind.as_str().contains(&q)
             })
+    }
+
+    fn matches_agent(&self, a: &Agent) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let q = self.filter.to_lowercase();
+        // `/agent` lists every session; `/claude`, `/cargo` (a shell), a dir, …
+        "agent".contains(&q)
+            || a.name.to_lowercase().contains(&q)
+            || a.project.to_lowercase().contains(&q)
+            || a.cwd.to_string_lossy().to_lowercase().contains(&q)
+            || a.git_branch
+                .as_deref()
+                .is_some_and(|b| b.to_lowercase().contains(&q))
+            || a.session.as_deref().is_some_and(|s| s.starts_with(&q))
+            || a.children
+                .iter()
+                .any(|c| c.label.to_lowercase().contains(&q))
     }
 
     /// Esc in normal mode: close the most intrusive thing first —
@@ -710,7 +789,7 @@ impl App {
                         let e = self.display[idx].clone();
                         let already = self.selected.as_ref().is_some_and(|s| same_entry(s, &e));
                         if already {
-                            if matches!(e, Entry::Group(_)) {
+                            if matches!(e, Entry::Group(_) | Entry::Agents) {
                                 self.toggle_collapse();
                             }
                         } else {
@@ -747,12 +826,38 @@ impl App {
     /// freeze for `FREEZE` after a keystroke.
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
         let targets = &self.snapshot.targets;
+        let agents = &self.snapshot.agents;
         let visible: Vec<usize> = (0..targets.len())
             .filter(|&i| self.matches(&targets[i]))
             .collect();
-        if visible.is_empty() {
+        let visible_agents: Vec<usize> = (0..agents.len())
+            .filter(|&i| self.matches_agent(&agents[i]))
+            .collect();
+        if visible.is_empty() && visible_agents.is_empty() {
             return Vec::new();
         }
+        // working, then idle, then stale; alphabetical within each
+        let now = unix_now();
+        let rank = |a: &Agent| {
+            if a.is_working(now) {
+                0
+            } else if a.is_stale(now) {
+                2
+            } else {
+                1
+            }
+        };
+        let agent_label = |i: usize| {
+            self.agent_session_of
+                .get(&agents[i].pid)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        // Project view: agents fold into one section at the bottom.
+        let (visible_agents, section): (Vec<usize>, Vec<usize>) = match self.group_by {
+            GroupBy::Session => (visible_agents, Vec::new()),
+            GroupBy::Project => (Vec::new(), visible_agents),
+        };
 
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -762,6 +867,16 @@ impl App {
                 order.push(p.to_string());
             }
             groups.entry(p.to_string()).or_default().push(i);
+        }
+        let mut group_agents: HashMap<String, Vec<usize>> = HashMap::new();
+        for &i in &visible_agents {
+            let Some(g) = self.agent_session_of.get(&agents[i].pid) else {
+                continue;
+            };
+            if !groups.contains_key(g) && !group_agents.contains_key(g) {
+                order.push(g.clone());
+            }
+            group_agents.entry(g.clone()).or_default().push(i);
         }
 
         let sort_members = |m: &mut Vec<usize>| match self.sort {
@@ -777,11 +892,19 @@ impl App {
         let mut grouped: Vec<(String, Vec<usize>)> = order
             .into_iter()
             .map(|p| {
-                let mut m = groups.remove(&p).unwrap();
+                let mut m = groups.remove(&p).unwrap_or_default();
                 sort_members(&mut m);
                 (p, m)
             })
             .collect();
+        let agents_of = |g: &str| group_agents.get(g).map(Vec::as_slice).unwrap_or_default();
+        let agent_cpu = |g: &str| agents_of(g).iter().map(|&i| agents[i].cpu_pct).sum::<f32>();
+        let agent_mem = |g: &str| {
+            agents_of(g)
+                .iter()
+                .map(|&i| agents[i].mem_bytes)
+                .sum::<u64>()
+        };
 
         match self.sort {
             SortMode::Port => grouped.sort_by(|a, b| {
@@ -790,36 +913,58 @@ impl App {
                         .filter_map(|&i| targets[i].ports.iter().min().copied())
                         .min()
                 };
+                // port-less groups: live agents before idle and stale ones
+                let r = |g: &str| agents_of(g).iter().map(|&i| rank(&agents[i])).min();
                 match (mp(&a.1), mp(&b.1)) {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.0.cmp(&b.0),
+                    (None, None) => r(&a.0).cmp(&r(&b.0)).then_with(|| a.0.cmp(&b.0)),
                 }
             }),
             SortMode::Cpu => grouped.sort_by(|a, b| {
-                let s = |m: &[usize]| m.iter().map(|&i| targets[i].cpu_pct).sum::<f32>();
-                s(&b.1)
-                    .partial_cmp(&s(&a.1))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let s = |g: &(String, Vec<usize>)| {
+                    g.1.iter().map(|&i| targets[i].cpu_pct).sum::<f32>() + agent_cpu(&g.0)
+                };
+                s(b).partial_cmp(&s(a)).unwrap_or(std::cmp::Ordering::Equal)
             }),
             SortMode::Mem => grouped.sort_by(|a, b| {
-                let s = |m: &[usize]| m.iter().map(|&i| targets[i].mem_bytes).sum::<u64>();
-                s(&b.1).cmp(&s(&a.1))
+                let s = |g: &(String, Vec<usize>)| {
+                    g.1.iter().map(|&i| targets[i].mem_bytes).sum::<u64>() + agent_mem(&g.0)
+                };
+                s(b).cmp(&s(a))
             }),
         }
 
         let mut entries = Vec::new();
         for (project, members) in &grouped {
-            if members.len() == 1 && self.group_by == GroupBy::Project {
+            let heads = agents_of(project);
+            if members.is_empty() {
+                // an agent session with no servers: just its row(s)
+                entries.extend(heads.iter().map(|&i| Entry::Agent(agents[i].pid)));
+            } else if members.len() == 1 && self.group_by == GroupBy::Project {
                 entries.push(Entry::Target(targets[members[0]].key.clone()));
             } else {
                 entries.push(Entry::Group(project.clone()));
                 if !self.collapsed.contains(project) {
+                    entries.extend(heads.iter().map(|&i| Entry::Agent(agents[i].pid)));
                     for &i in members {
                         entries.push(Entry::Member(targets[i].key.clone()));
                     }
                 }
+            }
+        }
+        if !section.is_empty() {
+            entries.push(Entry::Agents);
+            // a filter that hits an agent opens the section
+            if self.agents_open || !self.filter.is_empty() {
+                let mut section = section;
+                section.sort_by(|&a, &b| {
+                    rank(&agents[a])
+                        .cmp(&rank(&agents[b]))
+                        .then_with(|| agent_label(a).cmp(agent_label(b)))
+                });
+                entries.extend(section.iter().map(|&i| Entry::Agent(agents[i].pid)));
             }
         }
 
@@ -859,19 +1004,22 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
         Entry::Member(k) | Entry::Target(k) => Some(k),
-        Entry::Group(_) => None,
+        Entry::Group(_) | Entry::Agent(_) | Entry::Agents => None,
     }
 }
 
-/// Two entries are "the same selection" if they're the same target (ignoring
-/// Member/Target variant) or the same group.
-/// Session-view group label per target: `claude·fal-app`, `claude·ended`,
-/// `tmux`, `detached`, `unattributed`. Distinct sessions that would share a
+/// Session-view group label per target and per agent pid: `claude·fal-app`,
+/// `claude·ended`, `tmux`, `detached`, `unattributed`. A live agent and the
+/// servers it launched share a label. Distinct sessions that would share a
 /// label get a short id suffix (`claude·fal-app #219a`).
-pub(crate) fn session_groups(targets: &[Target]) -> HashMap<TargetKey, String> {
-    use crate::launcher::LauncherKind;
-    let base_and_id = |t: &Target| -> (String, String) {
-        let Some(l) = &t.launcher else {
+pub(crate) fn session_groups(
+    targets: &[Target],
+    agents: &[Agent],
+) -> (HashMap<TargetKey, String>, HashMap<u32, String>) {
+    use crate::launcher::{Launcher, LauncherKind};
+    let agent_launchers: Vec<Launcher> = agents.iter().map(Agent::as_launcher).collect();
+    let base_and_id = |l: Option<&Launcher>| -> (String, String) {
+        let Some(l) = l else {
             return ("unattributed".into(), String::new());
         };
         let id = l
@@ -891,22 +1039,32 @@ pub(crate) fn session_groups(targets: &[Target]) -> HashMap<TargetKey, String> {
         (base, id)
     };
     let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
-    for t in targets {
-        let (base, id) = base_and_id(t);
+    let all = targets
+        .iter()
+        .map(|t| t.launcher.as_ref())
+        .chain(agent_launchers.iter().map(Some));
+    for l in all {
+        let (base, id) = base_and_id(l);
         ids.entry(base).or_default().insert(id);
     }
-    targets
+    let label = |l: Option<&Launcher>| {
+        let (base, id) = base_and_id(l);
+        if ids[&base].len() > 1 && !id.is_empty() {
+            format!("{base} #{}", &id[..id.len().min(4)])
+        } else {
+            base
+        }
+    };
+    let by_target = targets
         .iter()
-        .map(|t| {
-            let (base, id) = base_and_id(t);
-            let label = if ids[&base].len() > 1 && !id.is_empty() {
-                format!("{base} #{}", &id[..id.len().min(4)])
-            } else {
-                base
-            };
-            (t.key.clone(), label)
-        })
-        .collect()
+        .map(|t| (t.key.clone(), label(t.launcher.as_ref())))
+        .collect();
+    let by_agent = agents
+        .iter()
+        .zip(&agent_launchers)
+        .map(|(a, l)| (a.pid, label(Some(l))))
+        .collect();
+    (by_target, by_agent)
 }
 
 /// One message per agent session that ended between `old` and `new` while its
@@ -959,6 +1117,8 @@ pub(crate) fn orphan_notices(old: &Snapshot, new: &Snapshot) -> Vec<String> {
         .collect()
 }
 
+/// Two entries are "the same selection" if they're the same target (ignoring
+/// Member/Target variant), the same group, or the same agent.
 pub(crate) fn same_entry(a: &Entry, b: &Entry) -> bool {
     match (key_of(a), key_of(b)) {
         (Some(x), Some(y)) => x == y,
@@ -1026,7 +1186,7 @@ mod tests {
     #[test]
     fn session_groups_label_by_agent_and_dir_and_disambiguate() {
         let snap = sessions_snapshot(1, true);
-        let g = session_groups(&snap.targets);
+        let (g, _) = session_groups(&snap.targets, &[]);
         assert_eq!(g[&TargetKey::Port(3000)], "claude·portal");
         assert_eq!(g[&TargetKey::Port(8000)], "claude·portal"); // same session
         assert_eq!(g[&TargetKey::Port(5555)], "claude·worker");
@@ -1036,7 +1196,7 @@ mod tests {
         // two different sessions in same-named dirs get a short id suffix
         let mut snap = sessions_snapshot(1, true);
         snap.targets[2].launcher = agent("cccc3333", "/Users/me/other/portal", true);
-        let g = session_groups(&snap.targets);
+        let (g, _) = session_groups(&snap.targets, &[]);
         assert_eq!(g[&TargetKey::Port(3000)], "claude·portal #aaaa");
         assert_eq!(g[&TargetKey::Port(5555)], "claude·portal #cccc");
     }
@@ -1110,6 +1270,74 @@ mod tests {
     }
 
     #[test]
+    fn session_view_lists_agents_and_verbs_never_reach_them() {
+        let mut snap = sessions_snapshot(1, true);
+        // pid 100 is the live claude behind session aaaa1111 (:3000, :8000);
+        // pid 300 is idle with no servers
+        snap.agents = vec![
+            Agent::sample(100, "aaaa1111", "portal"),
+            Agent::sample(300, "dddd4444", "notes"),
+        ];
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        // project view: one folded section at the bottom
+        let e = app.compute_entries();
+        assert_eq!(e.last(), Some(&Entry::Agents));
+        assert!(!e.iter().any(|e| matches!(e, Entry::Agent(_))));
+        app.selected = Some(Entry::Agents);
+        assert!(
+            app.selected_targets().is_empty(),
+            "K on the section: nothing"
+        );
+        app.toggle_collapse();
+        let e = app.compute_entries();
+        let pos = e.iter().position(|x| x == &Entry::Agents).unwrap();
+        assert_eq!(e[pos + 1..].len(), 2, "unfolded: both agents follow");
+        app.toggle_collapse();
+        assert!(!app
+            .compute_entries()
+            .iter()
+            .any(|e| matches!(e, Entry::Agent(_))));
+
+        app.toggle_group_by();
+        let entries = app.compute_entries();
+        let at = |e: &Entry| entries.iter().position(|x| x == e).unwrap();
+        // the agent heads its own group, right under the header
+        assert_eq!(
+            at(&Entry::Agent(100)),
+            at(&Entry::Group("claude·portal".into())) + 1
+        );
+        // an idle agent is a row of its own, no header
+        assert!(entries.contains(&Entry::Agent(300)));
+        assert!(!entries
+            .iter()
+            .any(|e| matches!(e, Entry::Group(g) if g == "claude·notes")));
+        assert_eq!(app.group_agents("claude·portal").len(), 1);
+
+        // K on the header: its servers, never the agent
+        app.selected = Some(Entry::Group("claude·portal".into()));
+        let pids: Vec<u32> = app
+            .selected_targets()
+            .iter()
+            .flat_map(|t| t.ports.clone())
+            .map(u32::from)
+            .collect();
+        assert!(!pids.is_empty() && !pids.contains(&100));
+        // on the agent row: nothing at all
+        app.selected = Some(Entry::Agent(100));
+        assert!(app.selected_targets().is_empty());
+        assert_eq!(app.selected_agent().map(|a| a.pid), Some(100));
+        assert_eq!(app.selection_label(), "claude session");
+
+        // `/agent` lists every session; a shell's command finds its agent
+        app.filter = "agent".into();
+        assert!(app.compute_entries().contains(&Entry::Agent(300)));
+        app.filter = "cargo test".into();
+        let e = app.compute_entries();
+        assert!(e.contains(&Entry::Agent(300)) && e.contains(&Entry::Agent(100)));
+    }
+
+    #[test]
     fn multi_target_project_gets_a_group_single_does_not() {
         let entries = app_with_sample().compute_entries();
         // client-portal (next dev + postgres) -> a group header
@@ -1177,6 +1405,7 @@ mod tests {
         snap.targets.retain(|t| match &victim {
             Entry::Target(k) | Entry::Member(k) => &t.key != k,
             Entry::Group(p) => &t.project != p,
+            Entry::Agent(_) | Entry::Agents => true,
         });
         app.apply(Arc::new(snap));
         app.reconcile();

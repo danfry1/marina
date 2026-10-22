@@ -95,7 +95,15 @@
   `ports.json`; dropped when its root is deleted or on `--release`.
 
 - **Session view** — the `v` grouping mode: group headers are launchers (agent
-  sessions, editors, terminals) instead of projects.
+  sessions, editors, terminals) instead of projects. Also lists the agent
+  sessions themselves.
+
+- **Agent session** — a running coding-agent process a person (or another
+  agent) is talking to: `claude`, `opencode`, `codex`, … — not its plumbing
+  (daemons, pty hosts, `app-server`, `serve`). *Not a Target* (ADR 0004): no
+  verb, selector or scope reaches it. Its **shells** are the direct children
+  running a command now; its **helpers** are the long-lived ones (MCP servers).
+  Listed in session view and by `marina agents`.
 
 - **Orphaned** — a Target whose launching agent session has ended while the
   server kept running (`claude·ended`). Distinct from *detached*, which carries

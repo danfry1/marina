@@ -472,6 +472,61 @@ alongside them — are never stored. Session ids are validated as
 Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
 hold auth tokens).
 
+### Agent sessions — IMPLEMENTED
+
+The agents themselves are listed, not only the servers they start (ADR 0004).
+`Snapshot.agents` holds one `Agent` per live session, built in the sampler
+after targets:
+
+- **What counts as a session** (`launcher::agent_session`): a process that
+  classifies as an agent (by name, node-hosted script, or Claude Code's
+  `…/claude/versions/<v>` binary for background sessions) and is not
+  *plumbing* — `daemon`, `--bg-pty-host`, `--bg-spare`, `app-server`, `mcp`,
+  `serve`, … in its first two args — nor a same-named child spawned directly
+  by a session (its helper). Spawned by plumbing (a pty host) it *is* a
+  session; spawned from a session's shell (`claude -p`) it is its own session.
+- **Rollup**: the agent plus its descendants, minus anything a target holds
+  and minus nested sessions (their own rows). So a session's cpu/mem is the
+  agent and its MCP helpers, never its servers.
+- **Children**: each direct child, labelled by the same subtree resolver as
+  targets (`cargo test`, `xcodebuild`, `npm exec chrome-devtools-mcp`; never
+  argv), split into *shells* (a shell running a command now) and *helpers*.
+  A shell whose subtree holds a target is left out — the server row says it.
+- **Session id**: the newest process carrying the agent's markers with its pid
+  (`CLAUDE_PID`), else the newest marked descendant — ids change on `/clear`
+  and resume, and older helpers keep the id they started with — else the
+  agent's argv (`--session-id`, `--resume`, `--session`, `resume <id>`,
+  validated). `link_sessions` then shares ids by pid in both directions with
+  the targets the agent launched, so a session and its servers group together
+  and both show the resume command.
+
+**Activity** (`Agent::is_working` / `is_stale` / `activity`) comes from the
+agent's controlling terminal (`sources::tty_activity`: libproc `e_tdev` +
+`devname` on macOS, `/proc/<pid>/fd` on Linux), whose device timestamps say
+when it was last written to (mtime) and read from (atime) — the signal `w`
+uses for IDLE. No screen contents are read. A working agent animates its
+spinner and streams; an idle one leaves the screen alone. So *working* = a
+shell is running a command, or terminal output within the last 5s; *idle*
+shows how long the screen has been still (`idle 12m`); *stale* = not working
+and no terminal input (keystrokes, or focus events from switching to it) for
+over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
+and open time. CPU alone was tried first and misread working sessions as
+idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
+are touched in idle sessions too, so marina reads nothing under `~/.claude`.
+
+Surfaces: the project view ends with a folded `agents` section (its own
+`Entry::Agents`, so it can't collide with a project of that name; `Enter`
+unfolds, a filter opens it) summarising working/stale counts and memory. The
+session view lists agents (a live agent with servers is the first row under
+its header; one without is a standalone row labelled like a header; working
+before idle before stale). Agent rows show the activity in COMMAND and dim
+when stale; the title totals agent count and memory; `i` lists
+shells/helpers; and `marina agents [sel…] [--json]` prints them with a
+`state` and the servers each started.
+Verbs never reach an agent: `selected_targets` is empty on an agent row (K/R/T/
+Y/O explain instead), a session header's `K` stops only its servers, and the
+CLI command is read-only.
+
 A **selector** matches by project name (exact/substring), port (`3000`/`:3000`),
 or command label. **Killing a project selector stops every target under it** —
 this selector resolution is the grouping primitive a future TUI group-kill reuses.
@@ -550,7 +605,8 @@ non-issue — rows for system stuff may just be opaque.
   editor, terminal, `detached`, or `unattributed`; distinct sessions that would
   share a label get a short id suffix (`#219a`). Every session gets a header,
   even with one member, because the session is the information. `K`/`R` on a
-  session header act on exactly that session's targets.
+  session header act on exactly that session's targets. Live agent sessions
+  list here too (see *Agent sessions*).
 - **Orphan notices**: the snapshot diff in `App::apply` reports each agent
   session whose targets go alive→orphaned, once, grouped per session, as a
   20s status notice plus a desktop notification (`osascript` / `notify-send`,

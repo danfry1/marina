@@ -57,6 +57,149 @@ pub struct Target {
     pub launcher: Option<crate::launcher::Launcher>,
 }
 
+/// A running coding-agent session (`claude`, `opencode`, `codex`, …). Not a
+/// Target: verbs, selectors and `ls` never see it, so no kill — group, project
+/// selector or `--orphaned` — can take an agent down with its servers.
+#[derive(Clone)]
+pub struct Agent {
+    pub name: String,
+    pub pid: u32,
+    pub start_time: u64,
+    /// Resumable session id, from its children's env markers or its own argv.
+    pub session: Option<String>,
+    pub cwd: PathBuf,
+    pub project: String,
+    pub git_branch: Option<String>,
+    /// Program path + arg count only, like targets (argv can hold secrets).
+    pub argv0: String,
+    pub argc: usize,
+    /// Agent + descendants, minus servers (their targets own them) and nested
+    /// agent sessions (their own rows).
+    pub pids: Vec<u32>,
+    pub cpu_pct: f32,   // EWMA-smoothed, rollup over `pids`
+    pub mem_bytes: u64, // rollup over `pids`
+    /// Direct children: tool shells and helpers (MCP servers, …).
+    pub children: Vec<AgentChild>,
+    /// Its terminal's last output / keystroke, when it has one.
+    pub tty: Option<crate::sources::TtyActivity>,
+}
+
+/// Smoothed CPU% at or above which an agent with no shell and no terminal
+/// counts as working.
+pub const AGENT_BUSY_CPU: f32 = 4.0;
+/// Terminal output this recent means the agent is working.
+pub const WORKING_OUTPUT_SECS: u64 = 5;
+/// An idle agent whose terminal has had no input this long is called stale.
+pub const STALE_AFTER_SECS: u64 = 24 * 3600;
+
+/// One direct child of an agent, labelled like a target (never raw argv).
+#[derive(Clone)]
+pub struct AgentChild {
+    pub pid: u32,
+    pub start_time: u64,
+    /// `cargo test`, `vite`, `node mcp-server.js`; `shell` for an idle one.
+    pub label: String,
+    /// A shell the agent is running a command in (vs a long-lived helper).
+    pub shell: bool,
+    pub cpu_pct: f32, // subtree, unsmoothed
+}
+
+impl Agent {
+    /// The agent as the launcher its servers would name — what session
+    /// grouping and the `via` styling share.
+    pub fn as_launcher(&self) -> crate::launcher::Launcher {
+        crate::launcher::Launcher {
+            kind: crate::launcher::LauncherKind::Agent,
+            name: self.name.clone(),
+            pid: Some(self.pid),
+            alive: true,
+            session: self.session.clone(),
+            cwd: Some(self.cwd.clone()),
+            start_time: self.start_time,
+        }
+    }
+
+    pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
+        self.children.iter().filter(|c| c.shell)
+    }
+
+    /// Doing something right now: a shell is running a command, or its
+    /// terminal is being written to (a working agent animates its spinner and
+    /// streams; an idle one leaves the screen alone). Without a terminal, CPU
+    /// is the fallback: an idle agent TUI sits around 1%.
+    pub fn is_working(&self, now: u64) -> bool {
+        if self.shells().next().is_some() {
+            return true;
+        }
+        match self.tty {
+            Some(t) => now.saturating_sub(t.output) <= WORKING_OUTPUT_SECS,
+            None => self.cpu_pct >= AGENT_BUSY_CPU,
+        }
+    }
+
+    /// When its terminal last had input (keystrokes, or focus events from
+    /// switching to it), else when it started. Transcript mtimes are no substitute: idle sessions' files
+    /// get touched too.
+    pub fn last_input(&self) -> u64 {
+        self.tty.map(|t| t.input).unwrap_or(self.start_time)
+    }
+
+    /// Not working, and its terminal has had no input for over a day —
+    /// likely a forgotten session holding memory.
+    pub fn is_stale(&self, now: u64) -> bool {
+        !self.is_working(now)
+            && self.last_input() != 0
+            && now.saturating_sub(self.last_input()) >= STALE_AFTER_SECS
+    }
+
+    /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
+    /// `idle 12m` (since its terminal last changed).
+    pub fn activity(&self, now: u64) -> String {
+        let mut shells = self.shells();
+        match (shells.next(), shells.count()) {
+            (Some(c), 0) => format!("$ {}", c.label),
+            (Some(c), more) => format!("$ {} +{more}", c.label),
+            (None, _) if self.is_working(now) => "working".into(),
+            (None, _) => match self.tty {
+                Some(t) => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t.output))),
+                None => "idle".into(),
+            },
+        }
+    }
+
+    /// Fixture: a claude session in `/Users/me/dev/<dir>` running one shell
+    /// (`cargo test`) next to an MCP helper.
+    #[cfg(test)]
+    pub fn sample(pid: u32, session: &str, dir: &str) -> Self {
+        let child = |pid: u32, label: &str, shell: bool| AgentChild {
+            pid,
+            start_time: 0,
+            label: label.into(),
+            shell,
+            cpu_pct: 0.0,
+        };
+        Agent {
+            name: "claude".into(),
+            pid,
+            start_time: 0,
+            session: Some(session.into()),
+            cwd: PathBuf::from("/Users/me/dev").join(dir),
+            project: dir.into(),
+            git_branch: Some("main".into()),
+            argv0: "claude".into(),
+            argc: 0,
+            pids: vec![pid, pid + 1, pid + 2],
+            cpu_pct: 1.5,
+            mem_bytes: 500 * 1024 * 1024,
+            children: vec![
+                child(pid + 1, "cargo test", true),
+                child(pid + 2, "npm exec chrome-devtools-mcp", false),
+            ],
+            tty: None,
+        }
+    }
+}
+
 /// Typed, optional URL — the verb layer decides what "open" / "copy" mean per scheme.
 #[derive(Clone)]
 pub struct Url {
@@ -87,6 +230,8 @@ impl UrlScheme {
 pub struct Snapshot {
     pub seq: u64,
     pub targets: Vec<Target>,
+    /// Live coding-agent sessions, kept apart from `targets` (see [`Agent`]).
+    pub agents: Vec<Agent>,
     /// A data-source failure (e.g. the port scan errored). Shown persistently
     /// in the UI — an empty cockpit must never silently mean "enumeration broke".
     pub error: Option<String>,
@@ -97,6 +242,7 @@ impl Snapshot {
         Snapshot {
             seq: 0,
             targets: Vec::new(),
+            agents: Vec::new(),
             error: None,
         }
     }
@@ -200,6 +346,7 @@ impl Snapshot {
         Snapshot {
             seq: 0,
             targets,
+            agents: Vec::new(),
             error: None,
         }
     }
@@ -215,6 +362,48 @@ mod tests {
         assert!(UrlScheme::Https.is_web());
         assert!(!UrlScheme::Postgres.is_web());
         assert!(!UrlScheme::Redis.is_web());
+    }
+
+    #[test]
+    fn agent_activity_working_idle_and_stale() {
+        use crate::sources::TtyActivity;
+        let now = 10 * STALE_AFTER_SECS;
+        let mut a = Agent::sample(1, "s", "app");
+        a.start_time = now - 5 * STALE_AFTER_SECS;
+        a.tty = Some(TtyActivity {
+            output: now - 600,
+            input: now - 2 * STALE_AFTER_SECS,
+        });
+        assert!(a.is_working(now) && !a.is_stale(now)); // a shell is running
+        assert_eq!(a.activity(now), "$ cargo test");
+        a.children[1].shell = true;
+        assert_eq!(a.activity(now), "$ cargo test +1");
+
+        a.children.clear();
+        assert_eq!(a.activity(now), "idle 10m");
+        assert!(a.is_stale(now), "nobody typed in two days");
+        a.tty = Some(TtyActivity {
+            output: now - 1, // spinner / streaming
+            input: now - 2 * STALE_AFTER_SECS,
+        });
+        assert_eq!(a.activity(now), "working");
+        assert!(!a.is_stale(now));
+        // a busy CPU doesn't count when the terminal is quiet
+        a.tty = Some(TtyActivity {
+            output: now - 60,
+            input: now - 30,
+        });
+        a.cpu_pct = AGENT_BUSY_CPU + 10.0;
+        assert!(!a.is_working(now) && !a.is_stale(now), "typed 30s ago");
+
+        // no terminal: CPU decides, open time stands in for input
+        a.tty = None;
+        assert_eq!(a.activity(now), "working");
+        a.cpu_pct = 0.3;
+        assert_eq!(a.activity(now), "idle");
+        assert!(a.is_stale(now), "open five days, no terminal to ask");
+        a.start_time = 0;
+        assert!(!a.is_stale(now), "unknown age is never stale");
     }
 
     #[test]

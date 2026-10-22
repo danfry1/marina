@@ -8,6 +8,7 @@
 //!   marina free <port>… [--json] stop whatever dev target holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
 //!   marina port --list | --release [name]
+//!   marina agents [sel]… [--json] running coding-agent sessions + their shells
 //!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
@@ -19,6 +20,9 @@
 //! session running this command (so an agent can clean up after itself);
 //! `--orphaned` to targets whose launching agent session has ended.
 //!
+//! `agents` is read-only by design: agent sessions are never targets, so no
+//! selector, scope or verb here can stop one.
+//!
 //! Unknown commands and flags are errors (exit 2) — a typo must never fall
 //! through and launch the TUI inside a script.
 
@@ -28,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::launcher;
-use crate::model::{Snapshot, Target, TargetKind};
+use crate::model::{Agent, Snapshot, Target, TargetKind};
 use crate::sampler::Sampler;
 use crate::sources::{Netstat2Ports, PortSource};
 use crate::ui::{fmt_uptime, tildify};
@@ -49,6 +53,7 @@ USAGE:
                                  (pnpm dev --port $(marina port))
     marina port --list           show assigned ports
     marina port --release [name] give this project's port back
+    marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
     marina version               print the version
 
 SELECTOR:
@@ -100,7 +105,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
             }
         }
     }
-    if scope.active() && matches!(cmd, "who" | "free" | "port") {
+    if scope.active() && matches!(cmd, "who" | "free" | "port" | "agents") {
         eprintln!("marina: {cmd} doesn't take --mine / --orphaned");
         return Some(2);
     }
@@ -117,6 +122,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
+        "agents" => agents(&selectors, json),
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -257,6 +263,99 @@ fn ls(json: bool, selectors: &[&str], scope: &Scope) -> i32 {
         println!(
             "{:<20} {:<16} {:<8} {:>6} {:>8} {:<14} {:<14}",
             t.project, t.command_label, port, cpu, mem, via, url
+        );
+    }
+    0
+}
+
+/// Does agent `a` match a selector: its name, project, cwd, or a session-id
+/// prefix?
+fn agent_matches(a: &Agent, sel: &str) -> bool {
+    let q = sel.to_lowercase();
+    a.name == q
+        || a.project.to_lowercase().contains(&q)
+        || a.cwd.to_string_lossy().to_lowercase().contains(&q)
+        || a.session.as_deref().is_some_and(|s| s.starts_with(&q))
+}
+
+/// The servers agent `a` launched: targets whose live launcher is its pid.
+fn servers_of<'a>(snap: &'a Snapshot, a: &Agent) -> Vec<&'a Target> {
+    snap.targets
+        .iter()
+        .filter(|t| {
+            t.launcher
+                .as_ref()
+                .is_some_and(|l| l.alive && l.name == a.name && l.pid == Some(a.pid))
+        })
+        .collect()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn agents(selectors: &[&str], json: bool) -> i32 {
+    let snap = snapshot(true);
+    let picked: Vec<&Agent> = snap
+        .agents
+        .iter()
+        .filter(|a| selectors.is_empty() || selectors.iter().any(|s| agent_matches(a, s)))
+        .collect();
+    if json {
+        let view: Vec<AgentJson> = picked
+            .iter()
+            .map(|a| AgentJson::new(a, &servers_of(&snap, a)))
+            .collect();
+        match serde_json::to_string_pretty(&view) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("marina: json error: {e}"),
+        }
+        return if picked.is_empty() && !selectors.is_empty() {
+            1
+        } else {
+            0
+        };
+    }
+    if picked.is_empty() {
+        println!("no agent sessions running");
+        return if selectors.is_empty() { 0 } else { 1 };
+    }
+    println!(
+        "{:<9} {:<7} {:<20} {:>6} {:>8} {:<5} {:<10} DOING",
+        "AGENT", "PID", "PROJECT", "CPU", "MEM", "UP", "SESSION"
+    );
+    for a in picked {
+        // `$ cargo test` per live shell, `:3000` per server it started
+        let mut doing: Vec<String> = a.shells().map(|c| format!("$ {}", c.label)).collect();
+        doing.extend(
+            servers_of(&snap, a)
+                .iter()
+                .flat_map(|t| t.ports.iter().map(|p| format!(":{p}"))),
+        );
+        let now = now_secs();
+        let doing = if doing.is_empty() {
+            match a.is_stale(now) {
+                true => format!("{} (stale)", a.activity(now)),
+                false => a.activity(now),
+            }
+        } else {
+            doing.join(" · ")
+        };
+        println!(
+            "{:<9} {:<7} {:<20} {:>6} {:>8} {:<5} {:<10} {doing}",
+            a.name,
+            a.pid,
+            a.project,
+            format!("{:.1}%", a.cpu_pct),
+            format!("{}MB", a.mem_bytes / (1024 * 1024)),
+            fmt_uptime(a.start_time),
+            a.session
+                .as_deref()
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("—"),
         );
     }
     0
@@ -943,6 +1042,95 @@ impl From<&launcher::Launcher> for LauncherJson {
     }
 }
 
+/// `marina agents --json`: one live agent session.
+#[derive(Serialize)]
+struct AgentJson {
+    name: String,
+    pid: u32,
+    /// Resumable session id, when known.
+    session: Option<String>,
+    /// How to get back into it (`claude --resume <id>`, …).
+    resume: Option<String>,
+    /// `working` (a shell running, or recent terminal output), `idle`, or
+    /// `stale` (idle, no terminal input for over a day).
+    state: &'static str,
+    cwd: String,
+    project: String,
+    branch: Option<String>,
+    uptime_secs: Option<u64>,
+    cpu_pct: f32,
+    mem_bytes: u64,
+    /// Agent + its shells and helpers (not its servers' pids).
+    pids: Vec<u32>,
+    /// Shells running a command right now.
+    shells: Vec<AgentChildJson>,
+    /// Long-lived helpers: MCP servers, daemons, …
+    helpers: Vec<AgentChildJson>,
+    /// Dev servers this session started (still running).
+    servers: Vec<AgentServerJson>,
+}
+
+#[derive(Serialize)]
+struct AgentChildJson {
+    pid: u32,
+    command: String,
+    uptime_secs: Option<u64>,
+    cpu_pct: f32,
+}
+
+#[derive(Serialize)]
+struct AgentServerJson {
+    project: String,
+    command: String,
+    ports: Vec<u16>,
+}
+
+impl AgentJson {
+    fn new(a: &Agent, servers: &[&Target]) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let up = |start: u64| (start != 0).then(|| now.saturating_sub(start));
+        let child = |c: &crate::model::AgentChild| AgentChildJson {
+            pid: c.pid,
+            command: c.label.clone(),
+            uptime_secs: up(c.start_time),
+            cpu_pct: c.cpu_pct,
+        };
+        AgentJson {
+            name: a.name.clone(),
+            pid: a.pid,
+            session: a.session.clone(),
+            resume: a.as_launcher().resume_hint(),
+            state: if a.is_working(now) {
+                "working"
+            } else if a.is_stale(now) {
+                "stale"
+            } else {
+                "idle"
+            },
+            cwd: a.cwd.display().to_string(),
+            project: a.project.clone(),
+            branch: a.git_branch.clone(),
+            uptime_secs: up(a.start_time),
+            cpu_pct: a.cpu_pct,
+            mem_bytes: a.mem_bytes,
+            pids: a.pids.clone(),
+            shells: a.children.iter().filter(|c| c.shell).map(child).collect(),
+            helpers: a.children.iter().filter(|c| !c.shell).map(child).collect(),
+            servers: servers
+                .iter()
+                .map(|t| AgentServerJson {
+                    project: t.project.clone(),
+                    command: t.command_label.clone(),
+                    ports: t.ports.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<&Target> for TargetJson {
     fn from(t: &Target) -> Self {
         let measured = !t.pids.is_empty();
@@ -1115,6 +1303,48 @@ mod tests {
         assert_eq!(j.ports, vec![5432]);
         assert!(j.exposed);
         assert_eq!(j.container.as_deref(), Some("myapp-db-1"));
+    }
+
+    #[test]
+    fn agents_match_by_name_project_and_session_prefix_and_json_is_pinned() {
+        let a = crate::model::Agent::sample(10, "41616c1a-c2d3", "marina");
+        assert!(agent_matches(&a, "claude"));
+        assert!(agent_matches(&a, "mari"));
+        assert!(agent_matches(&a, "41616c"));
+        assert!(!agent_matches(&a, "opencode"));
+
+        let mut snap = Snapshot::sample();
+        snap.targets[0].launcher = Some(a.as_launcher()); // :3000 is its server
+        let j = serde_json::to_value(AgentJson::new(&a, &servers_of(&snap, &a))).unwrap();
+        let obj = j.as_object().unwrap();
+        for field in [
+            "name",
+            "pid",
+            "session",
+            "resume",
+            "state",
+            "cwd",
+            "project",
+            "branch",
+            "uptime_secs",
+            "cpu_pct",
+            "mem_bytes",
+            "pids",
+            "shells",
+            "helpers",
+            "servers",
+        ] {
+            assert!(obj.contains_key(field), "missing JSON field {field}");
+        }
+        assert_eq!(obj.len(), 15);
+        assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
+        assert_eq!(j["shells"][0]["command"], "cargo test");
+        assert_eq!(j["servers"][0]["ports"][0], 3000);
+    }
+
+    #[test]
+    fn agents_take_no_scope_flags() {
+        assert_eq!(dispatch(&["agents".into(), "--orphaned".into()]), Some(2));
     }
 
     #[test]

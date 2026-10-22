@@ -214,6 +214,25 @@ fn dump() -> io::Result<()> {
             t.url.as_ref().map(|u| u.value.as_str()).unwrap_or(""),
         );
     }
+    println!("{} agent sessions", snap.agents.len());
+    for a in &snap.agents {
+        let kids: Vec<String> = a
+            .children
+            .iter()
+            .map(|c| format!("{}{}", if c.shell { "$ " } else { "" }, c.label))
+            .collect();
+        println!(
+            "  {:<9} pid={:<6} {:<18} {:>6.1}%  {:>6}MB  pids={} session={} [{}]",
+            a.name,
+            a.pid,
+            a.project,
+            a.cpu_pct,
+            a.mem_bytes / (1024 * 1024),
+            a.pids.len(),
+            a.session.as_deref().unwrap_or("—"),
+            kids.join(", "),
+        );
+    }
     Ok(())
 }
 
@@ -238,7 +257,27 @@ fn logtest(pids: Vec<u32>) -> io::Result<()> {
 
 // --- verbs (orchestrated here; the work runs off the UI thread) --------------
 
+/// Verbs act on targets only. On an agent-session row, say why nothing
+/// happens instead of a bare "nothing to kill": marina never stops an agent.
+fn on_agent_row(app: &mut ui::App, verb: &str) -> bool {
+    let Some(a) = app.selected_agent() else {
+        return false;
+    };
+    let msg = match verb {
+        "kill" | "restart" => format!(
+            "marina doesn't {verb} agent sessions — exit {} (pid {}) from its terminal; its servers are listed under it",
+            a.name, a.pid
+        ),
+        _ => format!("{} session has no {verb} — select one of its servers", a.name),
+    };
+    app.set_status(msg);
+    true
+}
+
 fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) {
+    if on_agent_row(app, "kill") {
+        return;
+    }
     let (pid_starts, containers, keys) = {
         let ts = app.selected_targets();
         let mut ps: Vec<verbs::PidStart> = Vec::new();
@@ -283,6 +322,9 @@ fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) 
 }
 
 fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) {
+    if on_agent_row(app, "restart") {
+        return;
+    }
     let label = app.selection_label();
     let (plans, containers, keys) = {
         let ts = app.selected_targets();
@@ -320,6 +362,9 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
 }
 
 fn verb_copy(app: &mut ui::App) {
+    if on_agent_row(app, "URL") {
+        return;
+    }
     if app.selected_target().is_none() {
         app.set_status("select a service (not a group) to copy a URL");
         return;
@@ -335,6 +380,9 @@ fn verb_copy(app: &mut ui::App) {
 }
 
 fn verb_open(app: &mut ui::App) {
+    if on_agent_row(app, "URL") {
+        return;
+    }
     if app.selected_target().is_none() {
         app.set_status("select a service (not a group) to open");
         return;
@@ -356,6 +404,9 @@ fn verb_open(app: &mut ui::App) {
 fn verb_tail(app: &mut ui::App, ev: &Sender<UiEvent>) {
     if app.log_open() {
         app.close_log();
+        return;
+    }
+    if on_agent_row(app, "log") {
         return;
     }
     let Some(t) = app.selected_target() else {

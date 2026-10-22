@@ -53,13 +53,26 @@ developer-process-centric.
 - **Session view** — press `v` to group by *who started it* instead: one header
   per agent session (`claude·fal-app`, `codex·api`), editor, or terminal, across
   projects. `K` on a session header stops everything that session started.
+- **Agent sessions** — every running coding-agent session (Claude Code,
+  opencode, Codex, …) is listed, even one with no servers: a folded
+  `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
+  project view, and a row per session in the session view. Each shows what it
+  is doing (`$ cargo test`, `working`, `idle 12m`), its cpu/mem (agent + MCP
+  helpers), dir, branch and session id; `i` lists its shells and helpers and
+  the resume command. Working vs idle comes from when its terminal was last
+  written to, like `w`'s IDLE column. Sessions whose terminal has had no input
+  for over a day are dimmed as *stale* — usually a forgotten session holding
+  memory. Background Claude Code
+  sessions are included; daemons and pty hosts are not. marina never stops an
+  agent: `K` on an agent row explains why, and `K` on its header stops only
+  its servers.
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification
   (`osascript` / `notify-send`; turn off with `[notify] desktop = false`).
 - **Agent/script CLI** — `marina ls --json`, `marina kill <project>`,
-  `marina who 3000` / `marina free 3000`, sharing the exact same resolution
-  engine as the TUI.
+  `marina who 3000` / `marina free 3000`, `marina agents`, sharing the exact
+  same resolution engine as the TUI.
 
 ## Install
 
@@ -121,7 +134,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a project group |
-| `v` | group by project ↔ by agent session / launcher |
+| `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
 | `s` | cycle sort (port / cpu / mem) — or click a column header |
@@ -148,6 +161,7 @@ marina who <port>… [--json]   # what's holding a port — dev target or not
 marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
 marina port [name] [--json]   # a stable, collision-free port for this project/worktree
 marina port --list            # every assigned port · --release [name] gives one back
+marina agents [sel…] [--json] # agent sessions: shells, helpers, servers, resume command
 marina version
 ```
 
@@ -258,7 +272,8 @@ marina is deliberately boring on this front:
   list is `MARKERS` in [src/launcher.rs](src/launcher.rs)), used to attribute a
   server to its agent session. Of those, only pids and validated session ids
   are kept; flag values are never read, and no other variable is kept,
-  displayed, or serialized; the nearest project
+  displayed, or serialized; for agent sessions, their terminal device's
+  last-written / last-read timestamps (never the screen contents); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.

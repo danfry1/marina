@@ -15,7 +15,11 @@ pub(crate) fn fmt_uptime(start: u64) -> String {
     if start == 0 {
         return "—".into();
     }
-    let s = unix_now().saturating_sub(start);
+    fmt_age(unix_now().saturating_sub(start))
+}
+
+/// A duration in seconds, same units as uptime: `40s`, `12m`, `3h`, `2d`.
+pub(crate) fn fmt_age(s: u64) -> String {
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {

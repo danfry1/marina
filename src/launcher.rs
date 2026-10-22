@@ -359,6 +359,14 @@ pub fn classify(p: &ProcInfo) -> Option<(LauncherKind, &'static str)> {
     if let Some(hit) = lookup(&p.name) {
         return Some(hit);
     }
+    // Claude Code's background sessions run the versioned binary directly
+    // (`~/.local/share/claude/versions/2.1.307`), so the name is a version.
+    if p.argv
+        .first()
+        .is_some_and(|a| a.contains("/claude/versions/"))
+    {
+        return Some((LauncherKind::Agent, "claude"));
+    }
     // node/bun-hosted CLIs: look at the script (`node /…/bin/codex`).
     let prog = p.argv.first().map(|a| basename(a)).unwrap_or("");
     if SCRIPT_HOSTS.contains(&prog) {
@@ -366,6 +374,79 @@ pub fn classify(p: &ProcInfo) -> Option<(LauncherKind, &'static str)> {
             if let Some(hit @ (LauncherKind::Agent, _)) = lookup(basename(script)) {
                 return Some(hit);
             }
+        }
+    }
+    None
+}
+
+/// Agent subcommands / flags that mark plumbing rather than a session a human
+/// is in: Claude Code's daemon and pty hosts, Codex's app-server, MCP and
+/// HTTP servers (`opencode serve` is a listener target, not a session).
+const AGENT_PLUMBING: &[&str] = &[
+    "daemon",
+    "--bg-pty-host",
+    "--bg-spare",
+    "app-server",
+    "mcp",
+    "mcp-server",
+    "serve",
+    "server",
+    "proto",
+];
+
+/// Is `p` an agent *session* — the process a person (or another agent) is
+/// talking to — and which agent? Plumbing processes and an agent's own
+/// same-named helper children are not sessions.
+pub fn agent_session(p: &ProcInfo, procs: &HashMap<u32, ProcInfo>) -> Option<&'static str> {
+    let Some((LauncherKind::Agent, name)) = classify(p) else {
+        return None;
+    };
+    if plumbing(p).is_some() {
+        return None;
+    }
+    // A same-named agent spawned directly by a session is that session's
+    // helper. (Spawned by plumbing — a pty host — it *is* a session.)
+    let parent = p.ppid.and_then(|pp| procs.get(&pp));
+    if parent.is_some_and(|pp| {
+        plumbing(pp).is_none()
+            && matches!(classify(pp), Some((LauncherKind::Agent, n)) if n == name)
+    }) {
+        return None;
+    }
+    Some(name)
+}
+
+/// The plumbing subcommand/flag an agent process runs (`daemon`,
+/// `--bg-pty-host`, `app-server`, …), if it is plumbing rather than a session.
+pub fn plumbing(p: &ProcInfo) -> Option<&'static str> {
+    // For node-hosted CLIs the subcommand follows the script.
+    let skip = match p.argv.first().map(|a| basename(a)) {
+        Some(prog) if SCRIPT_HOSTS.contains(&prog) => 2,
+        _ => 1,
+    };
+    p.argv
+        .iter()
+        .skip(skip)
+        .take(2)
+        .find_map(|a| AGENT_PLUMBING.iter().copied().find(|&k| k == a))
+}
+
+/// A session id from the agent's own command line: `--session-id <id>`
+/// (Claude background sessions), `--resume`/`-r <id>`, `--session`/`-s <id>`
+/// (opencode), `resume <id>` (codex). Only well-formed ids are kept — a
+/// `--resume <path>` is dropped.
+pub fn session_from_argv(argv: &[String]) -> Option<String> {
+    for flags in [
+        &["--session-id"][..],
+        &["--resume", "-r", "--session", "-s", "resume"][..],
+    ] {
+        if let Some(id) = argv
+            .windows(2)
+            .find(|w| flags.contains(&w[0].as_str()))
+            .map(|w| w[1].as_str())
+            .filter(|v| !v.starts_with('-') && is_session_id(v))
+        {
+            return Some(id.to_string());
         }
     }
     None
@@ -816,6 +897,87 @@ mod tests {
             p(20, 10, "node", &["node", "vite"]),
         ]);
         assert!(find(20, &procs).is_none());
+    }
+
+    #[test]
+    fn agent_sessions_exclude_plumbing_and_helpers() {
+        let procs = map(vec![
+            p(10, 1, "claude", &["claude"]),
+            // the session's own same-named helper -> not a session
+            p(11, 10, "claude", &["claude"]),
+            // plumbing: daemon, pty host
+            p(20, 10, "claude", &["claude", "daemon", "run"]),
+            p(21, 1, "claude", &["claude", "--bg-pty-host", "/tmp/x.sock"]),
+            // a background session under the pty host *is* a session; its
+            // process name is the version, the path says claude
+            p(
+                22,
+                21,
+                "2.1.307",
+                &[
+                    "/u/.local/share/claude/versions/2.1.307",
+                    "--session-id",
+                    "eb2a1a89-a393",
+                ],
+            ),
+            p(30, 1, "codex", &["codex", "app-server", "--listen"]),
+            p(31, 1, "opencode", &["opencode", "serve"]),
+            p(32, 1, "node", &["node", "/x/bin/opencode", "serve"]),
+            p(40, 1, "opencode", &["opencode"]),
+            // `claude -p` from a session's shell: its own session
+            p(50, 10, "zsh", &["/bin/zsh", "-c", "claude -p hi"]),
+            p(51, 50, "claude", &["claude", "-p", "hi"]),
+        ]);
+        let mut found: Vec<(u32, &str)> = procs
+            .values()
+            .filter_map(|q| agent_session(q, &procs).map(|n| (q.pid, n)))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![
+                (10, "claude"),
+                (22, "claude"),
+                (40, "opencode"),
+                (51, "claude")
+            ]
+        );
+        assert_eq!(plumbing(&procs[&20]), Some("daemon"));
+        assert_eq!(plumbing(&procs[&32]), Some("serve"));
+    }
+
+    #[test]
+    fn session_ids_come_from_argv_when_well_formed() {
+        let a =
+            |v: &[&str]| session_from_argv(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            a(&["claude", "--resume", "3039fd48-fcae"]).as_deref(),
+            Some("3039fd48-fcae")
+        );
+        // --session-id (the new id) beats the --resume it forked from
+        assert_eq!(
+            a(&[
+                "claude",
+                "--resume",
+                "aaaa",
+                "--session-id",
+                "bbbb",
+                "--fork-session"
+            ])
+            .as_deref(),
+            Some("bbbb")
+        );
+        assert_eq!(
+            a(&["opencode", "-s", "ses_3b0f"]).as_deref(),
+            Some("ses_3b0f")
+        );
+        assert_eq!(
+            a(&["codex", "resume", "0199a213"]).as_deref(),
+            Some("0199a213")
+        );
+        assert_eq!(a(&["claude", "--resume", "/x/y.jsonl"]), None); // a path
+        assert_eq!(a(&["codex", "resume", "--last"]), None);
+        assert_eq!(a(&["claude"]), None);
     }
 
     #[test]
