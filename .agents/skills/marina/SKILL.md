@@ -111,6 +111,12 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   `session` belong to another Claude Code session — leave them alone unless asked.
 - **"kill leftover/zombie dev servers"** → `marina ls --orphaned` first, show the
   user, then `marina kill --orphaned`.
+- **"what are my agents doing" / "which Claude sessions are running"** →
+  `marina agents --json`: one entry per live agent session with `session`,
+  `resume` (e.g. `claude --resume <id>`), `cwd`, `branch`, `cpu_pct`,
+  `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
+  and `servers` (dev servers it started). It's read-only — marina has no way to
+  stop an agent session; tell the user which one and let them exit it.
 - **"restart the api"** → `marina restart api` (if ambiguous, list first and confirm).
 - **"open / give me the URL for the frontend"** → `marina url <project>`.
 

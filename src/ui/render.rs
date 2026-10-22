@@ -16,7 +16,7 @@ use ratatui::{
 use super::format::{centered_rect, fmt_mem, fmt_uptime, tildify};
 use super::state::{App, Entry, GroupBy, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
-use crate::model::{Target, TargetKey, TargetKind};
+use crate::model::{Agent, Target, TargetKey, TargetKind};
 
 /// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
 const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
@@ -28,7 +28,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let inspect_open = app.inspect;
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
     if inspect_open {
-        constraints.push(Constraint::Length(9));
+        // an agent lists its shells/helpers below the usual five lines
+        let h = if app.selected_agent().is_some() {
+            12
+        } else {
+            9
+        };
+        constraints.push(Constraint::Length(h));
     }
     if log_open {
         constraints.push(Constraint::Length(app.log_height));
@@ -57,8 +63,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.table_rect = table_area;
     app.log_rect = log_area;
 
+    let agents = match (app.snapshot.agents.len(), app.group_by) {
+        (0, _) => String::new(),
+        (n, GroupBy::Session) => format!(" · {n} agents"),
+        (n, GroupBy::Project) => format!(" · {n} agents (v)"),
+    };
     let title = format!(
-        " marina · {} targets · sort:{}{} ",
+        " marina · {} targets{agents} · sort:{}{} ",
         app.snapshot.targets.len(),
         app.sort.label(),
         match app.group_by {
@@ -71,19 +82,27 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.display.is_empty() {
         app.header_hits.clear();
         let dim = Style::new().fg(Color::DarkGray);
-        let msg = if app.snapshot.targets.is_empty() {
+        let msg = if app.snapshot.targets.is_empty() && app.group_by == GroupBy::Project {
             "No dev processes detected."
+        } else if app.snapshot.targets.is_empty() && app.snapshot.agents.is_empty() {
+            "No dev processes or agent sessions detected."
         } else {
             "No targets match the filter."
+        };
+        let n = app.snapshot.agents.len();
+        let sub = if n > 0 && app.group_by == GroupBy::Project && app.filter.is_empty() {
+            format!(
+                "{n} agent session{} running · press v to list them",
+                if n == 1 { "" } else { "s" }
+            )
+        } else {
+            "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here."
+                .into()
         };
         let hint = Paragraph::new(vec![
             Line::from(""),
             Line::from(msg).centered(),
-            Line::styled(
-                "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here.",
-                dim,
-            )
-            .centered(),
+            Line::styled(sub, dim).centered(),
         ])
         .block(block);
         frame.render_widget(hint, table_area);
@@ -222,27 +241,21 @@ fn detail_line(app: &App) -> Line<'static> {
     match &app.selected {
         Some(Entry::Group(p)) => {
             let members: Vec<&Target> = app.group_members(p);
-            let cpu: f32 = members
-                .iter()
-                .filter(|t| !t.pids.is_empty())
-                .map(|t| t.cpu_pct)
-                .sum();
-            let mem: u64 = members
-                .iter()
-                .filter(|t| !t.pids.is_empty())
-                .map(|t| t.mem_bytes)
-                .sum();
+            let (cpu, mem) = group_usage(app, p);
             // In session view, name the session itself, not just its label.
-            let who = match (
-                app.group_by,
-                members.first().and_then(|t| t.launcher.as_ref()),
-            ) {
+            let who = match (app.group_by, app.group_launcher(p)) {
                 (GroupBy::Session, Some(l)) => format!("{} · ", l.describe()),
                 _ => String::new(),
             };
+            // The agent itself is never part of a kill.
+            let kill = if app.group_agents(p).is_empty() {
+                "K kills all"
+            } else {
+                "K stops its servers"
+            };
             Line::styled(
                 format!(
-                    "  {who}{} · {} services · {:.1}% · {} · K kills all",
+                    "  {who}{} · {} services · {:.1}% · {} · {kill}",
                     p,
                     members.len(),
                     cpu,
@@ -251,6 +264,36 @@ fn detail_line(app: &App) -> Line<'static> {
                 Style::new().fg(Color::Gray),
             )
         }
+        Some(Entry::Agent(_)) => match app.selected_agent() {
+            Some(a) => {
+                let l = a.as_launcher();
+                let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+                let doing = if shells.is_empty() {
+                    "idle".to_string()
+                } else {
+                    format!("running {}", shells.join(", "))
+                };
+                let mut spans = vec![
+                    Span::styled(format!("  {}", l.describe()), launcher_style(&l)),
+                    Span::styled(
+                        format!(
+                            " · {} · {doing} · pids:{}",
+                            a.git_branch.as_deref().unwrap_or("—"),
+                            a.pids.len()
+                        ),
+                        Style::new().fg(Color::Gray),
+                    ),
+                ];
+                if let Some(hint) = l.resume_hint() {
+                    spans.push(Span::styled(
+                        format!(" · {hint}"),
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                Line::from(spans)
+            }
+            None => Line::from(""),
+        },
         _ => match app.selected_target() {
             Some(t) => {
                 let gray = Style::new().fg(Color::Gray);
@@ -311,6 +354,10 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
         ])
     };
     let lines: Vec<Line> = match (&app.selected, app.selected_target()) {
+        (Some(Entry::Agent(_)), _) => match app.selected_agent() {
+            Some(a) => agent_inspect(a, key, val),
+            None => vec![Line::from(" nothing selected")],
+        },
         (_, Some(t)) => {
             // Never render raw argv — args can hold tokens/passwords (a
             // documented invariant). The program path + arg count is enough.
@@ -398,11 +445,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 format!(" {p} (group)"),
                 Style::new().add_modifier(Modifier::BOLD),
             ))];
-            let first = app
-                .group_members(p)
-                .first()
-                .and_then(|t| t.launcher.clone());
-            if let (GroupBy::Session, Some(l)) = (app.group_by, first) {
+            if let (GroupBy::Session, Some(l)) = (app.group_by, app.group_launcher(p)) {
                 let mut spans = vec![
                     Span::styled(" via    ".to_string(), key),
                     Span::styled(l.describe(), launcher_style(&l)),
@@ -427,34 +470,35 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
     Paragraph::new(lines).block(Block::bordered().title(" inspect — i / Esc to close "))
 }
 
+/// A group's cpu/mem: its measurable targets plus (session view) its agent.
+fn group_usage(app: &App, g: &str) -> (f32, u64) {
+    let members = app.group_members(g);
+    let measured = members.iter().filter(|t| !t.pids.is_empty());
+    let agents = app.group_agents(g);
+    (
+        measured.clone().map(|t| t.cpu_pct).sum::<f32>()
+            + agents.iter().map(|a| a.cpu_pct).sum::<f32>(),
+        measured.map(|t| t.mem_bytes).sum::<u64>()
+            + agents.iter().map(|a| a.mem_bytes).sum::<u64>(),
+    )
+}
+
 fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) -> Row<'static> {
     match entry {
         Entry::Group(p) => {
-            let members: Vec<&Target> = app.group_members(p);
-            let cpu: f32 = members
-                .iter()
-                .filter(|t| !t.pids.is_empty())
-                .map(|t| t.cpu_pct)
-                .sum();
-            let mem: u64 = members
-                .iter()
-                .filter(|t| !t.pids.is_empty())
-                .map(|t| t.mem_bytes)
-                .sum();
+            let n = app.group_members(p).len() + app.group_agents(p).len();
+            let (cpu, mem) = group_usage(app, p);
             let arrow = if app.collapsed.contains(p) {
                 "▸"
             } else {
                 "▾"
             };
-            let header_style = match (
-                app.group_by,
-                members.first().and_then(|t| t.launcher.as_ref()),
-            ) {
-                (GroupBy::Session, Some(l)) => launcher_style(l).add_modifier(Modifier::BOLD),
+            let header_style = match (app.group_by, app.group_launcher(p)) {
+                (GroupBy::Session, Some(l)) => launcher_style(&l).add_modifier(Modifier::BOLD),
                 _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             };
             Row::new(vec![
-                Cell::from(group_header_text(arrow, p, members.len())),
+                Cell::from(group_header_text(arrow, p, n)),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format!("{cpu:.1}%")),
@@ -473,7 +517,128 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             Some(t) => target_row(t, false, app),
             None => Row::new(Vec::<Cell>::new()),
         },
+        Entry::Agent(pid) => match app.snapshot.agents.iter().find(|a| a.pid == *pid) {
+            Some(a) => agent_row(a, app),
+            None => Row::new(Vec::<Cell>::new()),
+        },
     }
+}
+
+/// An agent session: under its group header when it has servers, else a row
+/// of its own named by its session label. COMMAND counts its live shells.
+fn agent_row(a: &Agent, app: &App) -> Row<'static> {
+    let label = app
+        .agent_session_of
+        .get(&a.pid)
+        .cloned()
+        .unwrap_or_else(|| a.name.clone());
+    let headed = !app.group_members(&label).is_empty();
+    let l = a.as_launcher();
+    let style = launcher_style(&l);
+    let project = if headed {
+        Cell::from("  ↳")
+    } else {
+        Cell::from(Span::styled(label, style))
+    };
+    let shells = a.shells().count();
+    let mut command = vec![Span::styled(a.name.clone(), style)];
+    if shells > 0 {
+        command.push(Span::styled(
+            format!(" ·{shells} sh"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    Row::new(vec![
+        project,
+        Cell::from(Line::from(command)),
+        Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
+        Cell::from(format!("{:.1}%", a.cpu_pct)),
+        Cell::from(fmt_mem(a.mem_bytes)),
+        Cell::from(Span::styled(
+            a.session
+                .as_deref()
+                .map(|s| s[..s.len().min(8)].to_string())
+                .unwrap_or_else(|| "—".into()),
+            Style::new().fg(Color::DarkGray),
+        )),
+        Cell::from(fmt_uptime(a.start_time)),
+        Cell::from(a.git_branch.clone().unwrap_or_else(|| "—".into())),
+    ])
+}
+
+/// Inspect for an agent session: who/where, how to resume, and what it's
+/// running right now — shells first, then helpers (MCP servers, …).
+fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
+    let kv = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<6} "), key),
+            Span::styled(v, val),
+        ])
+    };
+    let l = a.as_launcher();
+    let cmd = if a.argc > 0 {
+        format!("{} (+{} args)", a.argv0, a.argc)
+    } else {
+        a.argv0.clone()
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" {} session", a.name),
+                launcher_style(&l).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {}", a.project), val),
+        ]),
+        kv("cmd", cmd),
+        kv(
+            "cwd",
+            format!(
+                "{} · {}",
+                tildify(&a.cwd.display().to_string()),
+                a.git_branch.as_deref().unwrap_or("—")
+            ),
+        ),
+        kv(
+            "resume",
+            l.resume_hint()
+                .unwrap_or_else(|| a.session.clone().unwrap_or_else(|| "—".into())),
+        ),
+        kv(
+            "procs",
+            format!(
+                "{} pids · pid {} · up {} · marina never stops agents",
+                a.pids.len(),
+                a.pid,
+                fmt_uptime(a.start_time)
+            ),
+        ),
+    ];
+    if a.children.is_empty() {
+        lines.push(kv("doing", "idle — no shells or helpers".into()));
+    }
+    // room for 5 child lines in the 12-row panel (10 inner, 5 used above)
+    let shown = if a.children.len() <= 5 {
+        a.children.len()
+    } else {
+        4
+    };
+    for c in a.children.iter().take(shown) {
+        let k = if c.shell { "shell" } else { "helper" };
+        lines.push(kv(
+            k,
+            format!(
+                "{} · pid {} · {:.1}% · up {}",
+                c.label,
+                c.pid,
+                c.cpu_pct,
+                fmt_uptime(c.start_time)
+            ),
+        ));
+    }
+    if a.children.len() > shown {
+        lines.push(kv("", format!("+{} more", a.children.len() - shown)));
+    }
+    lines
 }
 
 fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
@@ -618,7 +783,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "/",
             "filter (project · command · port · cwd · branch · via)",
         ),
-        row("v", "group by project / agent session"),
+        row("v", "group by project / agent session (lists agents)"),
         row("K · u", "kill · cancel force-kill"),
         row("R", "restart (output captured to a log)"),
         row("T", "tail logs"),
@@ -789,6 +954,37 @@ mod tests {
         app.filter = "ended".into();
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("worker") && !out.contains("billing-api"));
+    }
+
+    #[test]
+    fn session_view_renders_agent_rows_and_inspect() {
+        use crate::model::Agent;
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        snap.agents = vec![Agent::sample(4242, "41616c1a-c2d3-4845", "marina")];
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        // project view only counts them
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(out.contains("1 agents (v)"), "{out}");
+
+        app.toggle_group_by();
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(out.contains("claude·marina"), "idle agent row is labelled");
+        assert!(out.contains("claude ·1 sh"), "live shells are counted");
+        assert!(out.contains("41616c1a"), "session id in the VIA column");
+
+        app.selected = Some(Entry::Agent(4242));
+        app.toggle_inspect();
+        let out = render_to_string(&mut app, 140, 30);
+        assert!(out.contains("claude session"));
+        assert!(out.contains("claude --resume 41616c1a-c2d3-4845"));
+        assert!(out.contains("shell  cargo test"));
+        assert!(out.contains("helper npm exec chrome-devtools-mcp"));
+        assert!(
+            out.contains("running cargo test"),
+            "detail line says what it's doing"
+        );
     }
 
     #[test]

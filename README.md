@@ -53,13 +53,20 @@ developer-process-centric.
 - **Session view** — press `v` to group by *who started it* instead: one header
   per agent session (`claude·fal-app`, `codex·api`), editor, or terminal, across
   projects. `K` on a session header stops everything that session started.
+- **Agent sessions** — the session view also lists every running coding-agent
+  session (Claude Code, opencode, Codex, …) as a row of its own, even one with
+  no servers: its cpu/mem (agent + MCP helpers), working dir, branch, session
+  id, and the shells it is running a command in right now (`claude ·2 sh`; `i`
+  names them — `cargo test`, `xcodebuild`). Background Claude Code sessions are
+  included; daemons and pty hosts are not. marina never stops an agent: `K` on
+  an agent row explains why, and `K` on its header stops only its servers.
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification
   (`osascript` / `notify-send`; turn off with `[notify] desktop = false`).
 - **Agent/script CLI** — `marina ls --json`, `marina kill <project>`,
-  `marina who 3000` / `marina free 3000`, sharing the exact same resolution
-  engine as the TUI.
+  `marina who 3000` / `marina free 3000`, `marina agents`, sharing the exact
+  same resolution engine as the TUI.
 
 ## Install
 
@@ -121,7 +128,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a project group |
-| `v` | group by project ↔ by agent session / launcher |
+| `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
 | `s` | cycle sort (port / cpu / mem) — or click a column header |
@@ -148,6 +155,7 @@ marina who <port>… [--json]   # what's holding a port — dev target or not
 marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
 marina port [name] [--json]   # a stable, collision-free port for this project/worktree
 marina port --list            # every assigned port · --release [name] gives one back
+marina agents [sel…] [--json] # agent sessions: shells, helpers, servers, resume command
 marina version
 ```
 

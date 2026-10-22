@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::launcher;
-use crate::model::{Anchor, Snapshot, Target, TargetKey, TargetKind};
+use crate::model::{Agent, AgentChild, Anchor, Snapshot, Target, TargetKey, TargetKind};
 use crate::msg::{SamplerCtl, SamplerMsg};
 use crate::resolve;
 use crate::sources::{Netstat2Ports, PortSource, ProcInfo, ProcSource, SysinfoProcs};
@@ -97,8 +97,8 @@ impl Sampler {
         // Docker host-proxy ports found this pass (resolved after the borrow ends).
         let mut docker_ports: HashSet<u16> = HashSet::new();
 
-        // Phase 1: build raw targets (CPU not yet smoothed).
-        let mut targets: Vec<Target> = {
+        // Phase 1: build raw targets and agent sessions (CPU not yet smoothed).
+        let (mut targets, mut agents): (Vec<Target>, Vec<Agent>) = {
             let procs = self.procs.procs();
             let children = child_map(procs);
             // Never list the session marina runs inside (its own ancestor chain:
@@ -287,7 +287,24 @@ impl Sampler {
                     launcher: launcher::find(w.anchor, procs),
                 });
             }
-            out
+
+            // Agent sessions. Everything a target holds is the target's, so an
+            // agent's rollup is only itself plus its shells and helpers.
+            let held: HashSet<u32> = out
+                .iter()
+                .flat_map(|t| t.pids.iter().copied())
+                .chain(claimed)
+                .collect();
+            let agents = build_agents(
+                procs,
+                &children,
+                &held,
+                &self.resolver,
+                &mut root_cache,
+                &mut name_cache,
+                home.as_deref(),
+            );
+            (out, agents)
         };
 
         self.root_cache = root_cache;
@@ -343,7 +360,15 @@ impl Sampler {
         for t in &mut targets {
             t.cpu_pct = self.smooth(&t.anchor, t.cpu_pct);
         }
-        self.prune_ewma(&targets);
+        for a in &mut agents {
+            let anchor = Anchor {
+                pid: a.pid,
+                start_time: a.start_time,
+            };
+            a.cpu_pct = self.smooth(&anchor, a.cpu_pct);
+        }
+        self.prune_ewma(&targets, &agents);
+        link_sessions(&mut targets, &mut agents);
 
         // Canonical order: listeners by port asc, watched after, by project.
         targets.sort_by(|a, b| match (a.ports.first(), b.ports.first()) {
@@ -367,6 +392,7 @@ impl Sampler {
         Snapshot {
             seq: self.seq,
             targets,
+            agents,
             error,
         }
     }
@@ -391,10 +417,11 @@ impl Sampler {
         *e
     }
 
-    fn prune_ewma(&mut self, targets: &[Target]) {
+    fn prune_ewma(&mut self, targets: &[Target], agents: &[Agent]) {
         let live: HashSet<(u32, u64)> = targets
             .iter()
             .map(|t| (t.anchor.pid, t.anchor.start_time))
+            .chain(agents.iter().map(|a| (a.pid, a.start_time)))
             .collect();
         self.ewma.retain(|k, _| live.contains(k));
     }
@@ -425,6 +452,142 @@ fn merge_into(base: &mut Target, extra: Target) {
     base.cpu_pct += extra.cpu_pct;
     base.mem_bytes += extra.mem_bytes;
     base.exposed |= extra.exposed;
+}
+
+/// Every live agent session, with its rollup and direct children. Pids in
+/// `held` (target subtrees) are skipped, and a nested session (an agent run
+/// from another's shell) stops the outer one's walk — it gets its own row.
+fn build_agents(
+    procs: &HashMap<u32, ProcInfo>,
+    children: &HashMap<u32, Vec<u32>>,
+    held: &HashSet<u32>,
+    resolver: &resolve::Resolver,
+    root_cache: &mut RootCache,
+    name_cache: &mut NameCache,
+    home: Option<&Path>,
+) -> Vec<Agent> {
+    let sessions: HashMap<u32, &'static str> = procs
+        .values()
+        .filter_map(|p| launcher::agent_session(p, procs).map(|n| (p.pid, n)))
+        .collect();
+    let mut agents: Vec<Agent> = sessions
+        .iter()
+        .filter_map(|(&pid, &name)| {
+            let p = procs.get(&pid)?;
+            let pids = subtree_until(pid, children, |c| {
+                held.contains(&c) || sessions.contains_key(&c)
+            });
+            let (cpu_pct, mem_bytes) = rollup(&pids, procs);
+            let kids = children.get(&pid).map(Vec::as_slice).unwrap_or_default();
+            let mut agent_children: Vec<AgentChild> = kids
+                .iter()
+                .filter(|c| !held.contains(c) && !sessions.contains_key(c))
+                // a shell hosting a dev server is shown as that server's row
+                .filter(|&&c| !subtree(c, children).iter().any(|d| held.contains(d)))
+                .filter_map(|&c| {
+                    let cp = procs.get(&c)?;
+                    let mut sub = subtree_until(c, children, |d| {
+                        held.contains(&d) || sessions.contains_key(&d)
+                    });
+                    // pipeline order (`marina ls | head` is marina), shell first
+                    sub.sort_by_key(|d| procs.get(d).map(|q| (q.start_time, q.pid)));
+                    let shell = resolve::is_shell(&cp.name);
+                    let (label, _) = resolver.label_and_url(&subtree_argvs(&sub, procs), None);
+                    let label = match (launcher::classify(cp), launcher::plumbing(cp)) {
+                        // `claude daemon`, not just `claude`
+                        (Some((_, agent)), Some(sub)) => {
+                            format!("{agent} {}", sub.trim_start_matches('-'))
+                        }
+                        _ if resolve::is_shell(&label) => "shell".into(),
+                        _ => label,
+                    };
+                    let cpu_pct = sub
+                        .iter()
+                        .filter_map(|d| procs.get(d))
+                        .map(|d| d.cpu_pct)
+                        .sum();
+                    Some(AgentChild {
+                        pid: c,
+                        start_time: cp.start_time,
+                        label,
+                        shell,
+                        cpu_pct,
+                    })
+                })
+                .collect();
+            // shells first, newest first: what it's doing right now
+            agent_children
+                .sort_by(|a, b| b.shell.cmp(&a.shell).then(b.start_time.cmp(&a.start_time)));
+            // The session id its children were handed, else its own argv. The
+            // newest child wins: a session id changes on /clear or resume, and
+            // older helpers keep the id they were started with.
+            let newest_marked = |ok: &dyn Fn(&ProcInfo) -> bool| {
+                procs
+                    .values()
+                    .filter(|q| ok(q))
+                    .filter_map(|q| Some((q.start_time, q.pid, q.agent.as_ref()?)))
+                    .filter(|(_, _, e)| e.agent.as_deref() == Some(name) && e.session.is_some())
+                    .max_by_key(|(start, pid, _)| (*start, *pid))
+                    .and_then(|(_, _, e)| e.session.clone())
+            };
+            let session = newest_marked(&|q| q.agent.as_ref().is_some_and(|e| e.pid == Some(pid)))
+                .or_else(|| newest_marked(&|q| pids.contains(&q.pid)))
+                .or_else(|| launcher::session_from_argv(&p.argv));
+            let cwd = p.cwd.clone().unwrap_or_default();
+            let root = p.cwd.as_deref().and_then(|c| root_of(c, root_cache, home));
+            let project = if root.is_none() && home == Some(cwd.as_path()) {
+                "~".to_string()
+            } else {
+                project_name(root.as_deref(), &cwd, name_cache)
+            };
+            Some(Agent {
+                name: name.into(),
+                pid,
+                start_time: p.start_time,
+                session,
+                git_branch: root.as_deref().and_then(resolve::git_branch),
+                cwd,
+                project,
+                argv0: p.argv.first().cloned().unwrap_or_else(|| p.name.clone()),
+                argc: p.argv.len().saturating_sub(1),
+                pids,
+                cpu_pct,
+                mem_bytes,
+                children: agent_children,
+            })
+        })
+        .collect();
+    agents.sort_by_key(|a| (a.start_time, a.pid));
+    agents
+}
+
+/// Share session ids between agents and the servers they launched, by pid:
+/// the live parent chain names an agent's pid but not its session, while env
+/// markers / argv may give the agent one. Both sides then group and resume
+/// alike.
+fn link_sessions(targets: &mut [Target], agents: &mut [Agent]) {
+    for a in agents.iter_mut().filter(|a| a.session.is_none()) {
+        a.session = targets
+            .iter()
+            .filter_map(|t| t.launcher.as_ref())
+            .find(|l| l.pid == Some(a.pid) && l.alive && l.name == a.name)
+            .and_then(|l| l.session.clone());
+    }
+    for t in targets.iter_mut() {
+        let Some(l) = t
+            .launcher
+            .as_mut()
+            .filter(|l| l.session.is_none() && l.alive)
+        else {
+            continue;
+        };
+        if let Some(a) = agents
+            .iter()
+            .find(|a| Some(a.pid) == l.pid && a.name == l.name)
+        {
+            l.session = a.session.clone();
+        }
+    }
 }
 
 /// Spawn the sampler thread; returns the snapshot channel the UI drains and a
@@ -592,6 +755,15 @@ fn climb(start: u32, procs: &HashMap<u32, ProcInfo>, root: Option<&Path>) -> u32
 
 /// Anchor + all descendants.
 fn subtree(anchor: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    subtree_until(anchor, children, |_| false)
+}
+
+/// Anchor + descendants, not entering (or counting) any child `stop` accepts.
+fn subtree_until(
+    anchor: u32,
+    children: &HashMap<u32, Vec<u32>>,
+    stop: impl Fn(u32) -> bool,
+) -> Vec<u32> {
     let mut seen: HashSet<u32> = HashSet::new();
     seen.insert(anchor);
     let mut out = vec![anchor];
@@ -599,7 +771,7 @@ fn subtree(anchor: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
     while let Some(n) = stack.pop() {
         if let Some(kids) = children.get(&n) {
             for &k in kids {
-                if seen.insert(k) {
+                if !stop(k) && seen.insert(k) {
                     // skip already-seen pids (cycle / shared child guard)
                     out.push(k);
                     stack.push(k);
@@ -959,6 +1131,123 @@ mod tests {
         let procs = vec![proc(50, Some(1), "rapportd", "/", &["/usr/sbin/rapportd"])];
         let mut s = sampler_with(vec![listener(50555, 50)], procs);
         assert_eq!(s.build().targets.len(), 0);
+    }
+
+    #[test]
+    fn build_lists_agent_sessions_apart_from_their_servers() {
+        use crate::launcher::AgentEnv;
+        let marked = |mut p: ProcInfo, session: &str| {
+            p.agent = Some(AgentEnv {
+                agent: Some("claude".into()),
+                pid: Some(900_100),
+                session: Some(session.into()),
+            });
+            p
+        };
+        let mut old_helper = marked(
+            proc(
+                900_102,
+                Some(900_100),
+                "node",
+                "/Users/me/app",
+                &["node", "/x/mcp.js"],
+            ),
+            "old-session",
+        );
+        old_helper.start_time = 10;
+        let mut shell = marked(
+            proc(
+                900_103,
+                Some(900_100),
+                "zsh",
+                "/Users/me/app",
+                &["/bin/zsh", "-c", "cargo test"],
+            ),
+            "new-session",
+        );
+        shell.start_time = 20;
+        let mut cargo = proc(
+            900_104,
+            Some(900_103),
+            "cargo",
+            "/Users/me/app",
+            &["cargo", "test"],
+        );
+        cargo.start_time = 21;
+        let procs = vec![
+            proc(900_100, Some(1), "claude", "/Users/me/app", &["claude"]),
+            old_helper,
+            shell,
+            cargo,
+            // a dev server the agent started (via a shell)
+            proc(
+                900_105,
+                Some(900_100),
+                "zsh",
+                "/Users/me/app",
+                &["/bin/zsh", "-c", "vite"],
+            ),
+            proc(
+                900_106,
+                Some(900_105),
+                "node",
+                "/Users/me/app",
+                &["node", "/x/.bin/vite"],
+            ),
+            // plumbing is not a session
+            proc(
+                900_200,
+                Some(1),
+                "claude",
+                "/Users/me",
+                &["claude", "daemon", "run"],
+            ),
+        ];
+        let snap = sampler_with(vec![listener(5173, 900_106)], procs).build();
+
+        assert_eq!(snap.agents.len(), 1, "one session, no plumbing");
+        let a = &snap.agents[0];
+        assert_eq!(
+            (a.name.as_str(), a.pid, a.project.as_str()),
+            ("claude", 900_100, "app")
+        );
+        // the newest marked child names the current session (ids change on /clear)
+        assert_eq!(a.session.as_deref(), Some("new-session"));
+        // the server is the target's, not the agent's
+        let server = &snap.targets[0];
+        assert!(server.pids.contains(&900_106));
+        assert!(!a.pids.contains(&900_106));
+        assert!(
+            a.pids.contains(&900_104),
+            "a shell's command is the agent's"
+        );
+        let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+        assert_eq!(shells, vec!["cargo"]);
+        assert!(a.children.iter().any(|c| !c.shell && c.pid == 900_102));
+        // the live chain names the agent's pid; the session is shared back
+        let l = server.launcher.as_ref().unwrap();
+        assert_eq!(
+            (l.pid, l.session.as_deref()),
+            (Some(900_100), Some("new-session"))
+        );
+    }
+
+    #[test]
+    fn link_sessions_fills_whichever_side_is_missing_it() {
+        let mut agents = vec![crate::model::Agent::sample(77, "s", "app")];
+        agents[0].session = None;
+        let mut targets = Snapshot::sample().targets;
+        targets[0].launcher = Some(crate::launcher::Launcher {
+            kind: crate::launcher::LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(77),
+            alive: true,
+            session: Some("from-env".into()),
+            cwd: None,
+            start_time: 0,
+        });
+        link_sessions(&mut targets, &mut agents);
+        assert_eq!(agents[0].session.as_deref(), Some("from-env"));
     }
 
     #[test]
