@@ -347,7 +347,7 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
         } else {
             doing.join(" · ")
         };
-        let doing = match a.host.as_ref().and_then(|h| h.title.as_ref()) {
+        let doing = match a.title() {
             Some(t) => format!("{doing} — {t}"),
             None => doing,
         };
@@ -361,7 +361,7 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
             fmt_uptime(a.start_time),
             a.session
                 .as_deref()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::launcher::short_id(s, 8))
                 .unwrap_or("—"),
             a.git.map(|g| g.short()).unwrap_or_else(|| "—".into()),
         );
@@ -1162,7 +1162,7 @@ impl AgentJson {
                     ports: t.ports.clone(),
                 })
                 .collect(),
-            title: a.host.as_ref().and_then(|h| h.title.clone()),
+            title: a.title().map(String::from),
             host: a.host.as_ref().map(|h| HostJson {
                 kind: h.kind.as_str(),
                 target: h.target.clone(),

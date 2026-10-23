@@ -57,6 +57,8 @@ pub struct Sampler {
     docker_cache: Option<(Instant, HashMap<u16, crate::docker::ContainerPort>)>,
     /// Multiplexer panes agents run in (herdr, tmux).
     hosts: crate::hosts::Hosts,
+    /// opencode session ids, asked of its background service.
+    opencode: crate::opencode::Sessions,
     /// Agents' working-tree status.
     git: crate::git::Cache,
     home: Option<PathBuf>,
@@ -77,6 +79,7 @@ impl Sampler {
             name_cache: HashMap::new(),
             docker_cache: None,
             hosts: Default::default(),
+            opencode: Default::default(),
             git: Default::default(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             last_topology: Vec::new(),
@@ -318,6 +321,7 @@ impl Sampler {
                     a.session = Some(s);
                 }
             }
+            self.opencode.fill(procs, &mut agents);
             (out, agents)
         };
 
@@ -585,6 +589,7 @@ fn build_agents(
                 tty: None, // filled with host + git after the procs borrow
                 host: None,
                 git: None,
+                title: None,
             })
         })
         .collect();
@@ -1004,6 +1009,7 @@ mod tests {
             name_cache: HashMap::new(),
             docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
             hosts: Default::default(),
+            opencode: Default::default(),
             git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),
             last_topology: Vec::new(),

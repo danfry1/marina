@@ -68,14 +68,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let agents = match (app.snapshot.agents.len(), app.group_by) {
         (0, _) => String::new(),
-        (n, _) => {
-            let mem: u64 = app.snapshot.agents.iter().map(|a| a.mem_bytes).sum();
-            format!(" · {n} agents {}", fmt_mem(mem))
-        }
+        (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
+    // an agent's service is counted with the agents, not as a dev server
+    let targets = app.snapshot.targets.len() - app.agent_services().count();
     let title = format!(
-        " marina · {} targets{agents} · sort:{}{} ",
-        app.snapshot.targets.len(),
+        " marina · {targets} targets{agents} · sort:{}{} ",
         app.sort.label(),
         match app.group_by {
             GroupBy::Project => "",
@@ -271,6 +269,11 @@ fn detail_line(app: &App) -> Line<'static> {
         Some(Entry::Agents) => {
             let (working, stale, _, mem) = agents_summary(app);
             let n = app.snapshot.agents.len();
+            let services = match app.agent_services().count() {
+                0 => String::new(),
+                1 => " · 1 service".into(),
+                k => format!(" · {k} services"),
+            };
             let stale_mem: u64 = app
                 .snapshot
                 .agents
@@ -280,7 +283,7 @@ fn detail_line(app: &App) -> Line<'static> {
                 .sum();
             Line::styled(
                 format!(
-                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
+                    "  {n} agent sessions{services} · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
                     fmt_mem(stale_mem),
                     fmt_mem(mem)
                 ),
@@ -294,7 +297,7 @@ fn detail_line(app: &App) -> Line<'static> {
                 let gray = Style::new().fg(Color::Gray);
                 let mut spans = Vec::new();
                 // the task title (from the host) says more than anything else
-                if let Some(t) = a.host.as_ref().and_then(|h| h.title.as_ref()) {
+                if let Some(t) = a.title() {
                     spans.push(Span::styled(
                         format!("  {t} · "),
                         Style::new().fg(Color::White).add_modifier(Modifier::ITALIC),
@@ -578,8 +581,11 @@ fn agents_summary(app: &App) -> (usize, usize, f32, u64) {
     (
         agents.iter().filter(|a| a.is_working(now)).count(),
         agents.iter().filter(|a| a.is_stale(now)).count(),
-        agents.iter().map(|a| a.cpu_pct).sum(),
-        agents.iter().map(|a| a.mem_bytes).sum(),
+        // their background services count toward what agents cost
+        agents.iter().map(|a| a.cpu_pct).sum::<f32>()
+            + app.agent_services().map(|t| t.cpu_pct).sum::<f32>(),
+        agents.iter().map(|a| a.mem_bytes).sum::<u64>()
+            + app.agent_services().map(|t| t.mem_bytes).sum::<u64>(),
     )
 }
 
@@ -679,7 +685,7 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         Cell::from(Span::styled(
             a.session
                 .as_deref()
-                .map(|s| s[..s.len().min(8)].to_string())
+                .map(|s| crate::launcher::short_id(s, 8).to_string())
                 .unwrap_or_else(|| "—".into()),
             Style::new().fg(Color::DarkGray),
         )),
@@ -745,7 +751,7 @@ fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'stat
         ),
         Span::styled(format!(" · {}", a.project), val),
     ];
-    if let Some(t) = a.host.as_ref().and_then(|h| h.title.as_ref()) {
+    if let Some(t) = a.title() {
         head.push(Span::styled(
             format!(" — {t}"),
             Style::new().add_modifier(Modifier::ITALIC),
@@ -828,7 +834,13 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         Some(p) => format!(":{p}"),
         None => "—".into(),
     };
-    let project_text = if indent {
+    let service = indent
+        .then(|| crate::launcher::agent_service(&t.anchor_argv))
+        .flatten();
+    let project_text = if let Some(agent) = service {
+        // in the agents section: whose service it is
+        format!("  {agent}·service")
+    } else if indent {
         "  ↳".to_string()
     } else {
         match t.kind {

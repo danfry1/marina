@@ -103,7 +103,9 @@
   (daemons, pty hosts, `app-server`, `serve`). *Not a Target* (ADR 0004): no
   verb, selector or scope reaches it. Its **shells** are the direct children
   running a command now; its **helpers** are the long-lived ones (MCP servers).
-  Listed in session view and by `marina agents`.
+  Listed in session view and by `marina agents`. Its plumbing that holds a
+  port (`opencode serve`) is still a Target — an **agent service** — but the
+  project view lists it in the agents section.
 
 - **Host** — the multiplexer an agent session's terminal runs in, when marina
   can drive it (herdr, tmux). Jump target, and for herdr a source of the

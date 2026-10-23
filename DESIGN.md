@@ -496,7 +496,13 @@ after targets:
   (`CLAUDE_PID`), else the newest marked descendant — ids change on `/clear`
   and resume, and older helpers keep the id they started with — else the
   agent's argv (`--session-id`, `--resume`, `--session`, `resume <id>`,
-  validated). `link_sessions` then shares ids by pid in both directions with
+  validated). opencode keeps its id in its background service instead, so
+  for an opencode session with none, `opencode::Sessions` asks that service
+  (`opencode session list --format json` in the session's directory, only
+  while `opencode serve --service` is already running, cached 10s) and pairs
+  newest session with newest process, a session going only to a process
+  started before it was last updated; the list's title fills the task title
+  when no host reports one. `link_sessions` then shares ids by pid in both directions with
   the targets the agent launched, so a session and its servers group together
   and both show the resume command.
 

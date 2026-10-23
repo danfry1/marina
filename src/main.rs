@@ -10,6 +10,7 @@ mod launcher;
 mod logs;
 mod model;
 mod msg;
+mod opencode;
 mod ports;
 mod resolve;
 mod sampler;

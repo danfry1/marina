@@ -912,19 +912,34 @@ impl App {
 
     // --- layout -------------------------------------------------------------
 
+    /// Agents' background services among the targets (see `is_agent_service`).
+    pub(crate) fn agent_services(&self) -> impl Iterator<Item = &Target> {
+        self.snapshot.targets.iter().filter(|t| is_agent_service(t))
+    }
+
     /// Group targets by project, sort groups + members by the active mode, and
     /// flatten to visible entries (collapsing folded groups). Volatile sorts
     /// freeze for `FREEZE` after a keystroke.
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
         let targets = &self.snapshot.targets;
         let agents = &self.snapshot.agents;
-        let visible: Vec<usize> = (0..targets.len())
+        let mut visible: Vec<usize> = (0..targets.len())
             .filter(|&i| self.matches(&targets[i]))
             .collect();
+        // Project view: agents' background services sit with the agents.
+        let services: Vec<usize> = match self.group_by {
+            GroupBy::Project => visible
+                .iter()
+                .copied()
+                .filter(|&i| is_agent_service(&targets[i]))
+                .collect(),
+            GroupBy::Session => Vec::new(),
+        };
+        visible.retain(|i| !services.contains(i));
         let visible_agents: Vec<usize> = (0..agents.len())
             .filter(|&i| self.matches_agent(&agents[i]))
             .collect();
-        if visible.is_empty() && visible_agents.is_empty() {
+        if visible.is_empty() && visible_agents.is_empty() && services.is_empty() {
             return Vec::new();
         }
         // working, then idle, then stale; alphabetical within each
@@ -1045,7 +1060,7 @@ impl App {
                 }
             }
         }
-        if !section.is_empty() {
+        if !section.is_empty() || !services.is_empty() {
             entries.push(Entry::Agents);
             // a filter that hits an agent opens the section
             if self.agents_open || !self.filter.is_empty() {
@@ -1056,6 +1071,11 @@ impl App {
                         .then_with(|| agent_label(a).cmp(agent_label(b)))
                 });
                 entries.extend(section.iter().map(|&i| Entry::Agent(agents[i].pid)));
+                entries.extend(
+                    services
+                        .iter()
+                        .map(|&i| Entry::Member(targets[i].key.clone())),
+                );
             }
         }
 
@@ -1141,7 +1161,7 @@ pub(crate) fn session_groups(
     let label = |l: Option<&Launcher>| {
         let (base, id) = base_and_id(l);
         if ids[&base].len() > 1 && !id.is_empty() {
-            format!("{base} #{}", &id[..id.len().min(4)])
+            format!("{base} #{}", crate::launcher::short_id(&id, 4))
         } else {
             base
         }
@@ -1226,6 +1246,12 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
     }
+}
+
+/// A target that is an agent's background service (`opencode serve`), which
+/// the project view lists in the agents section rather than as a project.
+pub(crate) fn is_agent_service(t: &Target) -> bool {
+    crate::launcher::agent_service(&t.anchor_argv).is_some()
 }
 
 #[cfg(test)]
@@ -1358,6 +1384,38 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("2 servers left running by ended agent sessions"));
+    }
+
+    #[test]
+    fn agent_services_sit_in_the_agents_section() {
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let mut svc = snap.targets[0].clone();
+        svc.key = TargetKey::Port(49374);
+        svc.ports = vec![49374];
+        svc.project = "opencode".into();
+        svc.anchor_argv = vec![
+            "/opt/homebrew/bin/opencode".into(),
+            "serve".into(),
+            "--service".into(),
+        ];
+        snap.targets.push(svc);
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let e = app.compute_entries();
+        let svc = TargetKey::Port(49374);
+        assert!(
+            !e.contains(&Entry::Target(svc.clone())),
+            "not a project: {e:?}"
+        );
+        assert_eq!(
+            e.last(),
+            Some(&Entry::Agents),
+            "a section even without sessions"
+        );
+        assert_eq!(app.agent_services().count(), 1);
+        app.agents_open = true;
+        assert_eq!(app.compute_entries().last(), Some(&Entry::Member(svc)));
     }
 
     #[test]

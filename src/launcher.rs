@@ -79,7 +79,7 @@ impl Launcher {
         if self.kind == LauncherKind::Detached {
             return "detached (its launching shell exited)".into();
         }
-        let short_session = self.session.as_deref().map(|s| &s[..s.len().min(8)]);
+        let short_session = self.session.as_deref().map(|s| short_id(s, 8));
         if self.is_orphaned() {
             return match short_session {
                 Some(s) => format!("{} (session {s} ended)", self.name),
@@ -227,6 +227,13 @@ impl AgentEnv {
 
 /// Session/thread ids: `219af9f5-…` (Claude, Codex), `ses_3b0f…` (opencode),
 /// `T-…` (Amp). Anything else is dropped rather than displayed.
+/// The first `n` characters of a session id that tell it apart: opencode's
+/// shared `ses_` prefix is skipped.
+pub fn short_id(id: &str, n: usize) -> &str {
+    let id = id.strip_prefix("ses_").unwrap_or(id);
+    &id[..id.len().min(n)]
+}
+
 pub fn is_session_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 80
@@ -429,6 +436,27 @@ pub fn plumbing(p: &ProcInfo) -> Option<&'static str> {
         .skip(skip)
         .take(2)
         .find_map(|a| AGENT_PLUMBING.iter().copied().find(|&k| k == a))
+}
+
+/// An agent's background service — `opencode serve`, Claude Code's daemon —
+/// from its command line: which agent it serves. Such a process can hold a
+/// port, but it belongs with the agent sessions, not the dev servers.
+pub fn agent_service(argv: &[String]) -> Option<&'static str> {
+    let p = ProcInfo {
+        pid: 0,
+        ppid: None,
+        name: argv.first().map(|a| basename(a).to_string())?,
+        argv: argv.to_vec(),
+        cwd: None,
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        start_time: 0,
+        agent: None,
+    };
+    match classify(&p) {
+        Some((LauncherKind::Agent, name)) => plumbing(&p).map(|_| name),
+        _ => None,
+    }
 }
 
 /// A session id from the agent's own command line: `--session-id <id>`
@@ -897,6 +925,30 @@ mod tests {
             p(20, 10, "node", &["node", "vite"]),
         ]);
         assert!(find(20, &procs).is_none());
+    }
+
+    #[test]
+    fn short_ids_skip_the_opencode_prefix() {
+        assert_eq!(short_id("ses_e97f0d992ffeb9", 8), "e97f0d99");
+        assert_eq!(short_id("41616c1a-c2d3", 8), "41616c1a");
+        assert_eq!(short_id("ab", 8), "ab");
+    }
+
+    #[test]
+    fn agent_services_are_plumbing_of_an_agent_binary() {
+        let a = |v: &[&str]| agent_service(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            a(&[
+                "/opt/homebrew/Cellar/opencode/2.0.24/bin/opencode",
+                "serve",
+                "--service"
+            ]),
+            Some("opencode")
+        );
+        assert_eq!(a(&["claude", "daemon"]), Some("claude"));
+        assert_eq!(a(&["opencode"]), None, "a session, not a service");
+        assert_eq!(a(&["node", "server.js", "serve"]), None, "not an agent");
+        assert_eq!(a(&[]), None);
     }
 
     #[test]

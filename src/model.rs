@@ -89,6 +89,9 @@ pub struct Agent {
     pub host: Option<crate::hosts::HostInfo>,
     /// Its working tree: uncommitted / untracked / unpushed work.
     pub git: Option<crate::git::GitStatus>,
+    /// The session's task title from the agent itself (opencode), when no
+    /// host reports one.
+    pub title: Option<String>,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -124,6 +127,14 @@ impl Agent {
             cwd: Some(self.cwd.clone()),
             start_time: self.start_time,
         }
+    }
+
+    /// The session's task title: the host's (herdr), else the agent's own.
+    pub fn title(&self) -> Option<&str> {
+        self.host
+            .as_ref()
+            .and_then(|h| h.title.as_deref())
+            .or(self.title.as_deref())
     }
 
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
@@ -229,6 +240,7 @@ impl Agent {
             tty: None,
             host: None,
             git: None,
+            title: None,
         }
     }
 }
