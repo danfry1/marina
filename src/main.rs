@@ -6,6 +6,7 @@ mod docker;
 mod exec;
 mod git;
 mod hosts;
+mod launch;
 mod launcher;
 mod logs;
 mod model;
@@ -116,6 +117,26 @@ fn run(
                     if app.help_open() {
                         // Any key dismisses the help overlay.
                         app.close_help();
+                    } else if app.is_new_session() {
+                        // `N`: the first prompt for a new session
+                        match key.code {
+                            KeyCode::Esc => app.new_cancel(),
+                            KeyCode::Tab => app.new_toggle_worktree(),
+                            KeyCode::Enter => {
+                                if let Some((req, place)) = app.new_commit() {
+                                    let ev = ev_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let msg = launch::start(&req, place).unwrap_or_else(|e| e);
+                                        let _ = ev.send(UiEvent::Status(msg));
+                                    });
+                                }
+                            }
+                            KeyCode::Backspace => app.new_backspace(),
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.new_push(c)
+                            }
+                            _ => {}
+                        }
                     } else if app.is_replying() {
                         // The reply box captures keystrokes until Enter/Esc.
                         match key.code {
@@ -142,6 +163,9 @@ fn run(
                             _ => {}
                         }
                     } else {
+                        if key.code != KeyCode::Char('X') {
+                            app.clear_pending_end();
+                        }
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
@@ -151,6 +175,16 @@ fn run(
                             KeyCode::Enter if app.selected_agent().is_some() => {
                                 verb_jump(app, &ev_tx)
                             }
+                            // an ended session (inbox): resume it
+                            KeyCode::Enter if app.is_ended_selected() => {
+                                if let Some((req, place)) = app.resume_selected() {
+                                    let ev = ev_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let msg = launch::start(&req, place).unwrap_or_else(|e| e);
+                                        let _ = ev.send(UiEvent::Status(msg));
+                                    });
+                                }
+                            }
                             KeyCode::Enter => app.toggle_collapse(),
                             KeyCode::Char('D') => verb_diff(app),
                             KeyCode::Char('/') => app.start_filter(),
@@ -159,6 +193,11 @@ fn run(
                             KeyCode::Char('p') => app.toggle_preview(),
                             KeyCode::Char('a') => app.toggle_inbox(),
                             KeyCode::Char('r') => app.start_reply(),
+                            KeyCode::Char('N') => app.start_new(),
+                            KeyCode::Char('X') => {
+                                let action = app.end_session();
+                                run_action(app, action, &ev_tx);
+                            }
                             KeyCode::Char(c @ '1'..='9') if app.selected_agent().is_some() => {
                                 app.quick_reply(c as usize - '0' as usize)
                             }

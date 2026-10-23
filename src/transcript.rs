@@ -54,7 +54,26 @@ pub struct Summary {
     /// (input + cache read + cache write), and that message's model.
     pub context_tokens: Option<u64>,
     pub model: Option<String>,
+    /// The session's working directory, as its newest record says.
+    pub cwd: Option<PathBuf>,
 }
+
+/// A Claude Code session that has exited but could be resumed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ended {
+    pub id: String,
+    /// When its transcript was last written: roughly when it ended.
+    pub at: u64,
+    pub cwd: PathBuf,
+    pub summary: Summary,
+}
+
+/// Ended sessions listed: the most recent this many…
+const ENDED_MAX: usize = 8;
+/// …from this far back…
+const ENDED_WITHIN: u64 = 2 * 86_400;
+/// …looked for at most this often.
+const ENDED_EVERY: Duration = Duration::from_secs(30);
 
 /// The transcript tail, newest record first. Lines are filtered by their
 /// type before parsing: request blobs can be hundreds of kilobytes each.
@@ -81,6 +100,9 @@ pub fn parse_tail(text: &str) -> Summary {
         }
         if s.updated.is_none() {
             s.updated = v["timestamp"].as_str().and_then(parse_ts);
+        }
+        if s.cwd.is_none() {
+            s.cwd = v["cwd"].as_str().map(PathBuf::from);
         }
         if !turn_known && matches!(kind, Some("user" | "assistant" | "system")) {
             turn_known = true;
@@ -265,7 +287,19 @@ fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
         updated: s.updated.or(wide.updated),
         context_tokens: s.context_tokens.or(wide.context_tokens),
         model: s.model.or(wide.model),
+        cwd: s.cwd.or(wide.cwd),
     })
+}
+
+/// The first `cwd` a transcript records: where its session started.
+fn first_cwd(path: &Path) -> Option<PathBuf> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(64 * 1024).read_to_end(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["cwd"].as_str().map(PathBuf::from))
 }
 
 fn claude_dir() -> Option<PathBuf> {
@@ -286,6 +320,8 @@ struct Entry {
 #[derive(Default)]
 pub struct Cache {
     entries: HashMap<String, Entry>,
+    /// The last look for ended sessions, and what it found.
+    ended: Option<(Instant, Vec<Ended>)>,
 }
 
 impl Cache {
@@ -319,9 +355,121 @@ impl Cache {
         Some(summary)
     }
 
-    /// Forget sessions not in `live`.
+    /// Forget sessions not in `live` (nor listed as ended).
     pub fn retain(&mut self, live: &[&str]) {
-        self.entries.retain(|id, _| live.contains(&id.as_str()));
+        let ended: Vec<String> = self
+            .ended
+            .iter()
+            .flat_map(|(_, e)| e.iter().map(|e| e.id.clone()))
+            .collect();
+        self.entries
+            .retain(|id, _| live.contains(&id.as_str()) || ended.contains(id));
+    }
+
+    /// Recently exited Claude Code sessions, newest first: transcripts
+    /// written in the last two days whose session isn't running. `busy_dirs`
+    /// are directories with a running session marina couldn't identify —
+    /// a transcript there may be its, so it isn't offered for resuming.
+    pub fn ended(&mut self, live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
+        if let Some((at, found)) = &self.ended {
+            if at.elapsed() < ENDED_EVERY {
+                return found
+                    .iter()
+                    .filter(|e| !live.contains(&e.id.as_str()))
+                    .cloned()
+                    .collect();
+            }
+        }
+        let now = SystemTime::now();
+        let mut recent: Vec<(String, PathBuf, u64)> = Vec::new();
+        if let Some(projects) = claude_dir().map(|d| d.join("projects")) {
+            for dir in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+                for f in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let p = f.path();
+                    let Some(id) = p
+                        .file_stem()
+                        .filter(|_| p.extension().is_some_and(|x| x == "jsonl"))
+                        .and_then(|s| s.to_str())
+                        .filter(|id| crate::launcher::is_session_id(id) && !live.contains(id))
+                    else {
+                        continue;
+                    };
+                    let Some(mtime) = f.metadata().ok().and_then(|m| m.modified().ok()) else {
+                        continue;
+                    };
+                    let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+                    // written in the last minute: likely still running
+                    if (60..=ENDED_WITHIN).contains(&age) {
+                        let at = mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        recent.push((id.to_string(), p, at));
+                    }
+                }
+            }
+        }
+        recent.sort_by_key(|r| std::cmp::Reverse(r.2));
+        let mut found = Vec::new();
+        // bounded work per scan, and unchanged files aren't re-read
+        for (id, path, at) in recent.into_iter().take(ENDED_MAX * 2) {
+            if found.len() == ENDED_MAX {
+                break;
+            }
+            let stamp = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len())));
+            let cached = self
+                .entries
+                .get(&id)
+                .filter(|e| Some(e.stamp) == stamp)
+                .map(|e| e.summary.clone());
+            let summary = match cached {
+                Some(s) => s,
+                None => {
+                    let Some(mut s) = summarize(&path, None) else {
+                        continue;
+                    };
+                    // resume looks the session up from the directory it
+                    // started in: the transcript's first recorded cwd
+                    s.cwd = first_cwd(&path).or(s.cwd);
+                    if let Some(stamp) = stamp {
+                        self.entries.insert(
+                            id.clone(),
+                            Entry {
+                                path: path.clone(),
+                                stamp,
+                                read_at: Instant::now(),
+                                summary: s.clone(),
+                            },
+                        );
+                    }
+                    s
+                }
+            };
+            // only sessions that said something, in a directory that's still
+            // there and isn't busy with an unidentified session
+            let Some(cwd) = summary
+                .cwd
+                .clone()
+                .filter(|c| c.is_absolute() && c.is_dir() && !busy_dirs.contains(c))
+                .filter(|_| summary.last_reply.is_some())
+            else {
+                continue;
+            };
+            found.push(Ended {
+                id,
+                at,
+                cwd,
+                summary,
+            });
+        }
+        self.ended = Some((Instant::now(), found.clone()));
+        found
     }
 }
 

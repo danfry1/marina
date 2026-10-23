@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use super::control::PreviewMode;
 use super::format::{fmt_age, tildify, unix_now};
-use super::state::App;
+use super::state::{App, Entry};
 use crate::model::Agent;
 
 const KEY: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
@@ -110,18 +110,15 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let now = unix_now();
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let selected = match &app.selected {
-        Some(super::state::Entry::Agent(pid)) => Some(*pid),
-        _ => None,
-    };
-    // (lines, pid) per row; headings and gaps have no pid
-    let mut rows: Vec<(Line<'static>, Option<u32>)> = Vec::new();
+    let selected = app.selected.clone();
+    // (line, entry) per row; headings and gaps have none
+    let mut rows: Vec<(Line<'static>, Option<Entry>)> = Vec::new();
     let mut group = "";
     let pids: Vec<u32> = app
         .display
         .iter()
         .filter_map(|e| match e {
-            super::state::Entry::Agent(p) => Some(*p),
+            Entry::Agent(p) => Some(*p),
             _ => None,
         })
         .collect();
@@ -139,8 +136,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .agents
                 .iter()
                 .filter(|x| {
-                    app.display.contains(&super::state::Entry::Agent(x.pid))
-                        && group_of(app, x, now) == g
+                    app.display.contains(&Entry::Agent(x.pid)) && group_of(app, x, now) == g
                 })
                 .count();
             let style = if g == "NEEDS YOU" {
@@ -151,7 +147,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             rows.push((Line::styled(format!(" {g} · {n}"), style), None));
             group = g;
         }
-        let sel = selected == Some(pid);
+        let sel = selected == Some(Entry::Agent(pid));
         let label = short_label(app, a);
         let ago = match a.last_active() {
             0 => String::new(),
@@ -209,14 +205,78 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             (l1, l2)
         };
-        rows.push((l1, Some(pid)));
-        rows.push((l2, Some(pid)));
+        rows.push((l1, Some(Entry::Agent(pid))));
+        rows.push((l2, Some(Entry::Agent(pid))));
+    }
+
+    // sessions that exited lately: dim cards, Enter resumes
+    let ended: Vec<&crate::transcript::Ended> = app
+        .display
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Ended(id) => app.snapshot.ended.iter().find(|x| &x.id == id),
+            _ => None,
+        })
+        .collect();
+    if !ended.is_empty() {
+        if !rows.is_empty() {
+            rows.push((Line::raw(""), None));
+        }
+        rows.push((
+            Line::styled(format!(" ENDED · {} · Enter resumes", ended.len()), DIM),
+            None,
+        ));
+    }
+    for e in ended {
+        let entry = Entry::Ended(e.id.clone());
+        let sel = selected.as_ref() == Some(&entry);
+        let bar = if sel { "▌" } else { " " };
+        let label = e
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ago = fmt_age(now.saturating_sub(e.at));
+        let title = e.summary.title.clone().unwrap_or_default();
+        let fixed = 4 + label.chars().count() + 2 + ago.chars().count() + 1;
+        let title = clip(&title, inner_w.saturating_sub(fixed));
+        let pad = inner_w.saturating_sub(fixed + title.chars().count());
+        let l1 = Line::from(vec![
+            Span::styled(bar, Style::new().fg(Color::Magenta)),
+            Span::styled(" ◌ ", DIM),
+            Span::styled(label, Style::new().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(title, DIM),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(ago, DIM),
+            Span::raw(" "),
+        ]);
+        let said = e
+            .summary
+            .recap
+            .as_deref()
+            .or(e.summary.last_reply.as_deref())
+            .map(first_sentence)
+            .unwrap_or_default();
+        let l2 = Line::from(vec![
+            Span::styled(bar, Style::new().fg(Color::Magenta)),
+            Span::raw("   "),
+            Span::styled(clip(&said, inner_w.saturating_sub(5)), DIM),
+        ]);
+        let (l1, l2) = if sel {
+            let hi = Style::new().bg(Color::Indexed(236));
+            (l1.patch_style(hi), l2.patch_style(hi))
+        } else {
+            (l1, l2)
+        };
+        rows.push((l1, Some(entry.clone())));
+        rows.push((l2, Some(entry)));
     }
 
     // scroll so the selected card is visible
     let sel_row = rows
         .iter()
-        .position(|(_, p)| p.is_some() && *p == selected)
+        .position(|(_, e)| e.is_some() && *e == selected)
         .unwrap_or(0);
     let mut top = app.ctl.list_top.min(rows.len().saturating_sub(1));
     if sel_row < top {
@@ -231,7 +291,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .skip(top)
         .take(inner_h)
-        .filter_map(|(i, (_, p))| p.map(|p| (area.y + 1 + (i - top) as u16, p)))
+        .filter_map(|(i, (_, e))| e.clone().map(|e| (area.y + 1 + (i - top) as u16, e)))
         .collect();
     let lines: Vec<Line> = rows
         .into_iter()
@@ -267,6 +327,10 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     app.ctl.detail_rect = area;
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
+    if let Some(e) = app.selected_ended().cloned() {
+        render_ended(frame, app, area, &e);
+        return;
+    }
     let Some(a) = app.selected_agent() else {
         frame.render_widget(
             Paragraph::new(Line::styled(" select a session", DIM)).block(Block::bordered()),
@@ -320,6 +384,67 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered().title_bottom(Line::styled(bottom, DIM));
     frame.render_widget(Paragraph::new(lines).block(block), area);
     // keep the stored offset in range, so scrolling back responds at once
+    app.ctl.detail_scroll = offset;
+}
+
+/// An exited session: where it was, what it last said, and how to resume.
+fn render_ended(frame: &mut Frame, app: &mut App, area: Rect, e: &crate::transcript::Ended) {
+    let w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let now = unix_now();
+    let name = e
+        .cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut head = vec![Line::from(vec![
+        Span::styled(" ◌ ", DIM),
+        Span::styled(
+            name,
+            Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " · ended {} ago · session {}",
+                fmt_age(now.saturating_sub(e.at)),
+                crate::launcher::short_id(&e.id, 8)
+            ),
+            DIM,
+        ),
+    ])];
+    if let Some(t) = &e.summary.title {
+        head.push(Line::styled(
+            format!(" {}", clip(t, w.saturating_sub(1))),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    }
+    head.push(Line::from(vec![
+        Span::styled(" repo   ", KEY),
+        Span::raw(tildify(&e.cwd.display().to_string())),
+    ]));
+    if let Some(pr) = &e.summary.pr_url {
+        head.push(Line::from(vec![
+            Span::styled(" pr     ", KEY),
+            Span::raw(pr.clone()),
+        ]));
+    }
+    head.push(Line::styled(
+        format!(" {}", "─".repeat(w.saturating_sub(2))),
+        DIM,
+    ));
+    let body = summary_lines(&e.summary, "claude", w);
+    let room = inner_h.saturating_sub(head.len());
+    let max = body.len().saturating_sub(room);
+    let offset = app.ctl.detail_scroll.min(max);
+    head.extend(body.into_iter().skip(offset).take(room));
+    let hint = match crate::launch::here() {
+        Some(p) => format!(" Enter resumes it in {} · [ ] scroll ", p.name()),
+        None => " Enter shows how to resume it · [ ] scroll ".into(),
+    };
+    frame.render_widget(
+        Paragraph::new(head).block(Block::bordered().title_bottom(Line::styled(hint, DIM))),
+        area,
+    );
     app.ctl.detail_scroll = offset;
 }
 
@@ -470,6 +595,11 @@ fn conversation_lines(a: &Agent, w: usize) -> Vec<Line<'static>> {
             DIM,
         )];
     };
+    summary_lines(s, &a.name, w)
+}
+
+/// You asked / Status / <agent> said, from a transcript summary.
+fn summary_lines(s: &crate::transcript::Summary, agent: &str, w: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let section = |out: &mut Vec<Line<'static>>, title: &str| {
         if !out.is_empty() {
@@ -495,7 +625,7 @@ fn conversation_lines(a: &Agent, w: usize) -> Vec<Line<'static>> {
             ));
         }
     }
-    section(&mut out, &format!("{} SAID", a.name.to_uppercase()));
+    section(&mut out, &format!("{} SAID", agent.to_uppercase()));
     let reply = s.last_reply.as_deref().unwrap_or("(nothing yet)");
     for l in wrap(reply, w.saturating_sub(3)) {
         let mut spans = vec![Span::raw("   ")];

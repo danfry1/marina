@@ -635,6 +635,22 @@ gone 10 minutes without two working in it (`busy_trees`).
 **Quick replies**: `1`–`9` open the reply box pre-filled from
 `[agents] quick`; nothing is sent until Enter.
 
+**Lifecycle** (`launch.rs`): `N` builds a `Launch` (directory of the
+selected row, agent, first prompt, worktree flag) and starts it in
+`launch::here()` — tmux (`$TMUX`, checked first: tmux inside a herdr pane
+inherits herdr's variables), herdr (`HERDR_PANE_ID`: `workspace create
+--cwd --focus`, then `agent start --kind <agent> --pane <root> -- <args>`),
+or the terminal app from `TERM_PROGRAM` (Ghostty: a new window whose
+`initial input` is the command; iTerm2: `write text`; Terminal: `do
+script`). The command line is `cd '<dir>' && <agent> '<arg>'…`, every value
+single-quoted, passed to AppleScript as argv. A worktree is `git worktree
+add -b marina/<stamp> <repo>-<stamp>` beside the repo, keeping the
+subdirectory. `X` sends `/exit` (`/quit` for Codex) through `hosts::send`
+after a second press within 4s. *Ended* sessions are transcripts written
+in the last two days whose id isn't live (at most 8, rescanned every 30s,
+needing a reply and a recorded `cwd`); `Enter` resumes one with
+`claude --resume <id>` through the same launcher.
+
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
 the peak and memory drift. Helpers several sessions each run a copy of
