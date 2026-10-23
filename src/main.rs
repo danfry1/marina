@@ -69,7 +69,9 @@ fn main() -> io::Result<()> {
     }));
     let mut app = ui::App::new();
     ui::load_seen(&mut app);
-    app.set_quick_replies(config::load().agents.quick);
+    let agents_cfg = config::load().agents;
+    app.set_quick_replies(agents_cfg.quick);
+    app.set_start_in_inbox(agents_cfg.start.as_deref() != Some("servers"));
     let notify = config::load().notify;
     app.notify_agents = notify.agents;
     let desktop_notify = notify.desktop;

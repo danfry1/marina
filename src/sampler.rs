@@ -375,6 +375,19 @@ impl Sampler {
                     .unwrap_or(0);
                 for a in &mut agents {
                     a.infer_waiting(now);
+                    // where its screen can be read (tmux), confirm the
+                    // inference: there must be a dialog on it
+                    if a.waiting {
+                        if let Some(h) = a
+                            .host
+                            .as_ref()
+                            .filter(|h| h.kind == crate::hosts::HostKind::Tmux)
+                        {
+                            if let Some(screen) = crate::hosts::read_screen(h, 30) {
+                                a.waiting = crate::hosts::shows_dialog(&screen);
+                            }
+                        }
+                    }
                 }
             }
             (out, agents)

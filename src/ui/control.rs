@@ -70,6 +70,8 @@ pub(crate) struct Control {
     pub new_session: Option<NewDraft>,
     /// `X` pressed once on this agent: press again to end it.
     pub pending_end: Option<(u32, Instant)>,
+    /// Open on the inbox once the first snapshot shows agent sessions.
+    pub start_in_inbox: bool,
 }
 
 /// `N`: where and with what to start a session.
@@ -707,6 +709,31 @@ impl App {
             "back to the project view"
         });
         self.dirty = true;
+    }
+
+    pub fn set_start_in_inbox(&mut self, yes: bool) {
+        self.ctl.start_in_inbox = yes;
+    }
+
+    /// On the first snapshot: open on the inbox when there are agent
+    /// sessions, and say how to get around.
+    pub(crate) fn first_look(&mut self) {
+        let n = self.snapshot.agents.len();
+        if n == 0 {
+            return;
+        }
+        if std::mem::take(&mut self.ctl.start_in_inbox) {
+            self.ctl.inbox = true;
+        }
+        let other = if self.ctl.inbox {
+            "servers"
+        } else {
+            "the agent inbox"
+        };
+        self.set_status(format!(
+            "{n} agent session{} · a: {other} · Enter: jump · ?: all keys",
+            if n == 1 { "" } else { "s" }
+        ));
     }
 
     pub fn inbox_open(&self) -> bool {

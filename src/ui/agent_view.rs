@@ -309,16 +309,27 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .filter(|a| app.inbox_urgency(a, now) == r)
                 .count()
         };
-        format!(
-            " inbox · {} need you · {} new · {} working · {} sessions ",
-            count(0),
-            count(1),
-            app.snapshot
-                .agents
-                .iter()
-                .filter(|a| a.is_working(now))
-                .count(),
-            app.snapshot.agents.len()
+        let working = app
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.is_working(now))
+            .count();
+        // only what's there, so it fits the column
+        let mut parts: Vec<String> = Vec::new();
+        for (n, what) in [
+            (count(0), "need you"),
+            (count(1), "new"),
+            (working, "working"),
+        ] {
+            if n > 0 {
+                parts.push(format!("{n} {what}"));
+            }
+        }
+        parts.push(format!("{} sessions", app.snapshot.agents.len()));
+        clip(
+            &format!(" ▸ INBOX · servers (a) │ {} ", parts.join(" · ")),
+            inner_w,
         )
     };
     frame.render_widget(

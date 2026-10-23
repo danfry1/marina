@@ -83,7 +83,8 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
-- **Inbox** (`a`) — a mail-client view of every agent session. On the left,
+- **Inbox** — a mail-client view of every agent session, where marina
+  opens when agents are running (`a` switches to the servers view). On the left,
   cards grouped by what wants you (*needs you, new, working, recent,
   earlier, stale*): a status dot, the project, its task, how long ago it
   last said anything, and one line on what it's doing or last said.
@@ -219,7 +220,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a group · on an agent row: jump to its pane |
 | `D` | uncommitted diff of the selected agent's / server's work tree |
-| `a` | inbox: every agent session, what needs you first |
+| `a` | switch between the agent inbox (where marina opens when agents run) and the servers view |
 | `p` | preview an agent: last prompt, recap and reply · again: its live screen |
 | `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `1`–`9` | quick reply: opens the reply box with a canned reply (Enter sends) |
@@ -345,6 +346,7 @@ transcripts = false            # don't read Claude Code transcript tails
                                # (preview, inbox, agents --long)
 quick = ["commit it", "push it", "run the tests", "continue"]
                                # replies on keys 1-9 (these are the default)
+start = "servers"              # open on the servers view instead of the inbox
 ```
 
 ## Privacy & security

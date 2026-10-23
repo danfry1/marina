@@ -237,6 +237,9 @@ impl App {
     /// and to notice targets that vanished *without* marina killing them.
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
+        if old.seq == 0 && self.snapshot.seq > 0 {
+            self.first_look();
+        }
         self.record_history();
         self.update_seen();
         self.drop_orphan_reply();
