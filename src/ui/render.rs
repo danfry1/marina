@@ -1097,6 +1097,7 @@ fn help_lines() -> Vec<Line<'static>> {
         row("p", "preview an agent: last reply · again: live screen"),
         row("y · n", "approve / reject what the agent is asking"),
         row("r", "reply to the agent (herdr / tmux panes)"),
+        row("1 – 9", "quick reply ([agents] quick), Enter sends"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row(

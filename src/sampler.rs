@@ -330,6 +330,9 @@ impl Sampler {
                 }
             }
             self.opencode.fill(procs, &mut agents);
+            for a in &mut agents {
+                a.tree = crate::model::work_tree(&a.cwd);
+            }
             if let Some(tc) = self.transcripts.as_mut() {
                 for a in agents.iter_mut().filter(|a| a.name == "claude") {
                     a.summary = a.session.as_deref().and_then(|id| tc.get(id));
@@ -620,6 +623,7 @@ fn build_agents(
                 title: None,
                 summary: None,
                 waiting: false,
+                tree: None,
             })
         })
         .collect();

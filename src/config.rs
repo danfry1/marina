@@ -36,6 +36,8 @@
 //! [agents]
 //! transcripts = false   # don't read the tail of Claude Code transcripts for
 //!                       # session previews and the inbox (default: true)
+//! quick = ["commit it", "push it", "run the tests", "continue"]
+//!                       # replies on keys 1-9 (these are the default)
 //! ```
 
 use std::path::PathBuf;
@@ -68,11 +70,23 @@ pub struct AgentsCfg {
     /// a session's last prompt, reply and recap.
     #[serde(default = "yes")]
     pub transcripts: bool,
+    /// Canned replies on keys 1-9.
+    #[serde(default = "quick_default")]
+    pub quick: Vec<String>,
+}
+
+fn quick_default() -> Vec<String> {
+    ["commit it", "push it", "run the tests", "continue"]
+        .map(String::from)
+        .to_vec()
 }
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        AgentsCfg { transcripts: true }
+        AgentsCfg {
+            transcripts: true,
+            quick: quick_default(),
+        }
     }
 }
 
@@ -252,6 +266,9 @@ mod tests {
         assert!(cfg.agents.transcripts, "on by default");
         let cfg: ConfigFile = toml::from_str("[agents]\ntranscripts = false").unwrap();
         assert!(!cfg.agents.transcripts);
+        assert_eq!(cfg.agents.quick[0], "commit it", "defaults kept");
+        let cfg: ConfigFile = toml::from_str("[agents]\nquick = [\"ship it\"]").unwrap();
+        assert_eq!(cfg.agents.quick, vec!["ship it"]);
         let cfg: ConfigFile = toml::from_str("[notify]\nagents = false").unwrap();
         assert!(cfg.notify.desktop && !cfg.notify.agents);
     }

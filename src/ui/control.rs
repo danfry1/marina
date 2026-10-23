@@ -59,6 +59,8 @@ pub(crate) struct Control {
     pub detail_pid: Option<u32>,
     /// What you've read: session id -> transcript time last seen.
     pub seen: Seen,
+    /// Canned replies on keys 1-9 (`[agents] quick`).
+    pub quick: Vec<String>,
 }
 
 /// The newest transcript time you've seen per session, so a session that
@@ -263,6 +265,18 @@ impl App {
             .map(|(_, p)| *p)
     }
 
+    /// Other live sessions in `a`'s git work tree.
+    pub(crate) fn tree_mates(&self, a: &Agent) -> Vec<&Agent> {
+        let Some(t) = a.tree.as_deref() else {
+            return Vec::new();
+        };
+        self.snapshot
+            .agents
+            .iter()
+            .filter(|o| o.pid != a.pid && o.tree.as_deref() == Some(t))
+            .collect()
+    }
+
     // --- unread -----------------------------------------------------------------
 
     /// Has `a` said something since you last looked? (Not while it's still
@@ -372,6 +386,33 @@ impl App {
         }
         self.ctl.reply = Some((a.pid, String::new()));
         self.dirty = true;
+    }
+
+    /// `1`-`9`: open the reply box with that canned reply, to send with
+    /// Enter (or edit first).
+    pub fn quick_reply(&mut self, n: usize) {
+        let Some(text) = self.ctl.quick.get(n.wrapping_sub(1)).cloned() else {
+            return;
+        };
+        self.start_reply();
+        if let Some((_, t)) = self.ctl.reply.as_mut() {
+            *t = text;
+        }
+    }
+
+    pub fn set_quick_replies(&mut self, quick: Vec<String>) {
+        self.ctl.quick = quick.into_iter().take(9).collect();
+    }
+
+    /// `1 commit it · 2 push it …` for hints.
+    pub(crate) fn quick_hint(&self) -> String {
+        self.ctl
+            .quick
+            .iter()
+            .enumerate()
+            .map(|(i, q)| format!("{} {q}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     pub fn is_replying(&self) -> bool {
@@ -579,6 +620,41 @@ mod tests {
         app.ctl.hits = vec![(5, 7)];
         assert_eq!(app.card_at(10, 5), Some(7));
         assert_eq!(app.card_at(90, 5), None);
+    }
+
+    #[test]
+    fn two_sessions_working_in_one_tree_are_flagged_once() {
+        let mut app = App::new();
+        let both = |seq: u64, working: bool| {
+            let mut s = Snapshot::sample();
+            s.seq = seq;
+            let mut a = Agent::sample(1, "aaaa1111", "pix");
+            let mut b = Agent::sample(2, "bbbb2222", "pix");
+            for x in [&mut a, &mut b] {
+                x.tree = Some(std::path::PathBuf::from("/Users/me/dev/pix"));
+                if !working {
+                    x.children.retain(|c| !c.shell);
+                }
+            }
+            s.agents = vec![a, b];
+            Arc::new(s)
+        };
+        app.apply(both(1, false));
+        let a = app.snapshot.agents[0].clone();
+        assert_eq!(app.tree_mates(&a).len(), 1);
+        app.snapshot = both(2, true);
+        let n = app.agent_notices(1_000);
+        assert!(
+            n.iter()
+                .any(|(t, _)| t.contains("working in the same tree")),
+            "{n:?}"
+        );
+        assert!(
+            !app.agent_notices(1_001)
+                .iter()
+                .any(|(t, _)| t.contains("same tree")),
+            "once"
+        );
     }
 
     #[test]

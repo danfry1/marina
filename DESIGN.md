@@ -607,6 +607,28 @@ window.
   body: *you asked*, *status* (recap), *<agent> said* (reply, markdown), or
   the live screen pinned to its bottom.
 
+**Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
+every 2s and sends the same notices (`App::take_notifications`) as desktop
+notifications. It holds `<state dir>/watch.pid`; the TUI checks it
+(`watch::running`, pid alive and named marina) and leaves desktop
+notifications to the watcher. `--install` writes a launchd agent
+(`~/Library/LaunchAgents/dev.marina.watch.plist`, RunAtLoad + KeepAlive,
+the installing shell's PATH, log in the state dir) and bootstraps it, or a
+systemd user unit on Linux; the program path is the `$PATH` entry that
+resolves to the running binary, so a Homebrew upgrade doesn't break it.
+Notices carry a jump key (session id, else pid); `verbs::notify` makes
+them clickable with `terminal-notifier -execute "<marina> jump <id>"`
+(macOS, when installed) or `notify-send --action` (Linux). The id is
+validated as a session id before it reaches a command line.
+
+**Shared trees**: `Agent::tree` is the nearest ancestor of its cwd with a
+`.git` (directory or file, so linked worktrees are distinct). Sessions
+sharing one get `⇄N` and a detail warning; when two or more are working
+in one at once, a notice fires once per such episode (`busy_trees`).
+
+**Quick replies**: `1`–`9` open the reply box pre-filled from
+`[agents] quick`; nothing is sent until Enter.
+
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
 the peak and memory drift. Helpers several sessions each run a copy of

@@ -159,7 +159,16 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let title = a.title().unwrap_or("").to_string();
         // line 1: ● label  title ……… ago
-        let fixed = 4 + label.chars().count() + 2 + ago.chars().count() + 1;
+        // ⇄N: N other sessions share its work tree
+        let mates = app.tree_mates(a);
+        let share = if mates.is_empty() {
+            String::new()
+        } else {
+            format!(" ⇄{}", mates.len())
+        };
+        let clash = a.is_working(now) && mates.iter().any(|m| m.is_working(now));
+        let share_style = Style::new().fg(if clash { Color::Red } else { Color::Yellow });
+        let fixed = 4 + label.chars().count() + share.chars().count() + 2 + ago.chars().count() + 1;
         let title = clip(&title, inner_w.saturating_sub(fixed));
         let pad = inner_w.saturating_sub(fixed + title.chars().count());
         let bar = if sel { "▌" } else { " " };
@@ -176,6 +185,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             dot(app, a, now),
             Span::raw(" "),
             Span::styled(label, label_style),
+            Span::styled(share, share_style),
             Span::raw("  "),
             Span::styled(title, title_style),
             Span::raw(" ".repeat(pad)),
@@ -285,6 +295,9 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut hints = vec!["Enter jump"];
     if interactive {
         hints.push("r reply");
+        if !app.ctl.quick.is_empty() {
+            hints.push("1-9 quick reply");
+        }
         if app.waiting_on_you(a) {
             hints.push("y/n answer");
         }
@@ -321,6 +334,12 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         )
     } else if a.is_working(now) {
         Span::styled(a.activity(now), Style::new().fg(Color::Yellow))
+    } else if a.summary.is_some() && a.last_active() > 0 {
+        // the same clock as its card: when it last said something
+        Span::styled(
+            format!("idle {}", fmt_age(now.saturating_sub(a.last_active()))),
+            DIM,
+        )
     } else {
         Span::styled(a.activity(now), DIM)
     };
@@ -370,6 +389,27 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         repo.push(Span::styled(format!(" · {}", g.describe()), style));
     }
     out.push(Line::from(repo));
+    // other sessions in the same work tree can overwrite its edits
+    let mates = app.tree_mates(a);
+    if !mates.is_empty() {
+        let names: Vec<String> = mates.iter().map(|m| short_label(app, m)).collect();
+        let clash = a.is_working(now) && mates.iter().any(|m| m.is_working(now));
+        let (lead, color) = if clash {
+            ("⚠ working alongside", Color::Red)
+        } else {
+            ("⇄ shares this tree with", Color::Yellow)
+        };
+        out.push(Line::styled(
+            clip(
+                &format!(
+                    " {lead} {} — a git worktree each keeps their edits apart",
+                    names.join(", ")
+                ),
+                w,
+            ),
+            Style::new().fg(color),
+        ));
+    }
     // what it's running and where you can see it
     let servers: Vec<String> = app
         .agent_servers(a)
@@ -402,6 +442,13 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
             format!(" ⚠ waiting on you{what} — y approve · n reject · r reply"),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+    }
+    // the canned replies on 1-9, where you'd reach for them
+    if a.host.as_ref().is_some_and(|h| h.kind.interactive()) && !app.ctl.quick.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled(" quick  ", KEY),
+            Span::styled(clip(&app.quick_hint(), w.saturating_sub(8)), DIM),
+        ]));
     }
     out.push(Line::styled(
         format!(" {}", "─".repeat(w.saturating_sub(2))),
