@@ -92,6 +92,8 @@ pub(crate) enum Entry {
     /// Project view: the folded `agents` section at the bottom. Its own
     /// variant, so it can never collide with (or kill) a project named so.
     Agents,
+    /// Inbox: a session that has exited, by session id (Enter resumes it).
+    Ended(String),
 }
 
 pub(crate) struct LogView {
@@ -653,7 +655,9 @@ impl App {
                 .iter()
                 .filter(|t| &t.key == k)
                 .collect(),
-            Some(Entry::Agent(_)) | Some(Entry::Agents) | None => Vec::new(),
+            Some(Entry::Agent(_)) | Some(Entry::Agents) | Some(Entry::Ended(_)) | None => {
+                Vec::new()
+            }
         }
     }
 
@@ -672,6 +676,7 @@ impl App {
                 .map(|a| format!("{} session", a.name))
                 .unwrap_or_default(),
             Some(Entry::Agents) => "agent sessions".into(),
+            Some(Entry::Ended(_)) => "ended session".into(),
             None => String::new(),
         }
     }
@@ -945,8 +950,8 @@ impl App {
                 }
                 if self.ctl.inbox {
                     // a card selects; the table geometry below doesn't apply
-                    if let Some(pid) = self.card_at(x, y) {
-                        self.selected = Some(Entry::Agent(pid));
+                    if let Some(e) = self.card_at(x, y) {
+                        self.selected = Some(e);
                         self.last_input = Instant::now();
                         self.dirty = true;
                     }
@@ -1237,7 +1242,7 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
         Entry::Member(k) | Entry::Target(k) => Some(k),
-        Entry::Group(_) | Entry::Agent(_) | Entry::Agents => None,
+        Entry::Group(_) | Entry::Agent(_) | Entry::Agents | Entry::Ended(_) => None,
     }
 }
 
@@ -1775,7 +1780,7 @@ mod tests {
         snap.targets.retain(|t| match &victim {
             Entry::Target(k) | Entry::Member(k) => &t.key != k,
             Entry::Group(p) => &t.project != p,
-            Entry::Agent(_) | Entry::Agents => true,
+            Entry::Agent(_) | Entry::Agents | Entry::Ended(_) => true,
         });
         app.apply(Arc::new(snap));
         app.reconcile();

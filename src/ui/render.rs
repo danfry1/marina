@@ -264,6 +264,27 @@ fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
 }
 
 fn footer_line(app: &App) -> Line<'static> {
+    if let Some(d) = app.new_draft() {
+        let place = crate::launch::here()
+            .map(|p| p.name())
+            .unwrap_or("(no terminal marina can open)");
+        let wt = if d.worktree { "on" } else { "off" };
+        return Line::from(vec![
+            Span::styled(
+                format!(
+                    "  new {} in {} › ",
+                    d.agent,
+                    tildify(&d.dir.display().to_string())
+                ),
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{}▏", d.prompt), Style::new().fg(Color::White)),
+            Span::styled(
+                format!("  first prompt, optional · Tab own worktree: {wt} · Enter opens {place} · Esc cancel"),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]);
+    }
     if let Some((who, text)) = app.reply_draft() {
         return Line::from(vec![
             Span::styled(
@@ -648,6 +669,8 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             None => Row::new(Vec::<Cell>::new()),
         },
         Entry::Agents => agents_section_row(app),
+        // only the inbox lists these, and draws its own rows
+        Entry::Ended(_) => Row::new(Vec::<Cell>::new()),
     }
 }
 
@@ -1098,6 +1121,8 @@ fn help_lines() -> Vec<Line<'static>> {
         row("y · n", "approve / reject what the agent is asking"),
         row("r", "reply to the agent (herdr / tmux panes)"),
         row("1 – 9", "quick reply ([agents] quick), Enter sends"),
+        row("N", "new agent session here (Tab: in its own git worktree)"),
+        row("X", "end the agent session (press twice; sends /exit)"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row(
