@@ -5,12 +5,16 @@
 //! which marina can't see from outside) and the session's task title.
 //!
 //! Each host is an adapter keyed by something marina already has — the
-//! agent's pid (herdr) or its tty (tmux) — so adding one (WezTerm, kitty,
-//! iTerm) is another `scan` arm plus a `jump` arm. Without a host, jumping
-//! falls back to copying a resume command.
+//! agent's pid (herdr), its tty (tmux, iTerm2, Terminal, WezTerm) or its
+//! directory (Ghostty, whose scripting doesn't expose ttys) — so adding one
+//! is another lookup arm plus a `jump` arm. Without a host, jumping falls
+//! back to copying a resume command.
 //!
-//! Hosts are queried only when their server process is running, through
-//! their own CLIs, with a deadline, at most every few seconds.
+//! Multiplexers are queried only when their server process is running,
+//! through their own CLIs, with a deadline, at most every few seconds.
+//! Terminal apps are recognised from the agent's ancestry alone and only
+//! scripted when jumping (AppleScript on macOS; `wezterm cli`), so sampling
+//! never triggers an automation prompt.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,10 @@ const TIMEOUT: Duration = Duration::from_millis(1500);
 pub enum HostKind {
     Herdr,
     Tmux,
+    ITerm,
+    Terminal,
+    Ghostty,
+    WezTerm,
 }
 
 impl HostKind {
@@ -35,6 +43,26 @@ impl HostKind {
         match self {
             HostKind::Herdr => "herdr",
             HostKind::Tmux => "tmux",
+            HostKind::ITerm => "iterm",
+            HostKind::Terminal => "terminal",
+            HostKind::Ghostty => "ghostty",
+            HostKind::WezTerm => "wezterm",
+        }
+    }
+
+    /// The terminal app that owns a process, from one ancestor's argv0.
+    fn terminal_app(argv0: &str) -> Option<HostKind> {
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        if argv0.contains("/iTerm.app/") || base.starts_with("iTermServer") {
+            Some(HostKind::ITerm)
+        } else if argv0.contains("/Terminal.app/") {
+            Some(HostKind::Terminal)
+        } else if argv0.contains("/Ghostty.app/") || base == "ghostty" {
+            Some(HostKind::Ghostty)
+        } else if base == "wezterm-gui" || base == "wezterm-mux-server" {
+            Some(HostKind::WezTerm)
+        } else {
+            None
         }
     }
 }
@@ -54,7 +82,8 @@ pub enum HostStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostInfo {
     pub kind: HostKind,
-    /// The host's id for the pane: herdr `w2S:p1`, tmux `main:1.0`.
+    /// The host's id for the pane: herdr `w2S:p1`, tmux `main:1.0`; the tty
+    /// for iTerm2/Terminal/WezTerm, the directory for Ghostty.
     pub target: String,
     pub status: Option<HostStatus>,
     /// The session's task title (herdr: the terminal title the agent sets).
@@ -62,6 +91,21 @@ pub struct HostInfo {
     /// The host's view of the session id — fresher than env markers, which
     /// older helpers keep from before a `/clear`.
     pub session: Option<String>,
+}
+
+impl HostInfo {
+    /// `herdr pane w2S:p1`, `iTerm2 session on /dev/ttys004`, …
+    pub fn describe(&self) -> String {
+        let t = &self.target;
+        match self.kind {
+            HostKind::Herdr => format!("herdr pane {t}"),
+            HostKind::Tmux => format!("tmux pane {t}"),
+            HostKind::ITerm => format!("iTerm2 session on {t}"),
+            HostKind::Terminal => format!("Terminal tab on {t}"),
+            HostKind::Ghostty => format!("Ghostty terminal in {t}"),
+            HostKind::WezTerm => format!("WezTerm pane on {t}"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -212,12 +256,13 @@ impl Hosts {
         };
     }
 
-    /// The host of the agent `pid` whose terminal is `tty`, if any.
+    /// The host of the agent `pid` in `cwd` whose terminal is `tty`, if any.
     pub fn lookup(
         &mut self,
         procs: &HashMap<u32, ProcInfo>,
         pid: u32,
         tty: Option<&Path>,
+        cwd: &Path,
     ) -> Option<HostInfo> {
         self.refresh(procs);
         let by_pid = self
@@ -228,15 +273,106 @@ impl Hosts {
         if let Some(h) = by_pid {
             return Some(h.clone());
         }
-        let target = self.tmux.get(tty?)?;
+        let tty = tty?;
+        let (kind, target) = match self.tmux.get(tty) {
+            Some(pane) => (HostKind::Tmux, pane.clone()),
+            None => match terminal_of(procs, pid)? {
+                HostKind::Ghostty => (HostKind::Ghostty, cwd.display().to_string()),
+                kind => (kind, tty.display().to_string()),
+            },
+        };
         Some(HostInfo {
-            kind: HostKind::Tmux,
-            target: target.clone(),
+            kind,
+            target,
             status: None,
             title: None,
             session: None,
         })
     }
+}
+
+/// The terminal app `pid` runs in: the first ancestor that is one.
+fn terminal_of(procs: &HashMap<u32, ProcInfo>, pid: u32) -> Option<HostKind> {
+    let mut cur = procs.get(&pid)?.ppid;
+    for _ in 0..64 {
+        let p = procs.get(&cur?)?;
+        if let Some(kind) = p.argv.first().and_then(|a| HostKind::terminal_app(a)) {
+            return Some(kind);
+        }
+        cur = p.ppid;
+    }
+    None
+}
+
+/// Run an AppleScript `on run argv` handler with `args` — passed as argv,
+/// never spliced into the script. `Some(stdout)` on success.
+fn osascript(script: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(script).args(args);
+    // a first jump may wait on the automation permission prompt
+    crate::exec::output(cmd, Duration::from_secs(20)).map(|s| s.trim().to_string())
+}
+
+const ITERM_FOCUS: &str = r#"on run argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is (item 1 of argv) then
+            select w
+            tell t to select
+            tell s to select
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "missing"
+end run"#;
+
+const TERMINAL_FOCUS: &str = r#"on run argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is (item 1 of argv) then
+          set selected tab of w to t
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "missing"
+end run"#;
+
+/// Ghostty doesn't expose ttys: focus a terminal in the session's directory,
+/// reporting how many were there.
+const GHOSTTY_FOCUS: &str = r#"on run argv
+  tell application "Ghostty"
+    set ts to every terminal whose working directory is (item 1 of argv)
+    if (count of ts) is 0 then return "missing"
+    focus (item 1 of ts)
+    activate
+    return (count of ts) as text
+  end tell
+end run"#;
+
+#[derive(Deserialize)]
+struct WezPane {
+    pane_id: u64,
+    #[serde(default)]
+    tty_name: Option<String>,
+}
+
+fn wezterm_pane(json: &str, tty: &str) -> Option<u64> {
+    serde_json::from_str::<Vec<WezPane>>(json)
+        .ok()?
+        .into_iter()
+        .find(|p| p.tty_name.as_deref() == Some(tty))
+        .map(|p| p.pane_id)
 }
 
 /// Focus the session's pane. Returns a line for the status bar.
@@ -263,6 +399,45 @@ pub fn jump(host: &HostInfo) -> Result<String, String> {
             } else {
                 Err(format!("tmux couldn't select {}", host.target))
             }
+        }
+        HostKind::ITerm | HostKind::Terminal => {
+            let script = if host.kind == HostKind::ITerm {
+                ITERM_FOCUS
+            } else {
+                TERMINAL_FOCUS
+            };
+            match osascript(script, &[&host.target]).as_deref() {
+                Some("ok") => Ok(format!("focused the {}", host.describe())),
+                Some(_) => Err(format!("no {} any more", host.describe())),
+                None => Err(format!(
+                    "couldn't script {} — allow marina's terminal under System Settings › Privacy › Automation",
+                    host.kind.as_str()
+                )),
+            }
+        }
+        HostKind::Ghostty => match osascript(GHOSTTY_FOCUS, &[&host.target]).as_deref() {
+            Some("1") => Ok(format!("focused the {}", host.describe())),
+            Some(n) if n.parse::<u32>().is_ok() => Ok(format!(
+                "focused a Ghostty terminal in {} ({n} are open there)",
+                host.target
+            )),
+            Some(_) => Err(format!("no {} any more", host.describe())),
+            None => Err(
+                "couldn't script Ghostty — allow marina's terminal under System Settings › Privacy › Automation"
+                    .into(),
+            ),
+        },
+        HostKind::WezTerm => {
+            let pane = run("wezterm", &["cli", "list", "--format", "json"])
+                .and_then(|j| wezterm_pane(&j, &host.target))
+                .ok_or_else(|| format!("no {} any more", host.describe()))?;
+            let id = pane.to_string();
+            run("wezterm", &["cli", "activate-pane", "--pane-id", &id])
+                .ok_or_else(|| format!("wezterm couldn't activate pane {id}"))?;
+            if cfg!(target_os = "macos") {
+                let _ = run("open", &["-a", "WezTerm"]);
+            }
+            Ok(format!("focused WezTerm pane {id}"))
         }
     }
 }
@@ -305,5 +480,93 @@ mod tests {
         assert_eq!(parse_herdr_pid("{}"), None);
         let t = parse_tmux_panes("/dev/ttys004\tmain:1.0\n/dev/ttys009\twork:2.1\n");
         assert_eq!(t[Path::new("/dev/ttys009")], "work:2.1");
+    }
+
+    #[test]
+    fn terminal_apps_from_ancestry() {
+        let k = HostKind::terminal_app;
+        assert_eq!(
+            k("/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+            Some(HostKind::ITerm)
+        );
+        assert_eq!(
+            k("/Users/x/Library/Application Support/iTerm2/iTermServer-3.5.0"),
+            Some(HostKind::ITerm)
+        );
+        assert_eq!(
+            k("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+            Some(HostKind::Terminal)
+        );
+        assert_eq!(
+            k("/Applications/Ghostty.app/Contents/MacOS/ghostty"),
+            Some(HostKind::Ghostty)
+        );
+        assert_eq!(k("/usr/bin/ghostty"), Some(HostKind::Ghostty));
+        assert_eq!(k("wezterm-gui"), Some(HostKind::WezTerm));
+        assert_eq!(k("/bin/zsh"), None);
+        assert_eq!(k("login"), None);
+    }
+
+    #[test]
+    fn lookup_walks_up_to_the_terminal_app() {
+        let p = |pid: u32, ppid: u32, argv0: &str| ProcInfo {
+            pid,
+            ppid: Some(ppid),
+            name: argv0.rsplit('/').next().unwrap().into(),
+            argv: vec![argv0.into()],
+            cwd: None,
+            cpu_pct: 0.0,
+            mem_bytes: 0,
+            start_time: 0,
+            agent: None,
+        };
+        let procs: HashMap<u32, ProcInfo> = [
+            p(10, 1, "/Applications/Ghostty.app/Contents/MacOS/ghostty"),
+            p(11, 10, "/usr/bin/login"),
+            p(12, 11, "-zsh"),
+            p(13, 12, "claude"),
+            p(
+                20,
+                1,
+                "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            ),
+            p(21, 20, "-zsh"),
+            p(22, 21, "claude"),
+            p(30, 1, "-zsh"),
+            p(31, 30, "claude"),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect();
+        let mut h = Hosts::default();
+        let tty = Path::new("/dev/ttys007");
+        let dir = Path::new("/w/app");
+        let g = h.lookup(&procs, 13, Some(tty), dir).unwrap();
+        assert_eq!((g.kind, g.target.as_str()), (HostKind::Ghostty, "/w/app"));
+        assert_eq!(g.describe(), "Ghostty terminal in /w/app");
+        let t = h.lookup(&procs, 22, Some(tty), dir).unwrap();
+        assert_eq!(
+            (t.kind, t.target.as_str()),
+            (HostKind::Terminal, "/dev/ttys007")
+        );
+        assert_eq!(
+            h.lookup(&procs, 31, Some(tty), dir),
+            None,
+            "no known terminal"
+        );
+        assert_eq!(
+            h.lookup(&procs, 22, None, dir),
+            None,
+            "no tty, nothing to match"
+        );
+    }
+
+    #[test]
+    fn finds_the_wezterm_pane_by_tty() {
+        let j = r#"[{"window_id":0,"tab_id":0,"pane_id":3,"tty_name":"/dev/ttys001"},
+                    {"window_id":0,"tab_id":1,"pane_id":7,"tty_name":"/dev/ttys009"}]"#;
+        assert_eq!(wezterm_pane(j, "/dev/ttys009"), Some(7));
+        assert_eq!(wezterm_pane(j, "/dev/ttys002"), None);
+        assert_eq!(wezterm_pane("nope", "/dev/ttys001"), None);
     }
 }

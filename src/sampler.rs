@@ -315,7 +315,9 @@ impl Sampler {
             );
             for a in &mut agents {
                 a.tty = a.tty_path.as_deref().and_then(crate::sources::tty_activity);
-                a.host = self.hosts.lookup(procs, a.pid, a.tty_path.as_deref());
+                a.host = self
+                    .hosts
+                    .lookup(procs, a.pid, a.tty_path.as_deref(), &a.cwd);
                 // the host tracks /clear and resume; markers can lag
                 if let Some(s) = a.host.as_ref().and_then(|h| h.session.clone()) {
                     a.session = Some(s);
@@ -537,12 +539,18 @@ fn build_agents(
                         .filter_map(|d| procs.get(d))
                         .map(|d| d.cpu_pct)
                         .sum();
+                    let mem_bytes = sub
+                        .iter()
+                        .filter_map(|d| procs.get(d))
+                        .map(|d| d.mem_bytes)
+                        .sum();
                     Some(AgentChild {
                         pid: c,
                         start_time: cp.start_time,
                         label,
                         shell,
                         cpu_pct,
+                        mem_bytes,
                     })
                 })
                 .collect();

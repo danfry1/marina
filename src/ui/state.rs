@@ -172,6 +172,9 @@ pub struct App {
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
     /// PROJECT column width at the last render (it grows with the pane).
     pub(crate) project_w: u16,
+    /// Recent cpu/mem per target and per agent session, for the inspect
+    /// panel's trend line.
+    pub(crate) history: HashMap<HistKey, VecDeque<(Instant, f32, u64)>>,
 }
 
 impl App {
@@ -212,6 +215,7 @@ impl App {
             log_rect: None,
             header_hits: Vec::new(),
             project_w: 22,
+            history: HashMap::new(),
         }
     }
 
@@ -221,6 +225,7 @@ impl App {
     /// and to notice targets that vanished *without* marina killing them.
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
+        self.record_history();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -910,6 +915,33 @@ impl App {
         }
     }
 
+    /// Append this snapshot's cpu/mem to each row's history; forget rows
+    /// that are gone.
+    fn record_history(&mut self) {
+        let snap = Arc::clone(&self.snapshot);
+        let now: Vec<(HistKey, f32, u64)> = snap
+            .targets
+            .iter()
+            .filter(|t| !t.pids.is_empty())
+            .map(|t| (HistKey::Target(t.key.clone()), t.cpu_pct, t.mem_bytes))
+            .chain(
+                snap.agents
+                    .iter()
+                    .map(|a| (HistKey::Agent(a.pid), a.cpu_pct, a.mem_bytes)),
+            )
+            .collect();
+        let live: HashSet<&HistKey> = now.iter().map(|(k, _, _)| k).collect();
+        self.history.retain(|k, _| live.contains(k));
+        let at = Instant::now();
+        for (k, cpu, mem) in &now {
+            let h = self.history.entry(k.clone()).or_default();
+            if h.len() == HISTORY {
+                h.pop_front();
+            }
+            h.push_back((at, *cpu, *mem));
+        }
+    }
+
     // --- layout -------------------------------------------------------------
 
     /// Group targets by project, sort groups + members by the active mode, and
@@ -1242,6 +1274,16 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
     }
+}
+
+/// Samples of history kept per row: about two minutes at the 1s tick.
+pub(crate) const HISTORY: usize = 120;
+
+/// Whose history: a target, or an agent session by pid.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HistKey {
+    Target(TargetKey),
+    Agent(u32),
 }
 
 /// A target that is an agent's background service (`opencode serve`), which

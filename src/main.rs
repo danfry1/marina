@@ -294,11 +294,7 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
     match a.host.clone() {
         Some(host) => {
             let ev = ev.clone();
-            app.set_status(format!(
-                "jumping to {} pane {}…",
-                host.kind.as_str(),
-                host.target
-            ));
+            app.set_status(format!("jumping to the {}…", host.describe()));
             std::thread::spawn(move || {
                 let msg = hosts::jump(&host).unwrap_or_else(|e| e);
                 let _ = ev.send(UiEvent::Status(msg));
@@ -315,7 +311,7 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
             );
             match verbs::copy_url(&cmd) {
                 Ok(()) => app.set_status(format!(
-                    "no multiplexer pane to jump to — copied `{cmd}`; paste it in a terminal"
+                    "no terminal marina can drive — copied `{cmd}`; paste it in a terminal"
                 )),
                 Err(e) => app.set_status(format!("no pane to jump to ({e}) — run: {cmd}")),
             }

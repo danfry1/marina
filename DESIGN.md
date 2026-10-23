@@ -528,10 +528,26 @@ with a 1.5s deadline per call (`exec::output`). A host's status overrides the
 tty heuristic (herdr watches the screen, so it can report *blocked* on an
 approval or question, and *done*), its session id overrides env markers
 (those lag a `/clear`), and its terminal title is shown as the session's task.
+Without a multiplexer, the terminal app is recognised from the agent's
+ancestry (the first ancestor whose argv0 is iTerm2 / its `iTermServer`,
+Terminal.app, Ghostty or `wezterm-gui`) — no scripting while sampling, so
+no automation prompt until the user jumps.
 `Enter` on an agent row jumps: `herdr agent focus <pane>`, tmux
-`switch-client`/`select-window` + `select-pane`, else copy
-`cd <dir> && <resume command>`. Adding a host (WezTerm, kitty, iTerm) is a
-scan arm keyed by pid or tty plus a jump arm.
+`switch-client`/`select-window` + `select-pane`; iTerm2 and Terminal by
+AppleScript matching the session's/tab's `tty`; Ghostty by AppleScript
+focusing a terminal whose `working directory` is the agent's (Ghostty
+exposes no tty, so with several terminals in one directory it picks the
+first and says so); WezTerm by `wezterm cli list` (tty → pane) and
+`activate-pane`; else copy `cd <dir> && <resume command>`. Values reach
+AppleScript as `on run argv` arguments, never spliced into the script.
+Adding a host (kitty, …) is a lookup arm keyed by pid, tty or directory plus
+a jump arm.
+
+**History**: the UI keeps ~2 minutes of cpu/mem per target and agent
+(`App::history`, pruned with the rows); `i` renders it as a sparkline with
+the peak and memory drift. Helpers several sessions each run a copy of
+(`model::repeated_helpers`, by label) are totalled on the agents section
+and after `marina agents`.
 
 **Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
 `diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached

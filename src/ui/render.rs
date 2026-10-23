@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use super::format::{centered_rect, fmt_age, fmt_mem, fmt_uptime, tildify, unix_now};
-use super::state::{App, Entry, GroupBy, SortMode};
+use super::state::{App, Entry, GroupBy, HistKey, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
 
@@ -33,9 +33,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if inspect_open {
         // an agent lists its shells/helpers below the usual five lines
         let h = if app.selected_agent().is_some() {
-            12
+            13
         } else {
-            9
+            10
         };
         constraints.push(Constraint::Length(h));
     }
@@ -277,9 +277,14 @@ fn detail_line(app: &App) -> Line<'static> {
                 .sum();
             Line::styled(
                 format!(
-                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
+                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total{} · Enter folds/unfolds",
                     fmt_mem(stale_mem),
-                    fmt_mem(mem)
+                    fmt_mem(mem),
+                    match crate::model::repeated_helpers(&app.snapshot.agents).first() {
+                        // each session's own copy of the same MCP server adds up
+                        Some((l, k, m)) => format!(" · helpers: {l} ×{k} {}", fmt_mem(*m)),
+                        None => String::new(),
+                    }
                 ),
                 Style::new().fg(Color::Gray),
             )
@@ -469,6 +474,9 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 }
                 None => kv("via", "—".into()),
             });
+            if t.container.is_none() {
+                lines.push(kv("trend", trend(app, &HistKey::Target(t.key.clone()))));
+            }
             lines.push(match &t.container {
                 Some(c) => kv("dockr", format!("container {c}")),
                 None => kv(
@@ -711,11 +719,41 @@ fn branch_cell(a: &Agent) -> Cell<'static> {
     }
 }
 
+/// `cpu ▁▁▃▇▅▂▁ 4.1% · peak 38% · mem 540MB +12MB over 2m` over the recorded
+/// history, so a spike or a leak shows without watching the row.
+fn trend(app: &App, key: &HistKey) -> String {
+    let Some(h) = app.history.get(key).filter(|h| !h.is_empty()) else {
+        return "—".into();
+    };
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let peak = h.iter().map(|s| s.1).fold(0.0_f32, f32::max);
+    // a floor so an idle row reads flat, not as noise scaled up to full height
+    let scale = peak.max(5.0);
+    // the last 60 samples, one bar each
+    let spark: String = h
+        .iter()
+        .skip(h.len().saturating_sub(60))
+        .map(|s| BARS[((s.1 / scale) * 7.0).round().clamp(0.0, 7.0) as usize])
+        .collect();
+    let (last, cpu, mem) = h[h.len() - 1];
+    let (start, _, first) = h[0];
+    let span = fmt_age(last.duration_since(start).as_secs());
+    let drift = match mem as i64 - first as i64 {
+        d if d.unsigned_abs() < 1024 * 1024 => format!("steady over {span}"),
+        d if d > 0 => format!("+{} over {span}", fmt_mem(d as u64)),
+        d => format!("−{} over {span}", fmt_mem(d.unsigned_abs())),
+    };
+    format!(
+        "cpu {spark} {cpu:.1}% · peak {peak:.1}% · mem {} {drift}",
+        fmt_mem(mem)
+    )
+}
+
 /// Where a session lives and what Enter does about it.
 fn where_line(a: &Agent) -> String {
     match &a.host {
-        Some(h) => format!("{} pane {} · Enter jumps there", h.kind.as_str(), h.target),
-        None => "no multiplexer pane marina can drive · Enter copies the resume command".into(),
+        Some(h) => format!("{} · Enter jumps there", h.describe()),
+        None => "no terminal marina can drive · Enter copies the resume command".into(),
     }
 }
 
@@ -773,6 +811,7 @@ fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'stat
     let mut lines = vec![
         Line::from(head),
         kv("cwd", cwd),
+        kv("trend", trend(app, &HistKey::Agent(a.pid))),
         kv(
             "resume",
             l.resume_hint()
@@ -804,10 +843,11 @@ fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'stat
         lines.push(kv(
             k,
             format!(
-                "{} · pid {} · {:.1}% · up {}",
+                "{} · pid {} · {:.1}% · {} · up {}",
                 c.label,
                 c.pid,
                 c.cpu_pct,
+                fmt_mem(c.mem_bytes),
                 fmt_uptime(c.start_time)
             ),
         ));
@@ -1275,6 +1315,51 @@ mod tests {
         let mut app = app_with_sample();
         assert!(render_to_string(&mut app, 120, 20).contains("BRANCH"));
         assert!(!render_to_string(&mut app, 64, 20).contains("BRANCH"));
+    }
+
+    #[test]
+    fn trend_line_shows_spark_peak_and_memory_drift() {
+        let mut app = app_with_sample();
+        let key = HistKey::Agent(1);
+        assert_eq!(trend(&app, &key), "—");
+        let mb = 1024 * 1024;
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        app.history.insert(
+            key.clone(),
+            [
+                (at(0), 0.0, 100 * mb),
+                (at(1), 10.0, 100 * mb),
+                (at(3), 40.0, 150 * mb),
+                (at(4), 2.0, 160 * mb),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let t = trend(&app, &key);
+        assert!(t.starts_with("cpu ▁▃█▁ 2.0% · peak 40.0%"), "{t}");
+        assert!(t.ends_with("mem 160MB +60MB over 4s"), "{t}");
+    }
+
+    #[test]
+    fn history_follows_rows_and_forgets_gone_ones() {
+        let snap = |seq: u64, n: usize| {
+            let mut s = Snapshot::sample();
+            s.seq = seq;
+            for (i, t) in s.targets.iter_mut().enumerate() {
+                t.pids = vec![100 + i as u32]; // measurable
+            }
+            s.targets.truncate(n);
+            s
+        };
+        let mut app = App::new();
+        app.apply(Arc::new(snap(1, 9)));
+        assert!(app.history.len() > 1);
+        let snap = snap(2, 1);
+        let kept = HistKey::Target(snap.targets[0].key.clone());
+        app.apply(Arc::new(snap));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[&kept].len(), 2, "one sample per snapshot");
     }
 
     #[test]

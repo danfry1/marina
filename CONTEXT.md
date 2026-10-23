@@ -107,9 +107,10 @@
   port (`opencode serve`) is still a Target — an **agent service** — but the
   project view shows it beside the agents section, not as a project.
 
-- **Host** — the multiplexer an agent session's terminal runs in, when marina
-  can drive it (herdr, tmux). Jump target, and for herdr a source of the
-  session's status (including *blocked*) and task title.
+- **Host** — the multiplexer or terminal app an agent session's terminal runs
+  in, when marina can drive it (herdr, tmux; iTerm2, Terminal, Ghostty,
+  WezTerm). Jump target, and for herdr a source of the session's status
+  (including *blocked*) and task title.
 
 - **Looks finished** — an agent session that is stale, has no live servers,
   and whose work tree is clean and pushed: the safest one to close.

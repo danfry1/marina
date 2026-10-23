@@ -1,5 +1,6 @@
 //! The immutable data model. See DESIGN.md "Type contract" and CONTEXT.md.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::hosts::HostStatus;
@@ -111,7 +112,33 @@ pub struct AgentChild {
     pub label: String,
     /// A shell the agent is running a command in (vs a long-lived helper).
     pub shell: bool,
-    pub cpu_pct: f32, // subtree, unsmoothed
+    pub cpu_pct: f32,   // subtree, unsmoothed
+    pub mem_bytes: u64, // subtree
+}
+
+/// Helpers that several sessions each run their own copy of — every Claude
+/// session starting `chrome-devtools-mcp`, say: `(label, copies, total mem)`,
+/// biggest first. What it would save to share them, or turn them off.
+pub fn repeated_helpers<'a>(
+    agents: impl IntoIterator<Item = &'a Agent>,
+) -> Vec<(String, usize, u64)> {
+    let mut by_label: HashMap<&str, (usize, u64)> = HashMap::new();
+    for c in agents
+        .into_iter()
+        .flat_map(|a| &a.children)
+        .filter(|c| !c.shell)
+    {
+        let e = by_label.entry(c.label.as_str()).or_default();
+        e.0 += 1;
+        e.1 += c.mem_bytes;
+    }
+    let mut out: Vec<(String, usize, u64)> = by_label
+        .into_iter()
+        .filter(|&(_, (n, _))| n > 1)
+        .map(|(l, (n, m))| (l.to_string(), n, m))
+        .collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 impl Agent {
@@ -218,6 +245,7 @@ impl Agent {
             label: label.into(),
             shell,
             cpu_pct: 0.0,
+            mem_bytes: 0,
         };
         Agent {
             name: "claude".into(),
@@ -399,6 +427,21 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_helpers_total_copies_across_sessions() {
+        let mut a = Agent::sample(1, "aaaa", "x");
+        let mut b = Agent::sample(2, "bbbb", "y");
+        for (ag, mem) in [(&mut a, 100), (&mut b, 300)] {
+            for c in ag.children.iter_mut() {
+                c.mem_bytes = mem;
+            }
+        }
+        let helper = a.children.iter().find(|c| !c.shell).unwrap().label.clone();
+        let r = repeated_helpers([&a, &b]);
+        assert_eq!(r, vec![(helper, 2, 400)], "shells aren't helpers");
+        assert!(repeated_helpers([&a]).is_empty(), "one copy isn't repeated");
+    }
+
     use super::*;
 
     #[test]

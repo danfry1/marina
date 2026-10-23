@@ -68,12 +68,18 @@ developer-process-centric.
   sessions are included; daemons and pty hosts are not. marina never stops an
   agent: `K` on an agent row explains why, and `K` on its header stops only
   its servers.
-- **Jump to a session** — `Enter` on an agent row focuses its pane in the
-  multiplexer it runs in: herdr (`herdr agent focus`) or tmux (switch to the
-  pane by its tty). Anywhere else it copies `cd <dir> && claude --resume <id>`
-  to paste into a terminal. Under herdr, marina also shows herdr's view of the
+- **Jump to a session** — `Enter` on an agent row focuses where it runs:
+  a herdr or tmux pane, or the iTerm2 session / Terminal tab / WezTerm pane on
+  its tty, or a Ghostty terminal in its directory (macOS asks once to let your
+  terminal control that app). Anywhere else it copies
+  `cd <dir> && claude --resume <id>` to paste into a terminal. Under herdr, marina also shows herdr's view of the
   session: its task title, and **needs you** when the agent is waiting on an
   approval or question.
+- **What it's costing** — `i` shows a two-minute cpu sparkline, peak and
+  memory drift for any row (`cpu ▁▁▃▇▅▂ 4.1% · peak 38% · mem 540MB +12MB
+  over 2m`), and each helper's memory. Helpers that every session runs its
+  own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
+  section and at the end of `marina agents`.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
   and `D` opens the uncommitted diff (stat, untracked files, patch) in the
@@ -307,7 +313,7 @@ marina is deliberately boring on this front:
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
-  `Enter` on an agent asks herdr/tmux to focus its pane. The one unprompted
+  `Enter` on an agent asks its multiplexer or terminal app to focus it. The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind, finishes, or needs you (`[notify] desktop = false` disables it).
 

@@ -117,7 +117,7 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   `stale` = idle with no terminal input for over a day), `cwd`, `branch`, `cpu_pct`,
   `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
   and `servers` (dev servers it started), plus `title` (the task, under
-  herdr), `host` (`{kind, target}` — the herdr/tmux pane), `git` (uncommitted /
+  herdr), `host` (`{kind, target}` — the herdr/tmux pane, or the iterm/terminal/wezterm tty or ghostty directory), `git` (uncommitted /
   untracked / unpushed counts) and `looks_finished` (stale, no servers, clean
   tree). `state` can also be `blocked` (waiting on a question). It's
   read-only — marina has no way to stop an agent session; tell the user which
