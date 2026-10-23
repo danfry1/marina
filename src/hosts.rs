@@ -91,6 +91,10 @@ pub struct HostInfo {
     /// The host's view of the session id — fresher than env markers, which
     /// older helpers keep from before a `/clear`.
     pub session: Option<String>,
+    /// The terminal app's own process, when it is a GUI app marina can bring
+    /// forward even if scripting can't pick the terminal (Ghostty runs one
+    /// process per instance and AppleScript reaches only one of them).
+    pub app_pid: Option<u32>,
 }
 
 impl HostInfo {
@@ -167,6 +171,7 @@ fn parse_herdr_list(json: &str) -> Vec<HostInfo> {
                 .agent_session
                 .and_then(|s| s.value)
                 .filter(|v| crate::launcher::is_session_id(v)),
+            app_pid: None,
         })
         .collect()
 }
@@ -274,11 +279,15 @@ impl Hosts {
             return Some(h.clone());
         }
         let tty = tty?;
-        let (kind, target) = match self.tmux.get(tty) {
-            Some(pane) => (HostKind::Tmux, pane.clone()),
+        let (kind, target, app_pid) = match self.tmux.get(tty) {
+            Some(pane) => (HostKind::Tmux, pane.clone(), None),
             None => match terminal_of(procs, pid)? {
-                HostKind::Ghostty => (HostKind::Ghostty, cwd.display().to_string()),
-                kind => (kind, tty.display().to_string()),
+                (HostKind::Ghostty, app) => {
+                    (HostKind::Ghostty, cwd.display().to_string(), Some(app))
+                }
+                // iTermServer isn't the app; the app is found by name
+                (HostKind::ITerm, _) => (HostKind::ITerm, tty.display().to_string(), None),
+                (kind, app) => (kind, tty.display().to_string(), Some(app)),
             },
         };
         Some(HostInfo {
@@ -287,19 +296,34 @@ impl Hosts {
             status: None,
             title: None,
             session: None,
+            app_pid,
         })
     }
 }
 
-/// The terminal app `pid` runs in: the first ancestor that is one.
-fn terminal_of(procs: &HashMap<u32, ProcInfo>, pid: u32) -> Option<HostKind> {
-    let mut cur = procs.get(&pid)?.ppid;
+/// The terminal app `pid` runs in, and that app's pid: the first ancestor
+/// that is one.
+fn terminal_of(procs: &HashMap<u32, ProcInfo>, pid: u32) -> Option<(HostKind, u32)> {
+    let app = |p: &ProcInfo| p.argv.first().and_then(|a| HostKind::terminal_app(a));
+    let mut cur = pid;
     for _ in 0..64 {
-        let p = procs.get(&cur?)?;
-        if let Some(kind) = p.argv.first().and_then(|a| HostKind::terminal_app(a)) {
-            return Some(kind);
+        let p = procs.get(&cur)?;
+        if cur != pid {
+            if let Some(kind) = app(p) {
+                return Some((kind, cur));
+            }
         }
-        cur = p.ppid;
+        cur = match p.ppid {
+            Some(pp) => pp,
+            // A root `login` hides its parent from us; a terminal app's
+            // children don't hide. Only a few terminal processes to ask.
+            None => {
+                return procs
+                    .values()
+                    .filter_map(|t| Some((app(t)?, t.pid)))
+                    .find(|&(_, t)| crate::sources::child_pids(t).contains(&cur));
+            }
+        };
     }
     None
 }
@@ -311,6 +335,19 @@ fn osascript(script: &str, args: &[&str]) -> Option<String> {
     cmd.arg("-e").arg(script).args(args);
     // a first jump may wait on the automation permission prompt
     crate::exec::output(cmd, Duration::from_secs(20)).map(|s| s.trim().to_string())
+}
+
+/// Bring the GUI app with process id `pid` to the front.
+fn activate_pid(pid: u32) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let script = format!(
+        "ObjC.import('AppKit'); var a = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid}); a ? a.activateWithOptions(0) : false"
+    );
+    let mut cmd = Command::new("osascript");
+    cmd.args(["-l", "JavaScript", "-e", &script]);
+    crate::exec::output(cmd, TIMEOUT).is_some_and(|o| o.trim() == "true")
 }
 
 const ITERM_FOCUS: &str = r#"on run argv
@@ -419,6 +456,12 @@ pub fn jump(host: &HostInfo) -> Result<String, String> {
             Some("1") => Ok(format!("focused the {}", host.describe())),
             Some(n) if n.parse::<u32>().is_ok() => Ok(format!(
                 "focused a Ghostty terminal in {} ({n} are open there)",
+                host.target
+            )),
+            // Several Ghostty instances: AppleScript reaches only one, which
+            // may not be this session's. Bring its own instance forward.
+            Some(_) if host.app_pid.is_some_and(activate_pid) => Ok(format!(
+                "brought its Ghostty window forward — Ghostty's scripting couldn't pick the terminal in {} (more than one Ghostty is running)",
                 host.target
             )),
             Some(_) => Err(format!("no {} any more", host.describe())),

@@ -169,6 +169,20 @@ pub fn tty_activity(path: &std::path::Path) -> Option<TtyActivity> {
     })
 }
 
+/// `pid`'s children, from the kernel's process list. For walking past a
+/// process whose parent sysinfo can't read (a root `login` under a terminal
+/// app): unprivileged, the parent is unknown, but a parent's children are not.
+#[cfg(target_os = "macos")]
+pub fn child_pids(pid: u32) -> Vec<u32> {
+    use libproc::processes::{pids_by_type, ProcFilter};
+    pids_by_type(ProcFilter::ByParentProcess { ppid: pid }).unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn child_pids(_pid: u32) -> Vec<u32> {
+    Vec::new() // Linux reads every parent from /proc
+}
+
 /// `pid`'s controlling terminal device (`/dev/ttys004`, `/dev/pts/3`).
 #[cfg(target_os = "macos")]
 pub fn tty_path(pid: u32) -> Option<PathBuf> {
@@ -205,6 +219,19 @@ pub fn tty_path(_pid: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lists_a_childs_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let found = child_pids(std::process::id()).contains(&child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found);
+    }
 
     #[test]
     fn sysinfo_sees_our_own_process() {

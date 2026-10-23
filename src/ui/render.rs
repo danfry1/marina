@@ -1260,6 +1260,7 @@ mod tests {
             status: Some(HostStatus::Blocked),
             title: Some("Agent visibility".into()),
             session: None,
+            app_pid: None,
         });
         a.git = Some(GitStatus {
             changed: 3,
