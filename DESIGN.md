@@ -496,7 +496,13 @@ after targets:
   (`CLAUDE_PID`), else the newest marked descendant — ids change on `/clear`
   and resume, and older helpers keep the id they started with — else the
   agent's argv (`--session-id`, `--resume`, `--session`, `resume <id>`,
-  validated). `link_sessions` then shares ids by pid in both directions with
+  validated). opencode keeps its id in its background service instead, so
+  for an opencode session with none, `opencode::Sessions` asks that service
+  (`opencode session list --format json` in the session's directory, only
+  while `opencode serve --service` is already running, cached 10s) and pairs
+  newest session with newest process, a session going only to a process
+  started before it was last updated; the list's title fills the task title
+  when no host reports one. `link_sessions` then shares ids by pid in both directions with
   the targets the agent launched, so a session and its servers group together
   and both show the resume command.
 
@@ -513,6 +519,58 @@ over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
 and open time. CPU alone was tried first and misread working sessions as
 idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
 are touched in idle sessions too, so marina reads nothing under `~/.claude`.
+
+**Terminal hosts** (`hosts.rs`): the multiplexer an agent's terminal lives
+in, when marina can drive it — herdr (matched by pid via `herdr pane
+process-info`, cached per pane) or tmux (matched by tty via `list-panes`).
+Queried only while the host's server process is running, every 3s at most,
+with a 1.5s deadline per call (`exec::output`). A host's status overrides the
+tty heuristic (herdr watches the screen, so it can report *blocked* on an
+approval or question, and *done*), its session id overrides env markers
+(those lag a `/clear`), and its terminal title is shown as the session's task.
+Without a multiplexer, the terminal app is recognised from the agent's
+ancestry (the first ancestor whose argv0 is iTerm2 / its `iTermServer`,
+Terminal.app, Ghostty or `wezterm-gui`; past a root `login`, whose parent
+is unreadable, by finding which terminal app lists it as a child) — no scripting while sampling, so
+no automation prompt until the user jumps.
+`Enter` on an agent row jumps: `herdr agent focus <pane>`, tmux
+`switch-client`/`select-window` + `select-pane`; iTerm2 and Terminal by
+AppleScript matching the session's/tab's `tty`; Ghostty by JXA addressed to the
+session's own Ghostty process (`Application(pid)` — AppleScript by name
+reaches only one of several running instances), focusing a terminal whose
+`working directory` is the agent's; Ghostty exposes no tty, so among
+several there it prefers one titled like the agent (`✳ …` or a braille
+spinner for Claude Code, `OC | …` for opencode) over, say, marina's own; WezTerm by `wezterm cli list` (tty → pane) and
+`activate-pane`; else copy `cd <dir> && <resume command>`. Values reach
+AppleScript as `on run argv` arguments, never spliced into the script.
+Adding a host (kitty, …) is a lookup arm keyed by pid, tty or directory plus
+a jump arm.
+
+A multiplexer host also records its *outer* terminal — the app its client
+runs in, up the session's own ancestry (herdr's server runs under its
+client) or else from a client process (a detached tmux server has none
+above it) — shown as `herdr·ghostty` in an agent row's VIA column, and
+raised by pid after the pane switch so the jump lands even from another
+window.
+
+**History**: the UI keeps ~2 minutes of cpu/mem per target and agent
+(`App::history`, pruned with the rows); `i` renders it as a sparkline with
+the peak and memory drift. Helpers several sessions each run a copy of
+(`model::repeated_helpers`, by label) are totalled on the agents section
+and after `marina agents`.
+
+**Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
+`diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached
+20s and refreshed at most 6 directories per tick, in parallel (the CLI refreshes all).
+Shown as a badge before the branch (`●4 ↑2`, `✓`); `D` streams `diff --stat`,
+untracked files and the patch into the log pane. *Looks finished* = stale, no
+live servers, clean and pushed tree — closing it loses nothing, and the
+session can be resumed.
+
+**Agent notices** (`App::agent_notices`): a working streak of 30s+ followed by
+10s quiet → `<label> finished after <d>`; a host-reported blocked state →
+`<label> needs you`, once per transition. Status line plus desktop
+notification; `[notify] agents = false` disables.
 
 Surfaces: the project view ends with a folded `agents` section (its own
 `Entry::Agents`, so it can't collide with a project of that name; `Enter`

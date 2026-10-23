@@ -145,6 +145,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
 /// One snapshot. `with_cpu` builds twice so CPU deltas are meaningful.
 fn snapshot(with_cpu: bool) -> Snapshot {
     let mut s = Sampler::new();
+    s.eager_git();
     let snap = s.build();
     if with_cpu {
         thread::sleep(Duration::from_millis(500));
@@ -323,10 +324,17 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
         println!("no agent sessions running");
         return if selectors.is_empty() { 0 } else { 1 };
     }
+    let pw = picked
+        .iter()
+        .map(|a| a.project.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(7, 32);
     println!(
-        "{:<9} {:<7} {:<20} {:>6} {:>8} {:<5} {:<10} DOING",
-        "AGENT", "PID", "PROJECT", "CPU", "MEM", "UP", "SESSION"
+        "{:<9} {:<7} {:<pw$} {:>6} {:>8} {:<5} {:<10} {:<8} DOING",
+        "AGENT", "PID", "PROJECT", "CPU", "MEM", "UP", "SESSION", "GIT"
     );
+    let repeated = crate::model::repeated_helpers(picked.iter().copied());
     for a in picked {
         // `$ cargo test` per live shell, `:3000` per server it started
         let mut doing: Vec<String> = a.shells().map(|c| format!("$ {}", c.label)).collect();
@@ -336,16 +344,22 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
                 .flat_map(|t| t.ports.iter().map(|p| format!(":{p}"))),
         );
         let now = now_secs();
+        let servers = servers_of(&snap, a).len();
         let doing = if doing.is_empty() {
-            match a.is_stale(now) {
-                true => format!("{} (stale)", a.activity(now)),
-                false => a.activity(now),
+            match (a.looks_finished(now, servers), a.is_stale(now)) {
+                (true, _) => format!("{} (stale, looks finished)", a.activity(now)),
+                (false, true) => format!("{} (stale)", a.activity(now)),
+                _ => a.activity(now),
             }
         } else {
             doing.join(" · ")
         };
+        let doing = match a.title() {
+            Some(t) => format!("{doing} — {t}"),
+            None => doing,
+        };
         println!(
-            "{:<9} {:<7} {:<20} {:>6} {:>8} {:<5} {:<10} {doing}",
+            "{:<9} {:<7} {:<pw$} {:>6} {:>8} {:<5} {:<10} {:<8} {doing}",
             a.name,
             a.pid,
             a.project,
@@ -354,11 +368,28 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
             fmt_uptime(a.start_time),
             a.session
                 .as_deref()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::launcher::short_id(s, 8))
                 .unwrap_or("—"),
+            a.git.map(|g| g.short()).unwrap_or_else(|| "—".into()),
+        );
+    }
+    if !repeated.is_empty() {
+        println!();
+        println!(
+            "helpers each session runs its own copy of: {}",
+            repeated_text(&repeated, usize::MAX)
         );
     }
     0
+}
+
+/// `chrome-devtools-mcp ×19 785MB, mobile-mcp ×2 90MB` — the first `n`.
+pub fn repeated_text(r: &[(String, usize, u64)], n: usize) -> String {
+    r.iter()
+        .take(n)
+        .map(|(l, k, m)| format!("{l} ×{k} {}MB", m / (1024 * 1024)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn kill(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
@@ -1051,8 +1082,9 @@ struct AgentJson {
     session: Option<String>,
     /// How to get back into it (`claude --resume <id>`, …).
     resume: Option<String>,
-    /// `working` (a shell running, or recent terminal output), `idle`, or
-    /// `stale` (idle, no terminal input for over a day).
+    /// `working` (a shell running, or recent terminal output), `blocked`
+    /// (waiting on a question, host-reported), `idle`, or `stale` (idle, no
+    /// terminal input for over a day).
     state: &'static str,
     cwd: String,
     project: String,
@@ -1068,6 +1100,32 @@ struct AgentJson {
     helpers: Vec<AgentChildJson>,
     /// Dev servers this session started (still running).
     servers: Vec<AgentServerJson>,
+    /// The session's task title, when its terminal host reports one.
+    title: Option<String>,
+    /// The multiplexer pane it runs in: `{kind: "herdr"|"tmux", target}`.
+    host: Option<HostJson>,
+    /// Its working tree: uncommitted, untracked and unpushed work.
+    git: Option<GitJson>,
+    /// Stale, no servers, and a clean, pushed tree.
+    looks_finished: bool,
+}
+
+#[derive(Serialize)]
+struct HostJson {
+    kind: &'static str,
+    target: String,
+    /// For herdr/tmux, the terminal app its client runs in.
+    outer: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct GitJson {
+    changed: u32,
+    untracked: u32,
+    insertions: u32,
+    deletions: u32,
+    ahead: Option<u32>,
+    behind: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1076,6 +1134,7 @@ struct AgentChildJson {
     command: String,
     uptime_secs: Option<u64>,
     cpu_pct: f32,
+    mem_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -1097,6 +1156,7 @@ impl AgentJson {
             command: c.label.clone(),
             uptime_secs: up(c.start_time),
             cpu_pct: c.cpu_pct,
+            mem_bytes: c.mem_bytes,
         };
         AgentJson {
             name: a.name.clone(),
@@ -1105,6 +1165,8 @@ impl AgentJson {
             resume: a.as_launcher().resume_hint(),
             state: if a.is_working(now) {
                 "working"
+            } else if a.is_blocked() {
+                "blocked"
             } else if a.is_stale(now) {
                 "stale"
             } else {
@@ -1127,6 +1189,21 @@ impl AgentJson {
                     ports: t.ports.clone(),
                 })
                 .collect(),
+            title: a.title().map(String::from),
+            host: a.host.as_ref().map(|h| HostJson {
+                kind: h.kind.as_str(),
+                target: h.target.clone(),
+                outer: h.outer.map(|o| o.as_str()),
+            }),
+            git: a.git.map(|g| GitJson {
+                changed: g.changed,
+                untracked: g.untracked,
+                insertions: g.insertions,
+                deletions: g.deletions,
+                ahead: g.ahead,
+                behind: g.behind,
+            }),
+            looks_finished: a.looks_finished(now, servers.len()),
         }
     }
 }
@@ -1333,10 +1410,14 @@ mod tests {
             "shells",
             "helpers",
             "servers",
+            "title",
+            "host",
+            "git",
+            "looks_finished",
         ] {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
-        assert_eq!(obj.len(), 15);
+        assert_eq!(obj.len(), 19);
         assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
         assert_eq!(j["shells"][0]["command"], "cargo test");
         assert_eq!(j["servers"][0]["ports"][0], 3000);

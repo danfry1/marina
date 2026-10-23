@@ -14,12 +14,15 @@ use ratatui::{
 };
 
 use super::format::{centered_rect, fmt_age, fmt_mem, fmt_uptime, tildify, unix_now};
-use super::state::{App, Entry, GroupBy, SortMode};
+use super::state::{App, Entry, GroupBy, HistKey, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
 
 /// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
-const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
+const COLW: [u16; 8] = [22, 16, 7, 7, 9, 14, 6, 15];
+/// How far PROJECT and BRANCH grow into spare width.
+const PROJECT_MAX: u16 = 36;
+const BRANCH_MAX: u16 = 40;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
@@ -30,9 +33,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if inspect_open {
         // an agent lists its shells/helpers below the usual five lines
         let h = if app.selected_agent().is_some() {
-            12
+            13
         } else {
-            9
+            10
         };
         constraints.push(Constraint::Length(h));
     }
@@ -65,10 +68,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let agents = match (app.snapshot.agents.len(), app.group_by) {
         (0, _) => String::new(),
-        (n, _) => {
-            let mem: u64 = app.snapshot.agents.iter().map(|a| a.mem_bytes).sum();
-            format!(" · {n} agents {}", fmt_mem(mem))
-        }
+        (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
     let title = format!(
         " marina · {} targets{agents} · sort:{}{} ",
@@ -124,7 +124,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .collect::<Vec<_>>(),
         )
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-        app.header_hits = header_hits(table_area, cols);
+        let colw = column_widths(table_area.width, cols);
+        app.project_w = colw[0];
+        app.header_hits = header_hits(table_area, &colw);
         let by_key: HashMap<&TargetKey, &Target> =
             app.snapshot.targets.iter().map(|t| (&t.key, t)).collect();
         let rows: Vec<Row> = app
@@ -132,14 +134,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .iter()
             .map(|e| entry_row(e, app, &by_key))
             .collect();
-        let widths: Vec<Constraint> = COLW[..cols]
-            .iter()
-            .map(|&w| Constraint::Length(w))
-            .collect();
+        let widths: Vec<Constraint> = colw.iter().map(|&w| Constraint::Length(w)).collect();
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+            .row_highlight_style(
+                // Reset first, so cell colors can't punch holes in the bar.
+                Style::new()
+                    .fg(Color::Reset)
+                    .bg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED),
+            )
             .highlight_symbol("▌ ")
             .highlight_spacing(HighlightSpacing::Always);
         frame.render_stateful_widget(table, table_area, &mut app.table_state);
@@ -177,7 +182,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         let lines = help_lines();
-        let area = centered_rect(58, lines.len() as u16 + 2, frame.area());
+        let area = centered_rect(72, lines.len() as u16 + 2, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" keys ")),
@@ -189,10 +194,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// Clickable header cells: (x_start, x_end, sort mode) for PORT/CPU/MEM.
 /// Accounts for the block border (1) and the always-reserved highlight
 /// symbol "▌ " (2), plus the default column spacing of 1.
-fn header_hits(area: Rect, cols: usize) -> Vec<(u16, u16, SortMode)> {
+fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
     let mut hits = Vec::new();
     let mut x = area.x + 1 + 2;
-    for (i, &w) in COLW[..cols].iter().enumerate() {
+    for (i, &w) in colw.iter().enumerate() {
         let mode = match i {
             2 => Some(SortMode::Port),
             3 => Some(SortMode::Cpu),
@@ -272,9 +277,14 @@ fn detail_line(app: &App) -> Line<'static> {
                 .sum();
             Line::styled(
                 format!(
-                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
+                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total{} · Enter folds/unfolds",
                     fmt_mem(stale_mem),
-                    fmt_mem(mem)
+                    fmt_mem(mem),
+                    match crate::model::repeated_helpers(&app.snapshot.agents).first() {
+                        // each session's own copy of the same MCP server adds up
+                        Some((l, k, m)) => format!(" · helpers: {l} ×{k} {}", fmt_mem(*m)),
+                        None => String::new(),
+                    }
                 ),
                 Style::new().fg(Color::Gray),
             )
@@ -283,37 +293,52 @@ fn detail_line(app: &App) -> Line<'static> {
             Some(a) => {
                 let l = a.as_launcher();
                 let now = unix_now();
-                let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
-                let doing = if !shells.is_empty() {
-                    format!("running {}", shells.join(", "))
-                } else if a.is_working(now) {
-                    "working".to_string()
-                } else if a.is_stale(now) {
+                let gray = Style::new().fg(Color::Gray);
+                let mut spans = Vec::new();
+                // the task title (from the host) says more than anything else
+                if let Some(t) = a.title() {
+                    spans.push(Span::styled(
+                        format!("  {t} · "),
+                        Style::new().fg(Color::White).add_modifier(Modifier::ITALIC),
+                    ));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                let doing = if a.is_stale(now) {
                     format!(
-                        "{}, no input for {} — stale",
+                        "{}, no input for {}{}",
                         a.activity(now),
-                        fmt_age(now.saturating_sub(a.last_input()))
+                        fmt_age(now.saturating_sub(a.last_input())),
+                        if app.closable(a, now) {
+                            " — looks finished"
+                        } else {
+                            " — stale"
+                        }
                     )
                 } else {
-                    "idle".to_string()
+                    let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+                    if shells.is_empty() {
+                        a.activity(now)
+                    } else {
+                        format!("running {}", shells.join(", "))
+                    }
                 };
-                let mut spans = vec![
-                    Span::styled(format!("  {}", l.describe()), launcher_style(&l)),
-                    Span::styled(
-                        format!(
-                            " · {} · {doing} · pids:{}",
-                            a.git_branch.as_deref().unwrap_or("—"),
-                            a.pids.len()
-                        ),
-                        Style::new().fg(Color::Gray),
-                    ),
-                ];
-                if let Some(hint) = l.resume_hint() {
-                    spans.push(Span::styled(
-                        format!(" · {hint}"),
-                        Style::new().fg(Color::DarkGray),
-                    ));
+                spans.push(Span::styled(doing, gray));
+                if let Some(g) = &a.git {
+                    spans.push(Span::styled(format!(" · {}", g.describe()), gray));
                 }
+                // before the long pid/dir/session part, so it's never cut off
+                spans.push(Span::styled(
+                    match &a.host {
+                        Some(h) => format!(" · Enter jumps ({})", h.short()),
+                        None => " · Enter copies resume".into(),
+                    },
+                    Style::new().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    format!(" · {}", l.describe()),
+                    launcher_style(&l),
+                ));
                 Line::from(spans)
             }
             None => Line::from(""),
@@ -379,7 +404,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
     };
     let lines: Vec<Line> = match (&app.selected, app.selected_target()) {
         (Some(Entry::Agent(_)), _) => match app.selected_agent() {
-            Some(a) => agent_inspect(a, key, val),
+            Some(a) => agent_inspect(a, app, key, val),
             None => vec![Line::from(" nothing selected")],
         },
         (_, Some(t)) => {
@@ -450,6 +475,9 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 }
                 None => kv("via", "—".into()),
             });
+            if t.container.is_none() {
+                lines.push(kv("trend", trend(app, &HistKey::Target(t.key.clone()))));
+            }
             lines.push(match &t.container {
                 Some(c) => kv("dockr", format!("container {c}")),
                 None => kv(
@@ -522,7 +550,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
                 _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             };
             Row::new(vec![
-                Cell::from(group_header_text(arrow, p, n)),
+                Cell::from(group_header_text(arrow, p, n, app.project_w)),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format!("{cpu:.1}%")),
@@ -566,7 +594,18 @@ fn agents_section_row(app: &App) -> Row<'static> {
     let (working, stale, cpu, mem) = agents_summary(app);
     let arrow = if app.agents_open { "▾" } else { "▸" };
     let n = app.snapshot.agents.len();
-    let busy = if working > 0 {
+    let blocked = app
+        .snapshot
+        .agents
+        .iter()
+        .filter(|a| a.is_blocked())
+        .count();
+    let busy = if blocked > 0 {
+        Span::styled(
+            format!("{blocked} need you"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if working > 0 {
         Span::styled(format!("{working} working"), Style::new().fg(Color::Yellow))
     } else {
         Span::styled("all idle", Style::new().fg(Color::DarkGray))
@@ -577,7 +616,7 @@ fn agents_section_row(app: &App) -> Row<'static> {
         Span::raw("")
     };
     Row::new(vec![
-        Cell::from(group_header_text(arrow, "agents", n)),
+        Cell::from(group_header_text(arrow, "agents", n, app.project_w)),
         Cell::from(busy),
         Cell::from(""),
         Cell::from(format!("{cpu:.1}%")),
@@ -608,16 +647,32 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     let project = match app.group_by {
         // under its session header, which already names it
         GroupBy::Session if !app.group_members(&label).is_empty() => Cell::from("  ↳"),
-        GroupBy::Session => Cell::from(Span::styled(label, style)),
+        GroupBy::Session => Cell::from(Span::styled(
+            ellipsize(&label, app.project_w as usize),
+            style,
+        )),
         // inside the agents section
-        GroupBy::Project => Cell::from(Span::styled(format!("  {label}"), style)),
+        GroupBy::Project => Cell::from(Span::styled(
+            format!(
+                "  {}",
+                ellipsize(&label, (app.project_w as usize).saturating_sub(2))
+            ),
+            style,
+        )),
     };
     // what it's doing, not which agent (the label says that)
     let activity = a.activity(now);
     let command = if a.shells().next().is_some() {
         Span::styled(activity, Style::new().fg(Color::Yellow))
+    } else if a.is_blocked() {
+        Span::styled(
+            activity,
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
     } else if a.is_working(now) {
         Span::styled(activity, launcher_style(&l))
+    } else if activity == "done" {
+        Span::styled(activity, Style::new().fg(Color::Green))
     } else {
         Span::styled(activity, Style::new().fg(Color::DarkGray))
     };
@@ -627,15 +682,14 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
         Cell::from(format!("{:.1}%", a.cpu_pct)),
         Cell::from(fmt_mem(a.mem_bytes)),
-        Cell::from(Span::styled(
-            a.session
-                .as_deref()
-                .map(|s| s[..s.len().min(8)].to_string())
-                .unwrap_or_else(|| "—".into()),
-            Style::new().fg(Color::DarkGray),
-        )),
+        // where it lives, i.e. where Enter goes (the session id is in the
+        // detail line and `i`)
+        Cell::from(match &a.host {
+            Some(h) => Span::raw(h.short()),
+            None => Span::styled("—", Style::new().fg(Color::DarkGray)),
+        }),
         Cell::from(fmt_uptime(a.start_time)),
-        Cell::from(a.git_branch.clone().unwrap_or_else(|| "—".into())),
+        branch_cell(a),
     ]);
     // idle for days: dim the whole row, it's the one to go close
     if stale {
@@ -645,9 +699,67 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     }
 }
 
+/// `●4 ↑2 main` — what's uncommitted / unpushed (`✓` when clean), then the
+/// branch; the badge goes first so a long branch name can't hide it.
+fn branch_cell(a: &Agent) -> Cell<'static> {
+    let branch = a.git_branch.clone().unwrap_or_else(|| "—".into());
+    match &a.git {
+        Some(g) => {
+            let color = if g.is_clean() {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
+            Cell::from(Line::from(vec![
+                Span::styled(format!("{} ", g.short()), Style::new().fg(color)),
+                Span::raw(branch),
+            ]))
+        }
+        None => Cell::from(branch),
+    }
+}
+
+/// `cpu ▁▁▃▇▅▂▁ 4.1% · peak 38% · mem 540MB +12MB over 2m` over the recorded
+/// history, so a spike or a leak shows without watching the row.
+fn trend(app: &App, key: &HistKey) -> String {
+    let Some(h) = app.history.get(key).filter(|h| !h.is_empty()) else {
+        return "—".into();
+    };
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let peak = h.iter().map(|s| s.1).fold(0.0_f32, f32::max);
+    // a floor so an idle row reads flat, not as noise scaled up to full height
+    let scale = peak.max(5.0);
+    // the last 60 samples, one bar each
+    let spark: String = h
+        .iter()
+        .skip(h.len().saturating_sub(60))
+        .map(|s| BARS[((s.1 / scale) * 7.0).round().clamp(0.0, 7.0) as usize])
+        .collect();
+    let (last, cpu, mem) = h[h.len() - 1];
+    let (start, _, first) = h[0];
+    let span = fmt_age(last.duration_since(start).as_secs());
+    let drift = match mem as i64 - first as i64 {
+        d if d.unsigned_abs() < 1024 * 1024 => format!("steady over {span}"),
+        d if d > 0 => format!("+{} over {span}", fmt_mem(d as u64)),
+        d => format!("−{} over {span}", fmt_mem(d.unsigned_abs())),
+    };
+    format!(
+        "cpu {spark} {cpu:.1}% · peak {peak:.1}% · mem {} {drift}",
+        fmt_mem(mem)
+    )
+}
+
+/// Where a session lives and what Enter does about it.
+fn where_line(a: &Agent) -> String {
+    match &a.host {
+        Some(h) => format!("{} · Enter jumps there", h.describe()),
+        None => "no terminal marina can drive · Enter copies the resume command".into(),
+    }
+}
+
 /// Inspect for an agent session: who/where, how to resume, and what it's
 /// running right now — shells first, then helpers (MCP servers, …).
-fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
+fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'static>> {
     let kv = |k: &str, v: String| {
         Line::from(vec![
             Span::styled(format!(" {k:<6} "), key),
@@ -655,56 +767,68 @@ fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
         ])
     };
     let l = a.as_launcher();
+    let now = unix_now();
     let cmd = if a.argc > 0 {
         format!("{} (+{} args)", a.argv0, a.argc)
     } else {
         a.argv0.clone()
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!(" {} session", a.name),
-                launcher_style(&l).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" · {}", a.project), val),
-        ]),
-        kv("cmd", cmd),
-        kv(
-            "cwd",
-            format!(
-                "{} · {}",
-                tildify(&a.cwd.display().to_string()),
-                a.git_branch.as_deref().unwrap_or("—")
-            ),
+    let mut head = vec![
+        Span::styled(
+            format!(" {} session", a.name),
+            launcher_style(&l).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!(" · {}", a.project), val),
+    ];
+    if let Some(t) = a.title() {
+        head.push(Span::styled(
+            format!(" — {t}"),
+            Style::new().add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let mut cwd = format!(
+        "{} · {}",
+        tildify(&a.cwd.display().to_string()),
+        a.git_branch.as_deref().unwrap_or("—")
+    );
+    if let Some(g) = &a.git {
+        cwd.push_str(&format!(" · {} · D shows the diff", g.describe()));
+    }
+    let state = match a.tty {
+        Some(t) => format!(
+            "{} · output {} ago · input {} ago",
+            a.activity(now),
+            fmt_age(now.saturating_sub(t.output)),
+            fmt_age(now.saturating_sub(t.input))
+        ),
+        None => format!("{} · no terminal (judged by CPU)", a.activity(now)),
+    };
+    let state = if app.closable(a, now) {
+        format!("{state} · looks finished: stale, no servers, clean tree")
+    } else {
+        state
+    };
+    let mut lines = vec![
+        Line::from(head),
+        kv("cwd", cwd),
+        kv("trend", trend(app, &HistKey::Agent(a.pid))),
         kv(
             "resume",
             l.resume_hint()
                 .unwrap_or_else(|| a.session.clone().unwrap_or_else(|| "—".into())),
         ),
+        kv("where", where_line(a)),
+        kv("state", state),
         kv(
             "procs",
             format!(
-                "{} pids · pid {} · up {} · marina never stops agents",
+                "{cmd} · {} pids · pid {} · up {} · marina never stops agents",
                 a.pids.len(),
                 a.pid,
                 fmt_uptime(a.start_time)
             ),
         ),
     ];
-    let now = unix_now();
-    lines.push(kv(
-        "tty",
-        match a.tty {
-            Some(t) => format!(
-                "{} · output {} ago · input {} ago",
-                a.activity(now),
-                fmt_age(now.saturating_sub(t.output)),
-                fmt_age(now.saturating_sub(t.input))
-            ),
-            None => format!("{} · no terminal (judged by CPU)", a.activity(now)),
-        },
-    ));
     if a.children.is_empty() {
         lines.push(kv("doing", "no shells or helpers".into()));
     }
@@ -719,10 +843,11 @@ fn agent_inspect(a: &Agent, key: Style, val: Style) -> Vec<Line<'static>> {
         lines.push(kv(
             k,
             format!(
-                "{} · pid {} · {:.1}% · up {}",
+                "{} · pid {} · {:.1}% · {} · up {}",
                 c.label,
                 c.pid,
                 c.cpu_pct,
+                fmt_mem(c.mem_bytes),
                 fmt_uptime(c.start_time)
             ),
         ));
@@ -740,7 +865,11 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         Some(p) => format!(":{p}"),
         None => "—".into(),
     };
-    let project_text = if indent {
+    let service = crate::launcher::agent_service(&t.anchor_argv);
+    let project_text = if let Some(agent) = service.filter(|_| !indent) {
+        // beside the agents section: whose server it is
+        format!("{agent} server")
+    } else if indent {
         "  ↳".to_string()
     } else {
         match t.kind {
@@ -818,16 +947,36 @@ fn infra_tag(label: &str) -> Option<&'static str> {
 /// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
 /// `▾ label (n)` sized to the PROJECT column: a long label is cut with `…`
 /// so the member count always stays visible.
-fn group_header_text(arrow: &str, label: &str, n: usize) -> String {
+fn group_header_text(arrow: &str, label: &str, n: usize, width: u16) -> String {
     let suffix = format!(" ({n})");
-    let room = (COLW[0] as usize).saturating_sub(2 + suffix.chars().count());
-    let label = if label.chars().count() > room {
-        let cut: String = label.chars().take(room.saturating_sub(1)).collect();
-        format!("{cut}…")
-    } else {
-        label.to_string()
-    };
-    format!("{arrow} {label}{suffix}")
+    let room = (width as usize).saturating_sub(2 + suffix.chars().count());
+    format!("{arrow} {}{suffix}", ellipsize(label, room))
+}
+
+/// `s` cut to `room` columns, ending in `…` when it doesn't fit.
+fn ellipsize(s: &str, room: usize) -> String {
+    if s.chars().count() <= room {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(room.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Column widths for a table `width` wide showing `cols` columns: the
+/// minimums in `COLW`, with spare room going to PROJECT (long session
+/// labels) and then BRANCH, so a wide terminal doesn't cut names short.
+fn column_widths(width: u16, cols: usize) -> Vec<u16> {
+    let mut w = COLW[..cols].to_vec();
+    // borders (2), highlight symbol (2), one space between columns
+    let used = 4 + w.iter().sum::<u16>() + cols.saturating_sub(1) as u16;
+    let mut spare = width.saturating_sub(used);
+    let grow = spare.min(PROJECT_MAX - COLW[0]);
+    w[0] += grow;
+    spare -= grow;
+    if cols == COLW.len() {
+        w[cols - 1] += spare.min(BRANCH_MAX - COLW[cols - 1]);
+    }
+    w
 }
 
 /// Agents stand out (an orphan — its session ended — in yellow); editors and
@@ -844,11 +993,11 @@ fn launcher_style(l: &Launcher) -> Style {
 /// Columns that fit: each needs its width + 1 spacing, plus borders and the
 /// highlight gutter (4).
 fn visible_columns(width: u16) -> usize {
-    if width >= 105 {
+    if width >= 107 {
         8
-    } else if width >= 89 {
+    } else if width >= 91 {
         7
-    } else if width >= 82 {
+    } else if width >= 84 {
         6
     } else {
         5
@@ -868,7 +1017,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         row("j / k", "move (mouse: click, wheel)"),
         row("g / G", "top / bottom"),
-        row("Enter", "fold / unfold group"),
+        row("Enter", "fold / unfold group · on an agent: jump to it"),
+        row("D", "uncommitted diff of the agent / server's tree"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row(
@@ -984,6 +1134,17 @@ mod tests {
     }
 
     #[test]
+    fn spare_width_goes_to_project_then_branch() {
+        assert_eq!(column_widths(107, 8), COLW.to_vec(), "no spare room");
+        let w = column_widths(140, 8);
+        assert_eq!((w[0], w[7]), (36, 34));
+        let w = column_widths(300, 8);
+        assert_eq!((w[0], w[7]), (PROJECT_MAX, BRANCH_MAX));
+        assert_eq!(column_widths(91, 7)[0], 22);
+        assert_eq!(column_widths(97, 7)[0], 28, "narrow panes grow PROJECT too");
+    }
+
+    #[test]
     fn visible_columns_drop_from_the_right_when_narrow() {
         assert_eq!(visible_columns(120), 8);
         assert_eq!(visible_columns(95), 7);
@@ -1069,7 +1230,10 @@ mod tests {
         let out = render_to_string(&mut app, 120, 20);
         assert!(out.contains("claude·marina"), "idle agent row is labelled");
         assert!(out.contains("$ cargo test"), "COMMAND says what it's doing");
-        assert!(out.contains("41616c1a"), "session id in the VIA column");
+        assert!(
+            !out.contains("41616c1a"),
+            "VIA says where it lives, not the id"
+        );
 
         app.selected = Some(Entry::Agent(4242));
         app.toggle_inspect();
@@ -1085,12 +1249,69 @@ mod tests {
     }
 
     #[test]
+    fn agent_rows_show_host_title_git_and_blocked_state() {
+        use crate::git::GitStatus;
+        use crate::hosts::{HostInfo, HostKind, HostStatus};
+        use crate::model::Agent;
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let mut a = Agent::sample(4242, "41616c1a", "marina");
+        a.children.clear();
+        a.host = Some(HostInfo {
+            kind: HostKind::Herdr,
+            target: "w2S:p1".into(),
+            status: Some(HostStatus::Blocked),
+            title: Some("Agent visibility".into()),
+            session: None,
+            app_pid: None,
+            outer: Some(HostKind::Ghostty),
+        });
+        a.git = Some(GitStatus {
+            changed: 3,
+            untracked: 1,
+            insertions: 40,
+            deletions: 2,
+            ahead: Some(2),
+            behind: Some(0),
+        });
+        snap.agents = vec![a];
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(
+            out.contains("1 need you"),
+            "section header leads with it: {out}"
+        );
+
+        app.toggle_group_by();
+        app.selected = Some(Entry::Agent(4242));
+        let out = render_to_string(&mut app, 160, 20);
+        assert!(out.contains("needs you"));
+        assert!(
+            out.contains("●4 ↑2 main"),
+            "git badge before the branch: {out}"
+        );
+        assert!(
+            out.contains("Agent visibility"),
+            "task title in the detail line"
+        );
+        assert!(out.contains("3 files +40 −2 · 1 untracked · 2 unpushed"));
+        assert!(out.contains("Enter jumps (herdr·ghostty)"), "{out}");
+        assert!(out.contains("herdr·ghostty"), "where it lives, in VIA");
+
+        app.toggle_inspect();
+        let out = render_to_string(&mut app, 160, 30);
+        assert!(out.contains("herdr pane w2S:p1 in Ghostty · Enter jumps there"));
+        assert!(out.contains("D shows the diff"));
+    }
+
+    #[test]
     fn long_group_labels_keep_their_count_visible() {
-        let t = group_header_text("▾", "claude·courts-portfolio-site", 3);
+        let t = group_header_text("▾", "claude·courts-portfolio-site", 3, COLW[0]);
         assert_eq!(t.chars().count(), COLW[0] as usize);
         assert!(t.ends_with("… (3)"), "{t}");
         assert_eq!(
-            group_header_text("▾", "client-portal", 2),
+            group_header_text("▾", "client-portal", 2, COLW[0]),
             "▾ client-portal (2)"
         );
     }
@@ -1100,6 +1321,51 @@ mod tests {
         let mut app = app_with_sample();
         assert!(render_to_string(&mut app, 120, 20).contains("BRANCH"));
         assert!(!render_to_string(&mut app, 64, 20).contains("BRANCH"));
+    }
+
+    #[test]
+    fn trend_line_shows_spark_peak_and_memory_drift() {
+        let mut app = app_with_sample();
+        let key = HistKey::Agent(1);
+        assert_eq!(trend(&app, &key), "—");
+        let mb = 1024 * 1024;
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        app.history.insert(
+            key.clone(),
+            [
+                (at(0), 0.0, 100 * mb),
+                (at(1), 10.0, 100 * mb),
+                (at(3), 40.0, 150 * mb),
+                (at(4), 2.0, 160 * mb),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let t = trend(&app, &key);
+        assert!(t.starts_with("cpu ▁▃█▁ 2.0% · peak 40.0%"), "{t}");
+        assert!(t.ends_with("mem 160MB +60MB over 4s"), "{t}");
+    }
+
+    #[test]
+    fn history_follows_rows_and_forgets_gone_ones() {
+        let snap = |seq: u64, n: usize| {
+            let mut s = Snapshot::sample();
+            s.seq = seq;
+            for (i, t) in s.targets.iter_mut().enumerate() {
+                t.pids = vec![100 + i as u32]; // measurable
+            }
+            s.targets.truncate(n);
+            s
+        };
+        let mut app = App::new();
+        app.apply(Arc::new(snap(1, 9)));
+        assert!(app.history.len() > 1);
+        let snap = snap(2, 1);
+        let kept = HistKey::Target(snap.targets[0].key.clone());
+        app.apply(Arc::new(snap));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[&kept].len(), 2, "one sample per snapshot");
     }
 
     #[test]

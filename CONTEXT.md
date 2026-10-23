@@ -103,7 +103,17 @@
   (daemons, pty hosts, `app-server`, `serve`). *Not a Target* (ADR 0004): no
   verb, selector or scope reaches it. Its **shells** are the direct children
   running a command now; its **helpers** are the long-lived ones (MCP servers).
-  Listed in session view and by `marina agents`.
+  Listed in session view and by `marina agents`. Its plumbing that holds a
+  port (`opencode serve`) is still a Target — an **agent service** — but the
+  project view shows it beside the agents section, not as a project.
+
+- **Host** — the multiplexer or terminal app an agent session's terminal runs
+  in, when marina can drive it (herdr, tmux; iTerm2, Terminal, Ghostty,
+  WezTerm). Jump target, and for herdr a source of the session's status
+  (including *blocked*) and task title.
+
+- **Looks finished** — an agent session that is stale, has no live servers,
+  and whose work tree is clean and pushed: the safest one to close.
 
 - **Orphaned** — a Target whose launching agent session has ended while the
   server kept running (`claude·ended`). Distinct from *detached*, which carries

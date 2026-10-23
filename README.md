@@ -58,7 +58,9 @@ developer-process-centric.
   `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
   project view, and a row per session in the session view. Each shows what it
   is doing (`$ cargo test`, `working`, `idle 12m`), its cpu/mem (agent + MCP
-  helpers), dir, branch and session id; `i` lists its shells and helpers and
+  helpers), dir, branch and session id; an agent's background server
+  (`opencode serve`) is shown just above that section, always visible, as
+  `opencode server`, rather than as a project among the dev servers; `i` lists its shells and helpers and
   the resume command. Working vs idle comes from when its terminal was last
   written to, like `w`'s IDLE column. Sessions whose terminal has had no input
   for over a day are dimmed as *stale* — usually a forgotten session holding
@@ -66,6 +68,30 @@ developer-process-centric.
   sessions are included; daemons and pty hosts are not. marina never stops an
   agent: `K` on an agent row explains why, and `K` on its header stops only
   its servers.
+- **Jump to a session** — an agent row's `VIA` says where it lives
+  (`herdr·ghostty`, `tmux·iterm`, `ghostty`, `—` for no terminal), and
+  `Enter` focuses it there — switching the multiplexer's pane and raising
+  the terminal app showing it:
+  a herdr or tmux pane, or the iTerm2 session / Terminal tab / WezTerm pane on
+  its tty, or a Ghostty terminal in its directory (macOS asks once to let your
+  terminal control that app). Anywhere else it copies
+  `cd <dir> && claude --resume <id>` to paste into a terminal. Under herdr, marina also shows herdr's view of the
+  session: its task title, and **needs you** when the agent is waiting on an
+  approval or question.
+- **What it's costing** — `i` shows a two-minute cpu sparkline, peak and
+  memory drift for any row (`cpu ▁▁▃▇▅▂ 4.1% · peak 38% · mem 540MB +12MB
+  over 2m`), and each helper's memory. Helpers that every session runs its
+  own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
+  section and at the end of `marina agents`.
+- **What each agent changed** — the BRANCH column leads with the work tree's
+  state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
+  and `D` opens the uncommitted diff (stat, untracked files, patch) in the
+  pane below. A stale session with no servers and a clean, pushed tree is
+  marked *looks finished* — the one to close first.
+- **Agent notices** — when a session finishes a stretch of work (30s+, then
+  quiet) or starts waiting on you: `claude·api finished after 12m`,
+  `claude·api needs you`, in the status line and as a desktop notification
+  (`[notify] agents = false` turns these off).
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification
@@ -133,7 +159,8 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | key | action |
 |---|---|
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
-| `Enter` | fold / unfold a project group |
+| `Enter` | fold / unfold a group · on an agent row: jump to its pane |
+| `D` | uncommitted diff of the selected agent's / server's work tree |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -242,7 +269,8 @@ members = [3000, 5432, "worker"]
 match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 
 [notify]
-desktop = false                # no desktop notification for orphaned servers
+desktop = false                # no desktop notifications at all
+agents  = false                # no "finished" / "needs you" agent notices
 ```
 
 ## Privacy & security
@@ -273,7 +301,11 @@ marina is deliberately boring on this front:
   server to its agent session. Of those, only pids and validated session ids
   are kept; flag values are never read, and no other variable is kept,
   displayed, or serialized; for agent sessions, their terminal device's
-  last-written / last-read timestamps (never the screen contents); the nearest project
+  last-written / last-read timestamps (never the screen contents), their work
+  tree's `git status` / `git diff --shortstat` (run with
+  `GIT_OPTIONAL_LOCKS=0`, so marina never takes a lock an agent needs), and —
+  only when herdr or tmux is running — those tools' own pane listings
+  (`herdr agent list`, `tmux list-panes`); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
@@ -283,9 +315,10 @@ marina is deliberately boring on this front:
   panel shows just the program path and an arg count. argv is used for
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
-  browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes.
-  The one unprompted action is a local desktop notification when an agent
-  session leaves servers behind (`[notify] desktop = false` disables it).
+  browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
+  `Enter` on an agent asks its multiplexer or terminal app to focus it. The one unprompted
+  action is a local desktop notification when an agent session leaves servers
+  behind, finishes, or needs you (`[notify] desktop = false` disables it).
 
 ## Design
 

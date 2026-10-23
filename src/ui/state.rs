@@ -33,6 +33,10 @@ pub(crate) const FREEZE: Duration = Duration::from_secs(2);
 pub(crate) const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Orphan notices outlive ordinary status messages — they ask for a decision.
 pub(crate) const NOTICE_TTL: Duration = Duration::from_secs(20);
+/// An agent working at least this long gets a "finished" notice when it stops.
+const AGENT_WORK_MIN: u64 = 30;
+/// ...once it has been quiet this long (rides out pauses between tool calls).
+const AGENT_QUIET: u64 = 10;
 /// How long a newly-appeared row flashes.
 pub(crate) const FLASH: Duration = Duration::from_millis(1500);
 /// How long after a marina-initiated kill/restart a vanished target is NOT
@@ -135,6 +139,12 @@ pub struct App {
     pub(crate) agent_session_of: HashMap<u32, String>,
     /// Project view's `agents` section is unfolded.
     pub(crate) agents_open: bool,
+    /// Notify when an agent finishes or starts waiting (`[notify] agents`).
+    pub notify_agents: bool,
+    /// Per agent pid: (started, last seen) working, unix seconds.
+    agent_streaks: HashMap<u32, (u64, u64)>,
+    /// Agents already reported as waiting on a question.
+    agent_blocked: HashSet<u32>,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -160,6 +170,11 @@ pub struct App {
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
+    /// PROJECT column width at the last render (it grows with the pane).
+    pub(crate) project_w: u16,
+    /// Recent cpu/mem per target and per agent session, for the inspect
+    /// panel's trend line.
+    pub(crate) history: HashMap<HistKey, VecDeque<(Instant, f32, u64)>>,
 }
 
 impl App {
@@ -180,6 +195,9 @@ impl App {
             session_of: HashMap::new(),
             agent_session_of: HashMap::new(),
             agents_open: false,
+            notify_agents: true,
+            agent_streaks: HashMap::new(),
+            agent_blocked: HashSet::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -196,6 +214,8 @@ impl App {
             table_rect: Rect::default(),
             log_rect: None,
             header_hits: Vec::new(),
+            project_w: 22,
+            history: HashMap::new(),
         }
     }
 
@@ -205,6 +225,7 @@ impl App {
     /// and to notice targets that vanished *without* marina killing them.
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
+        self.record_history();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -239,6 +260,12 @@ impl App {
                 self.notifications.push(msg.clone());
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
             }
+            if self.notify_agents {
+                for msg in self.agent_notices(unix_now()) {
+                    self.notifications.push(msg.clone());
+                    self.set_notice(format!("{msg} · Enter on its row jumps there"));
+                }
+            }
         } else {
             let n = self
                 .snapshot
@@ -257,6 +284,67 @@ impl App {
             session_groups(&self.snapshot.targets, &self.snapshot.agents);
         self.data_warning = self.snapshot.error.clone();
         self.dirty = true;
+    }
+
+    /// Agents that finished a stretch of work, or started waiting on a
+    /// question, since the last snapshot: `claude·api finished after 12m`,
+    /// `claude·api needs you`. Each transition is reported once.
+    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
+        self.agent_streaks.retain(|pid, _| live.contains(pid));
+        self.agent_blocked.retain(|pid| live.contains(pid));
+        for a in &self.snapshot.agents {
+            let label = self
+                .agent_session_of
+                .get(&a.pid)
+                .cloned()
+                .unwrap_or_else(|| a.name.clone());
+            if a.is_blocked() {
+                if self.agent_blocked.insert(a.pid) {
+                    out.push(format!("{label} needs you"));
+                }
+                self.agent_streaks.remove(&a.pid); // the question says it all
+                continue;
+            }
+            self.agent_blocked.remove(&a.pid);
+            if a.is_working(now) {
+                self.agent_streaks
+                    .entry(a.pid)
+                    .and_modify(|s| s.1 = now)
+                    .or_insert((now, now));
+            } else if let Some(&(start, last)) = self.agent_streaks.get(&a.pid) {
+                if now.saturating_sub(last) >= AGENT_QUIET {
+                    self.agent_streaks.remove(&a.pid);
+                    if last.saturating_sub(start) >= AGENT_WORK_MIN {
+                        out.push(format!(
+                            "{label} finished after {}",
+                            super::format::fmt_age(last - start)
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Servers this agent session started (its live launcher is the agent).
+    pub(crate) fn agent_servers(&self, a: &Agent) -> Vec<&Target> {
+        self.snapshot
+            .targets
+            .iter()
+            .filter(|t| {
+                t.launcher
+                    .as_ref()
+                    .is_some_and(|l| l.alive && l.name == a.name && l.pid == Some(a.pid))
+            })
+            .collect()
+    }
+
+    /// Stale, no servers, and nothing uncommitted or unpushed: it looks
+    /// finished. (Closing never loses files, and the session can be resumed.)
+    pub(crate) fn closable(&self, a: &Agent, now: u64) -> bool {
+        a.looks_finished(now, self.agent_servers(a).len())
     }
 
     /// The sampler channel disconnected — data is frozen; say so, loudly.
@@ -691,6 +779,14 @@ impl App {
         self.dirty = true;
     }
 
+    /// Read from the top instead of following the tail (a diff, not a log).
+    pub fn log_from_top(&mut self) {
+        if let Some(l) = &mut self.log {
+            l.scroll = Some(0);
+            self.dirty = true;
+        }
+    }
+
     pub fn close_log(&mut self) {
         if let Some(old) = self.log.take() {
             old.close();
@@ -819,6 +915,33 @@ impl App {
         }
     }
 
+    /// Append this snapshot's cpu/mem to each row's history; forget rows
+    /// that are gone.
+    fn record_history(&mut self) {
+        let snap = Arc::clone(&self.snapshot);
+        let now: Vec<(HistKey, f32, u64)> = snap
+            .targets
+            .iter()
+            .filter(|t| !t.pids.is_empty())
+            .map(|t| (HistKey::Target(t.key.clone()), t.cpu_pct, t.mem_bytes))
+            .chain(
+                snap.agents
+                    .iter()
+                    .map(|a| (HistKey::Agent(a.pid), a.cpu_pct, a.mem_bytes)),
+            )
+            .collect();
+        let live: HashSet<&HistKey> = now.iter().map(|(k, _, _)| k).collect();
+        self.history.retain(|k, _| live.contains(k));
+        let at = Instant::now();
+        for (k, cpu, mem) in &now {
+            let h = self.history.entry(k.clone()).or_default();
+            if h.len() == HISTORY {
+                h.pop_front();
+            }
+            h.push_back((at, *cpu, *mem));
+        }
+    }
+
     // --- layout -------------------------------------------------------------
 
     /// Group targets by project, sort groups + members by the active mode, and
@@ -827,13 +950,23 @@ impl App {
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
         let targets = &self.snapshot.targets;
         let agents = &self.snapshot.agents;
-        let visible: Vec<usize> = (0..targets.len())
+        let mut visible: Vec<usize> = (0..targets.len())
             .filter(|&i| self.matches(&targets[i]))
             .collect();
+        // Project view: agents' background services sit beside the agents.
+        let services: Vec<usize> = match self.group_by {
+            GroupBy::Project => visible
+                .iter()
+                .copied()
+                .filter(|&i| is_agent_service(&targets[i]))
+                .collect(),
+            GroupBy::Session => Vec::new(),
+        };
+        visible.retain(|i| !services.contains(i));
         let visible_agents: Vec<usize> = (0..agents.len())
             .filter(|&i| self.matches_agent(&agents[i]))
             .collect();
-        if visible.is_empty() && visible_agents.is_empty() {
+        if visible.is_empty() && visible_agents.is_empty() && services.is_empty() {
             return Vec::new();
         }
         // working, then idle, then stale; alphabetical within each
@@ -954,6 +1087,12 @@ impl App {
                 }
             }
         }
+        // always visible, right above the (folded) sessions they serve
+        entries.extend(
+            services
+                .iter()
+                .map(|&i| Entry::Target(targets[i].key.clone())),
+        );
         if !section.is_empty() {
             entries.push(Entry::Agents);
             // a filter that hits an agent opens the section
@@ -1050,7 +1189,7 @@ pub(crate) fn session_groups(
     let label = |l: Option<&Launcher>| {
         let (base, id) = base_and_id(l);
         if ids[&base].len() > 1 && !id.is_empty() {
-            format!("{base} #{}", &id[..id.len().min(4)])
+            format!("{base} #{}", crate::launcher::short_id(&id, 4))
         } else {
             base
         }
@@ -1135,6 +1274,22 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
     }
+}
+
+/// Samples of history kept per row: about two minutes at the 1s tick.
+pub(crate) const HISTORY: usize = 120;
+
+/// Whose history: a target, or an agent session by pid.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HistKey {
+    Target(TargetKey),
+    Agent(u32),
+}
+
+/// A target that is an agent's background service (`opencode serve`), which
+/// the project view lists beside the agents section rather than as a project.
+pub(crate) fn is_agent_service(t: &Target) -> bool {
+    crate::launcher::agent_service(&t.anchor_argv).is_some()
 }
 
 #[cfg(test)]
@@ -1270,6 +1425,45 @@ mod tests {
     }
 
     #[test]
+    fn agent_servers_sit_beside_the_agents_section() {
+        let mut snap = Snapshot::sample();
+        snap.seq = 1;
+        let mut svc = snap.targets[0].clone();
+        svc.key = TargetKey::Port(49374);
+        svc.ports = vec![49374];
+        svc.project = "opencode".into();
+        svc.anchor_argv = vec![
+            "/opt/homebrew/bin/opencode".into(),
+            "serve".into(),
+            "--service".into(),
+        ];
+        snap.targets.push(svc);
+        let mut app = App::new();
+        app.apply(Arc::new(snap));
+        let e = app.compute_entries();
+        // shown even with the section folded, after the projects
+        assert_eq!(
+            e.last(),
+            Some(&Entry::Target(TargetKey::Port(49374))),
+            "{e:?}"
+        );
+        assert!(!e.contains(&Entry::Agents), "no sessions, no section");
+
+        // with the section open, it's listed once, not again inside it
+        let mut snap = Snapshot::sample();
+        snap.seq = 2;
+        snap.targets
+            .push(app.snapshot.targets.last().unwrap().clone());
+        snap.agents = vec![Agent::sample(7, "aaaa1111", "marina")];
+        app.apply(Arc::new(snap));
+        app.agents_open = true;
+        let e = app.compute_entries();
+        let svc = |x: &&Entry| matches!(x, Entry::Target(k) | Entry::Member(k) if *k == TargetKey::Port(49374));
+        assert_eq!(e.iter().filter(svc).count(), 1, "{e:?}");
+        assert_eq!(e.last(), Some(&Entry::Agent(7)));
+    }
+
+    #[test]
     fn session_view_lists_agents_and_verbs_never_reach_them() {
         let mut snap = sessions_snapshot(1, true);
         // pid 100 is the live claude behind session aaaa1111 (:3000, :8000);
@@ -1335,6 +1529,60 @@ mod tests {
         app.filter = "cargo test".into();
         let e = app.compute_entries();
         assert!(e.contains(&Entry::Agent(300)) && e.contains(&Entry::Agent(100)));
+    }
+
+    #[test]
+    fn agents_finishing_or_blocking_are_announced_once() {
+        use crate::hosts::{HostInfo, HostKind, HostStatus};
+        let snap_with = |seq: u64, working: bool, status: Option<HostStatus>| {
+            let mut snap = Snapshot::sample();
+            snap.seq = seq;
+            let mut a = Agent::sample(100, "s1", "api");
+            if !working {
+                a.children.clear(); // no shell; the host decides
+            }
+            a.host = Some(HostInfo {
+                kind: HostKind::Herdr,
+                target: "w1:p1".into(),
+                status,
+                title: None,
+                session: None,
+                app_pid: None,
+                outer: None,
+            });
+            snap.agents = vec![a];
+            Arc::new(snap)
+        };
+        let mut app = App::new();
+        app.apply(snap_with(1, true, Some(HostStatus::Working)));
+        let t0 = 1_000_000;
+        // working for two minutes...
+        app.snapshot = snap_with(2, true, Some(HostStatus::Working));
+        assert!(app.agent_notices(t0).is_empty());
+        assert!(app.agent_notices(t0 + 120).is_empty());
+        // ...then quiet: nothing until the quiet period passes
+        app.snapshot = snap_with(3, false, Some(HostStatus::Idle));
+        assert!(
+            app.agent_notices(t0 + 125).is_empty(),
+            "a pause, not done yet"
+        );
+        let n = app.agent_notices(t0 + 135);
+        assert_eq!(n, vec!["claude·api finished after 2m".to_string()]);
+        assert!(app.agent_notices(t0 + 200).is_empty(), "once");
+
+        // a short burst isn't worth a ping
+        app.snapshot = snap_with(4, true, Some(HostStatus::Working));
+        app.agent_notices(t0 + 300);
+        app.snapshot = snap_with(5, false, Some(HostStatus::Idle));
+        assert!(app.agent_notices(t0 + 320).is_empty());
+
+        // blocked: right away, once
+        app.snapshot = snap_with(6, false, Some(HostStatus::Blocked));
+        assert_eq!(
+            app.agent_notices(t0 + 400),
+            vec!["claude·api needs you".to_string()]
+        );
+        assert!(app.agent_notices(t0 + 410).is_empty());
     }
 
     #[test]
