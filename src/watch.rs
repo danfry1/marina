@@ -294,12 +294,17 @@ pub fn uninstall() -> i32 {
 }
 
 /// `--status`: is it installed, and running?
-pub fn status() -> i32 {
-    let installed = if cfg!(target_os = "macos") {
+/// Is the login service (launchd agent / systemd unit) installed?
+pub fn service_installed() -> bool {
+    if cfg!(target_os = "macos") {
         plist_path().is_some_and(|p| p.is_file())
     } else {
         unit_path().is_some_and(|p| p.is_file())
-    };
+    }
+}
+
+pub fn status() -> i32 {
+    let installed = service_installed();
     let run = running();
     println!(
         "marina watch: {} · {}",

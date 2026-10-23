@@ -116,8 +116,20 @@
   transcript: title, last prompt, last reply, recap, pending tool, PR link.
   Shown in the preview, the inbox and `marina agents --long/--json`.
 
-- **Inbox** — the view of all agent sessions ordered by *urgency*: waiting
-  on you, new (said something you haven't seen), working, idle, stale.
+- **Inbox** — the view of all agent sessions grouped by what each needs
+  from you: *needs you* (an approval or question is up), *your turn*
+  (finished and asking something, or unread), *working*, *parked*
+  (finished, nothing asked, or set aside), and *ended*.
+
+- **Report** — what an agent said of its own state through marina's hooks
+  (working, blocked, idle). Trusted over inference until the transcript
+  records something newer.
+
+- **Set aside** — a session you've parked with `d` until it does something
+  new.
+
+- **Heavy** — a Target using 90%+ CPU or 2GB+ memory: flagged as a likely
+  runaway.
 
 - **Unread** — a session whose transcript has news since you last viewed
   it in marina.

@@ -105,6 +105,19 @@ pub struct Agent {
     /// a `.git` (a linked worktree has its own). Sessions sharing one can
     /// overwrite each other's edits.
     pub tree: Option<PathBuf>,
+    /// What the agent last reported of itself, through marina's hooks.
+    pub report: Option<crate::hooks::Report>,
+}
+
+/// A target this busy (smoothed, whole subtree) or this big is called heavy
+/// — a runaway test runner, a leak — and flagged in the servers view.
+pub const HEAVY_CPU: f32 = 90.0;
+pub const HEAVY_MEM: u64 = 2 << 30;
+
+impl Target {
+    pub fn is_heavy(&self) -> bool {
+        !self.pids.is_empty() && (self.cpu_pct >= HEAVY_CPU || self.mem_bytes >= HEAVY_MEM)
+    }
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -256,8 +269,27 @@ impl Agent {
         self.tty.map(|t| t.input).unwrap_or(self.start_time)
     }
 
+    /// What a host (herdr) says it's doing, else what it reported itself.
     pub fn host_status(&self) -> Option<HostStatus> {
-        self.host.as_ref().and_then(|h| h.status)
+        self.host
+            .as_ref()
+            .and_then(|h| h.status)
+            .or_else(|| self.reported())
+    }
+
+    /// Its own last report (hooks), unless overtaken: its transcript
+    /// recorded something since (you typed, or interrupted it). A running
+    /// shell after an approval prompt means you approved.
+    pub fn reported(&self) -> Option<HostStatus> {
+        let r = self.report.as_ref()?;
+        let newer = self.summary.as_ref().and_then(|s| s.updated);
+        if newer.is_some_and(|u| u > r.at + crate::hooks::REPORT_SLACK) {
+            return None;
+        }
+        match r.status {
+            HostStatus::Blocked if self.shells().next().is_some() => Some(HostStatus::Working),
+            st => Some(st),
+        }
     }
 
     /// Waiting on a human: an approval prompt or a question (host-reported).
@@ -372,6 +404,7 @@ impl Agent {
             summary: None,
             waiting: false,
             tree: None,
+            report: None,
         }
     }
 }
@@ -587,6 +620,56 @@ mod tests {
         );
         assert_eq!(work_tree(&base.join("repo/wt")), Some(base.join("repo/wt")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_runaway_target_is_heavy() {
+        let mut t = Snapshot::sample().targets.remove(0);
+        t.pids = vec![t.anchor.pid];
+        t.cpu_pct = 12.0;
+        t.mem_bytes = 300 << 20;
+        assert!(!t.is_heavy());
+        t.cpu_pct = 180.0;
+        assert!(t.is_heavy(), "a vitest pinning two cores");
+        t.cpu_pct = 1.0;
+        t.mem_bytes = 4 << 30;
+        assert!(t.is_heavy(), "a leak");
+        t.pids.clear();
+        assert!(!t.is_heavy(), "a container: nothing measured");
+    }
+
+    #[test]
+    fn its_own_report_wins_until_something_newer_happens() {
+        let mut a = Agent::sample(100, "s", "app");
+        a.children.clear();
+        a.tty = Some(crate::sources::TtyActivity {
+            output: 119,
+            input: 0,
+        });
+        let report = |status| crate::hooks::Report {
+            agent: "claude".into(),
+            session: Some("s".into()),
+            status,
+            at: 100,
+            chain: vec![100],
+        };
+        a.report = Some(report(HostStatus::Blocked));
+        assert!(a.is_blocked() && a.urgency(120) == 0, "it said so");
+        // the screen redraws, but it reported the turn over
+        a.report = Some(report(HostStatus::Idle));
+        assert!(!a.is_working(120) && !a.is_blocked());
+        // a prompt typed since: the transcript is newer, so infer again
+        a.summary = Some(crate::transcript::Summary {
+            updated: Some(110),
+            ..Default::default()
+        });
+        assert_eq!(a.reported(), None);
+        assert!(a.is_working(120), "its screen is moving");
+        // approved: a shell runs, so it isn't waiting any more
+        a.summary = None;
+        a.report = Some(report(HostStatus::Blocked));
+        a.children = Agent::sample(100, "s", "app").children;
+        assert!(!a.is_blocked() && a.is_working(120));
     }
 
     #[test]
