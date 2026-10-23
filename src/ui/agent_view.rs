@@ -64,7 +64,7 @@ fn short_label(app: &App, a: &Agent) -> String {
 fn gist(app: &App, a: &Agent, now: u64) -> String {
     let s = a.summary.as_ref();
     if app.waiting_on_you(a) {
-        return match s.and_then(|s| s.pending_tool.as_deref()) {
+        return match a.pending_tool() {
             Some(t) => format!("wants to run {t}"),
             None => "is asking you something".into(),
         };
@@ -74,7 +74,7 @@ fn gist(app: &App, a: &Agent, now: u64) -> String {
         if !shells.is_empty() {
             return format!("running {}", shells.join(", "));
         }
-        if let Some(t) = s.and_then(|s| s.pending_tool.as_deref()) {
+        if let Some(t) = a.pending_tool() {
             return format!("running {t}");
         }
     }
@@ -106,6 +106,7 @@ fn clip(s: &str, w: usize) -> String {
 /// The inbox list: grouped two-line cards. Records each card's rows for
 /// mouse hits, and keeps the selection in view.
 pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.ctl.list_rect = area;
     let now = unix_now();
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
@@ -272,9 +273,10 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let room = inner_h.saturating_sub(head.len());
     // the screen sticks to its bottom (the prompt); prose starts at the top
     let max = body.len().saturating_sub(room);
+    let offset = app.ctl.detail_scroll.min(max);
     let scroll = match mode {
-        PreviewMode::Screen => max.saturating_sub(app.ctl.detail_scroll),
-        PreviewMode::Reply => app.ctl.detail_scroll.min(max),
+        PreviewMode::Screen => max.saturating_sub(offset),
+        PreviewMode::Reply => offset,
     };
     let more_below = scroll < max;
     let mut lines = head;
@@ -304,6 +306,8 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let block = Block::bordered().title_bottom(Line::styled(bottom, DIM));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    // keep the stored offset in range, so scrolling back responds at once
+    app.ctl.detail_scroll = offset;
 }
 
 /// Who, what, where: always visible above the conversation.
@@ -391,9 +395,7 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
     }
     if app.waiting_on_you(a) {
         let what = a
-            .summary
-            .as_ref()
-            .and_then(|s| s.pending_tool.clone())
+            .pending_tool()
             .map(|t| format!(" to run {t}"))
             .unwrap_or_default();
         out.push(Line::styled(

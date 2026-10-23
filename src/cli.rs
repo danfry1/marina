@@ -57,6 +57,7 @@ USAGE:
     marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
                      [--long]        … and what each last said: recap, last
                                      prompt and reply, what it's waiting on
+                                     (with --json: the `summary` field)
     marina version               print the version
 
 SELECTOR:
@@ -315,7 +316,14 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
     if json {
         let view: Vec<AgentJson> = picked
             .iter()
-            .map(|a| AgentJson::new(a, &servers_of(&snap, a)))
+            .map(|a| {
+                let mut j = AgentJson::new(a, &servers_of(&snap, a));
+                if !long {
+                    // conversation text only when asked for
+                    j.summary = None;
+                }
+                j
+            })
             .collect();
         match serde_json::to_string_pretty(&view) {
             Ok(s) => println!("{s}"),
@@ -445,7 +453,7 @@ fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
         let Some(s) = &a.summary else {
             continue;
         };
-        if let Some(t) = s.pending_tool.as_deref().filter(|_| a.is_blocked()) {
+        if let Some(t) = a.pending_tool().filter(|_| a.is_blocked()) {
             field("waiting", &format!("to run {t}"), 1);
         }
         if let Some(r) = &s.recap {
@@ -1188,7 +1196,8 @@ struct AgentJson {
     git: Option<GitJson>,
     /// Stale, no servers, and a clean, pushed tree.
     looks_finished: bool,
-    /// What it last said, from its transcript (Claude Code), when readable.
+    /// What it last said, from its transcript (Claude Code): only with
+    /// `--long`, since it carries conversation text; `null` otherwise.
     summary: Option<SummaryJson>,
 }
 

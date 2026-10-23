@@ -41,6 +41,9 @@ pub(crate) struct Control {
     pub screen: Option<Screen>,
     /// A screen read is in flight (guards double fetches).
     pub screen_pending: bool,
+    /// Bumped whenever marina sends to a session: a screen read requested
+    /// before then is out of date when it lands, and is dropped.
+    pub screen_gen: u64,
     /// Reply being typed: (agent pid, text).
     pub reply: Option<(u32, String)>,
     /// The inbox view replaces the project/session table.
@@ -49,6 +52,7 @@ pub(crate) struct Control {
     /// visible card row, for mouse hits.
     pub list_top: usize,
     pub hits: Vec<(u16, u32)>,
+    pub list_rect: Rect,
     /// Detail pane: where it was drawn, its scroll, and whose it was.
     pub detail_rect: Rect,
     pub detail_scroll: usize,
@@ -71,15 +75,14 @@ pub(crate) struct Seen {
 
 impl Seen {
     pub fn load(path: PathBuf) -> Seen {
-        let text = std::fs::read_to_string(&path).ok();
-        let map = text
-            .as_deref()
-            .and_then(|t| serde_json::from_str(t).ok())
-            .unwrap_or_default();
+        let map: Option<HashMap<String, u64>> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok());
         Seen {
-            seed: text.is_none(),
+            // missing or unreadable: start with everything read, not unread
+            seed: map.is_none(),
+            map: map.unwrap_or_default(),
             path: Some(path),
-            map,
             dirty: false,
         }
     }
@@ -107,8 +110,12 @@ impl Seen {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
+            // write then rename: a reader never sees half a file
             if let Ok(json) = serde_json::to_string(&self.map) {
-                let _ = std::fs::write(p, json);
+                let tmp = p.with_extension(format!("json.{}", std::process::id()));
+                if std::fs::write(&tmp, json).is_ok() {
+                    let _ = std::fs::rename(&tmp, p);
+                }
             }
         }
     }
@@ -118,7 +125,7 @@ impl Seen {
 pub enum Action {
     None,
     /// Send this to the agent's host on a background thread.
-    Send(HostInfo, Send, bool),
+    Send(HostInfo, Send),
 }
 
 impl App {
@@ -145,6 +152,7 @@ impl App {
         }
         let has_reply = a.is_some_and(|a| a.summary.is_some());
         let has_screen = a.is_some_and(|a| a.host.as_ref().is_some_and(|h| h.kind.interactive()));
+        self.drop_screen();
         self.ctl.preview = match self.ctl.preview {
             None if has_reply || !has_screen => Some(PreviewMode::Reply),
             None => Some(PreviewMode::Screen),
@@ -157,7 +165,7 @@ impl App {
     /// The selected agent's host, when the open preview wants a fresh screen
     /// of it and none is being read. The caller reads it off-thread and hands
     /// the rows to `screen_ready`.
-    pub fn screen_due(&mut self) -> Option<(u32, HostInfo)> {
+    pub fn screen_due(&mut self) -> Option<(u32, u64, HostInfo)> {
         if self.ctl.preview.is_none() || self.ctl.screen_pending {
             return None;
         }
@@ -173,11 +181,14 @@ impl App {
         }
         let pid = a.pid;
         self.ctl.screen_pending = true;
-        Some((pid, host))
+        Some((pid, self.ctl.screen_gen, host))
     }
 
-    pub fn screen_ready(&mut self, pid: u32, rows: Option<Vec<String>>) {
+    pub fn screen_ready(&mut self, pid: u32, generation: u64, rows: Option<Vec<String>>) {
         self.ctl.screen_pending = false;
+        if generation != self.ctl.screen_gen {
+            return; // read before marina last sent something: stale
+        }
         self.ctl.screen = Some(Screen {
             pid,
             at: Instant::now(),
@@ -195,10 +206,26 @@ impl App {
             .map(|s| s.rows.as_slice())
     }
 
+    /// Forget the fetched screen (after sending, or when it's no longer
+    /// being watched), so nothing acts on an old one.
+    pub(crate) fn drop_screen(&mut self) {
+        self.ctl.screen = None;
+        self.ctl.screen_gen += 1;
+    }
+
     /// Is `a` at an approval / question dialog right now? Its host says so
     /// (herdr), or its screen shows one.
+    /// A host that reports status is trusted; otherwise a screen read in
+    /// the last couple of seconds showing a dialog also counts. (Sending
+    /// re-reads the screen anyway; this only decides what's offered.)
     pub(crate) fn waiting_on_you(&self, a: &Agent) -> bool {
-        a.is_blocked() || self.screen_of(a.pid).is_some_and(hosts::shows_dialog)
+        if a.host.as_ref().is_some_and(|h| h.status.is_some()) {
+            return a.is_blocked();
+        }
+        let fresh_dialog = self.ctl.screen.as_ref().is_some_and(|s| {
+            s.pid == a.pid && s.at.elapsed() < SCREEN_EVERY * 2 && hosts::shows_dialog(&s.rows)
+        });
+        a.is_blocked() || fresh_dialog
     }
 
     /// Scroll the detail pane (`[` / `]`, PgUp / PgDn, wheel). Positive is
@@ -219,12 +246,21 @@ impl App {
         if pid != self.ctl.detail_pid {
             self.ctl.detail_pid = pid;
             self.ctl.detail_scroll = 0;
+            self.drop_screen();
         }
     }
 
-    /// Mouse: the inbox card at screen row `y`, if any.
-    pub(crate) fn card_at(&self, y: u16) -> Option<u32> {
-        self.ctl.hits.iter().find(|(r, _)| *r == y).map(|(_, p)| *p)
+    /// Mouse: the inbox card at (`x`, `y`), if any.
+    pub(crate) fn card_at(&self, x: u16, y: u16) -> Option<u32> {
+        let r = self.ctl.list_rect;
+        if x < r.x || x >= r.x + r.width {
+            return None;
+        }
+        self.ctl
+            .hits
+            .iter()
+            .find(|(row, _)| *row == y)
+            .map(|(_, p)| *p)
     }
 
     // --- unread -----------------------------------------------------------------
@@ -255,7 +291,9 @@ impl App {
     pub(crate) fn update_seen(&mut self) {
         let mut marks: Vec<(String, u64)> = Vec::new();
         let seed = std::mem::take(&mut self.ctl.seen.seed);
-        let viewing = (self.ctl.inbox || self.ctl.preview.is_some())
+        // only while you're using marina: an unattended inbox reads nothing
+        let in_use = self.last_input.elapsed() < Duration::from_secs(60);
+        let viewing = (in_use && (self.ctl.inbox || self.ctl.preview.is_some()))
             .then(|| self.selected_agent().map(|a| a.pid))
             .flatten();
         for a in &self.snapshot.agents {
@@ -318,8 +356,8 @@ impl App {
             return Action::None;
         }
         let what = if approve { Send::Approve } else { Send::Reject };
-        self.ctl.screen = None; // re-read after it reacts
-        Action::Send(host, what, true)
+        self.drop_screen(); // re-read after it reacts
+        Action::Send(host, what)
     }
 
     /// `r`: start typing a reply to the selected session.
@@ -377,16 +415,32 @@ impl App {
             self.set_status(cant_type(a));
             return Action::None;
         };
-        let waiting = self.waiting_on_you(a);
-        self.ctl.screen = None;
-        Action::Send(host, Send::Reply(text), waiting)
+        self.drop_screen();
+        Action::Send(host, Send::Reply(text))
     }
 
     /// The reply being typed and who it's for.
     pub(crate) fn reply_draft(&self) -> Option<(String, &str)> {
         let (pid, text) = self.ctl.reply.as_ref()?;
-        let a = self.snapshot.agents.iter().find(|a| a.pid == *pid)?;
-        Some((self.agent_label(a), text.as_str()))
+        let who = match self.snapshot.agents.iter().find(|a| a.pid == *pid) {
+            Some(a) => self.agent_label(a),
+            None => format!("pid {pid}"),
+        };
+        Some((who, text.as_str()))
+    }
+
+    /// The session a reply is being typed to ended: close the box (it would
+    /// otherwise keep capturing keys) and say so.
+    pub(crate) fn drop_orphan_reply(&mut self) {
+        let gone = self
+            .ctl
+            .reply
+            .as_ref()
+            .is_some_and(|(pid, _)| !self.snapshot.agents.iter().any(|a| a.pid == *pid));
+        if gone {
+            self.ctl.reply = None;
+            self.set_status("that session ended — reply discarded");
+        }
     }
 
     pub(crate) fn agent_label(&self, a: &Agent) -> String {
@@ -492,6 +546,39 @@ mod tests {
         assert!(app.is_unread(&a, now));
         app.mark_read(7);
         assert!(!app.is_unread(&a, now), "jumping to it reads it");
+    }
+
+    #[test]
+    fn stale_screens_and_ended_sessions_never_drive_input() {
+        let mut app = App::new();
+        app.apply(snap(1, 100));
+        let a = app.snapshot.agents[0].clone();
+        let dialog = vec!["Do you want to proceed?".to_string(), "❯ 1. Yes".into()];
+        // a read requested before marina sent something lands late: dropped
+        let generation = app.ctl.screen_gen;
+        app.drop_screen();
+        app.screen_ready(7, generation, Some(dialog.clone()));
+        assert!(app.screen_of(7).is_none());
+        assert!(!app.waiting_on_you(&a));
+        // a current read counts
+        app.screen_ready(7, app.ctl.screen_gen, Some(dialog));
+        assert!(app.waiting_on_you(&a));
+        // ...but not once it's old
+        app.ctl.screen.as_mut().unwrap().at -= SCREEN_EVERY * 3;
+        assert!(!app.waiting_on_you(&a));
+
+        // a reply box whose session ended closes instead of eating keys
+        app.ctl.reply = Some((7, "hi".into()));
+        let mut gone = Snapshot::sample();
+        gone.seq = 2;
+        app.apply(Arc::new(gone));
+        assert!(!app.is_replying());
+
+        // inbox clicks must land in the list, not the detail beside it
+        app.ctl.list_rect = Rect::new(0, 0, 60, 30);
+        app.ctl.hits = vec![(5, 7)];
+        assert_eq!(app.card_at(10, 5), Some(7));
+        assert_eq!(app.card_at(90, 5), None);
     }
 
     #[test]

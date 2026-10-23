@@ -96,14 +96,18 @@ developer-process-centric.
   session's live screen (herdr and tmux panes).
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
-  a session counts as waiting when its transcript ends in a tool call that
-  hasn't run, yet nothing is running (no shell, a still screen): an
-  approval prompt or a question. Notices say what it wants:
+  a session counts as waiting when a turn is under way in its transcript
+  (your prompt or a tool call with no end-of-turn record after it) yet
+  nothing is running — no shell, a still screen, or a Bash call whose
+  command never started: an approval prompt or a question. Notices say what it wants:
   `claude·api needs you: wants to run Bash: cargo publish`, and finished
   ones what it said.
 - **Answer from marina** — on a herdr or tmux session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
-  dialog first). Only on your keystroke, only to the selected session, and
+  dialog first). Each re-reads the session's screen at the moment of
+  sending: `y` sends Enter only if the highlighted choice is a *Yes*
+  (Claude Code's folder-trust prompt highlights *No*), and `n` sends Esc
+  only if a dialog is up, so neither can interrupt a working agent. Only on your keystroke, only to the selected session, and
   never into a GUI terminal window — `Enter` jumps there instead.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),

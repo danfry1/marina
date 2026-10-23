@@ -221,16 +221,24 @@ fn run(
             match ev {
                 UiEvent::Status(s) => app.set_status(s),
                 UiEvent::LogReady { project, path } => on_log_ready(app, project, path),
-                UiEvent::Screen { pid, rows } => app.screen_ready(pid, rows),
+                UiEvent::Screen {
+                    pid,
+                    generation,
+                    rows,
+                } => app.screen_ready(pid, generation, rows),
             }
         }
 
         // The open preview's live screen, read off the UI thread.
-        if let Some((pid, host)) = app.screen_due() {
+        if let Some((pid, generation, host)) = app.screen_due() {
             let ev = ev_tx.clone();
             std::thread::spawn(move || {
                 let rows = hosts::read_screen(&host, ui::control_rows());
-                let _ = ev.send(UiEvent::Screen { pid, rows });
+                let _ = ev.send(UiEvent::Screen {
+                    pid,
+                    generation,
+                    rows,
+                });
             });
         }
 
@@ -371,13 +379,13 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
 /// Carry out a control action (approve / reject / reply) off the UI thread:
 /// herdr and tmux calls can take a moment.
 fn run_action(app: &mut ui::App, action: ui::Action, ev: &Sender<UiEvent>) {
-    let ui::Action::Send(host, what, waiting) = action else {
+    let ui::Action::Send(host, what) = action else {
         return;
     };
     app.set_status(format!("sending to the {}…", host.describe()));
     let ev = ev.clone();
     std::thread::spawn(move || {
-        let msg = hosts::send(&host, &what, waiting).unwrap_or_else(|e| e);
+        let msg = hosts::send(&host, &what).unwrap_or_else(|e| e);
         let _ = ev.send(UiEvent::Status(msg));
     });
 }

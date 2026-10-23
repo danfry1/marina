@@ -117,7 +117,7 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   `stale` = idle with no terminal input for over a day), `cwd`, `branch`, `cpu_pct`,
   `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
   and `servers` (dev servers it started), plus `title` (the task, under
-  herdr), `host` (`{kind, target, outer}` — the herdr/tmux pane, or the iterm/terminal/wezterm tty or ghostty directory; `outer` is the terminal app a herdr/tmux client runs in), `summary` (Claude Code: `last_prompt`, `last_reply`, `recap`, `pending_tool`, `pr_url`, `updated_secs_ago` — read from the transcript tail), `git` (uncommitted /
+  herdr), `host` (`{kind, target, outer}` — the herdr/tmux pane, or the iterm/terminal/wezterm tty or ghostty directory; `outer` is the terminal app a herdr/tmux client runs in), `summary` (with `--long` only, else `null` — Claude Code: `last_prompt`, `last_reply`, `recap`, `pending_tool`, `pr_url`, `updated_secs_ago`, read from the transcript tail), `git` (uncommitted /
   untracked / unpushed counts) and `looks_finished` (stale, no servers, clean
   tree). `state` can also be `blocked` (waiting on a question). It's
   read-only — marina has no way to stop an agent session; tell the user which

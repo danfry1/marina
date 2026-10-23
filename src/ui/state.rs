@@ -144,7 +144,9 @@ pub struct App {
     /// Per agent pid: (started, last seen) working, unix seconds.
     agent_streaks: HashMap<u32, (u64, u64)>,
     /// Agents already reported as waiting on a question.
-    agent_blocked: HashSet<u32>,
+    /// Agents already reported as waiting, and on what (the pending tool
+    /// call): a flicker in the waiting signal doesn't repeat the notice.
+    agent_blocked: HashMap<u32, String>,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -199,7 +201,7 @@ impl App {
             agents_open: false,
             notify_agents: true,
             agent_streaks: HashMap::new(),
-            agent_blocked: HashSet::new(),
+            agent_blocked: HashMap::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -230,6 +232,7 @@ impl App {
         let old = std::mem::replace(&mut self.snapshot, snap);
         self.record_history();
         self.update_seen();
+        self.drop_orphan_reply();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -297,7 +300,7 @@ impl App {
         let mut out = Vec::new();
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
         self.agent_streaks.retain(|pid, _| live.contains(pid));
-        self.agent_blocked.retain(|pid| live.contains(pid));
+        self.agent_blocked.retain(|pid, _| live.contains(pid));
         for a in &self.snapshot.agents {
             let label = self
                 .agent_session_of
@@ -305,11 +308,17 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| a.name.clone());
             if a.is_blocked() {
-                if self.agent_blocked.insert(a.pid) {
+                let what = a
+                    .summary
+                    .as_ref()
+                    .map(|s| format!("{:?}@{:?}", s.pending_tool, s.pending_since))
+                    .unwrap_or_default();
+                if self.agent_blocked.get(&a.pid) != Some(&what) {
+                    self.agent_blocked.insert(a.pid, what);
                     // say what it wants, so the notification is actionable
-                    match a.summary.as_ref().and_then(|s| s.pending_tool.as_deref()) {
+                    match a.pending_tool() {
                         Some(t) => {
-                            out.push(format!("{label} needs you: wants to run {}", clip(t, 90)))
+                            out.push(format!("{label} needs you: wants to run {}", clip(&t, 90)))
                         }
                         None => out.push(format!("{label} needs you")),
                     }
@@ -317,7 +326,7 @@ impl App {
                 self.agent_streaks.remove(&a.pid); // the question says it all
                 continue;
             }
-            self.agent_blocked.remove(&a.pid);
+            // kept until a different question comes: waiting can flicker
             if a.is_working(now) {
                 self.agent_streaks
                     .entry(a.pid)
@@ -769,6 +778,7 @@ impl App {
             self.close_log();
         } else if self.ctl.preview.is_some() {
             self.ctl.preview = None;
+            self.drop_screen();
             self.dirty = true;
         } else if self.inspect {
             self.inspect = false;
@@ -888,7 +898,7 @@ impl App {
                 }
                 if self.ctl.inbox {
                     // a card selects; the table geometry below doesn't apply
-                    if let Some(pid) = self.card_at(y) {
+                    if let Some(pid) = self.card_at(x, y) {
                         self.selected = Some(Entry::Agent(pid));
                         self.last_input = Instant::now();
                         self.dirty = true;

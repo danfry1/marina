@@ -95,10 +95,11 @@ pub struct Agent {
     pub title: Option<String>,
     /// What the session last said, from its transcript (Claude Code).
     pub summary: Option<crate::transcript::Summary>,
-    /// Inferred, for sessions no host reports on: its transcript ends in a
-    /// tool call with no result, yet nothing runs — no shell, a still
-    /// screen. A running tool has a child or a spinner; this is an approval
-    /// prompt or a question to the human.
+    /// Inferred, for sessions no host reports on: a turn is under way (its
+    /// transcript ends in your prompt, or a tool call or result, not the
+    /// record a turn ends with), yet nothing runs — no shell, a still screen.
+    /// A thinking agent animates its screen and a running tool has a child
+    /// or a spinner; this is an approval prompt or a question to the human.
     pub waiting: bool,
 }
 
@@ -243,17 +244,38 @@ impl Agent {
         }
     }
 
+    /// The pending tool call, with paths inside its directory made relative:
+    /// `Write: hello.txt` rather than the whole absolute path.
+    pub fn pending_tool(&self) -> Option<String> {
+        let t = self.summary.as_ref()?.pending_tool.as_deref()?;
+        let dir = format!("{}/", self.cwd.display());
+        Some(t.replace(&dir, ""))
+    }
+
     /// Set `waiting` (see there) as of `now`.
     pub fn infer_waiting(&mut self, now: u64) {
-        let pending = self
+        let Some(s) = self
             .summary
             .as_ref()
-            .is_some_and(|s| s.pending_tool.is_some());
+            .filter(|s| s.pending_tool.is_some() || s.in_turn)
+        else {
+            self.waiting = false;
+            return;
+        };
+        let idle = self.host_status().is_none() && self.shells().next().is_none();
         let still = self
             .tty
             .is_some_and(|t| now.saturating_sub(t.output) > WORKING_OUTPUT_SECS);
-        self.waiting =
-            self.host_status().is_none() && pending && self.shells().next().is_none() && still;
+        // An approved Bash call starts its shell at once, so one pending for
+        // a few seconds with no shell is at its prompt — whose screen
+        // Claude Code keeps redrawing, so "still" can't tell.
+        let bash_unstarted = s
+            .pending_tool
+            .as_deref()
+            .is_some_and(|t| t.starts_with("Bash:"))
+            && s.pending_since
+                .is_some_and(|at| now.saturating_sub(at) > WORKING_OUTPUT_SECS);
+        self.waiting = idle && self.tty.is_some() && (still || bash_unstarted);
     }
 
     /// Not working, and its terminal has had no input for over a day —
@@ -498,6 +520,19 @@ mod tests {
         });
         a.infer_waiting(103);
         assert!(!a.waiting, "the screen moved 3s ago: still running");
+        // a Bash prompt keeps redrawing, but its command never started
+        a.summary.as_mut().unwrap().pending_since = Some(90);
+        a.tty = Some(TtyActivity {
+            output: 119,
+            input: 100,
+        });
+        a.infer_waiting(120);
+        assert!(a.waiting, "Bash pending 30s with no shell");
+        a.summary.as_mut().unwrap().pending_since = None;
+        a.tty = Some(TtyActivity {
+            output: 100,
+            input: 100,
+        });
         a.infer_waiting(120);
         assert!(a.waiting && a.is_blocked() && a.urgency(120) == 0);
         a.summary.as_mut().unwrap().pending_tool = None;

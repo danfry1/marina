@@ -568,16 +568,27 @@ window.
 - *Preview* (`p`): the summary, or the session's live screen via
   `herdr agent read --source visible` / `tmux capture-pane`, read
   off-thread every 1.5s while open.
-- *Answering*: `y`/`n` send `enter`/`esc` (herdr `agent send-keys`, tmux
-  `send-keys`) only when the session is waiting — herdr says *blocked*, or
-  its screen shows a numbered choice / "Do you want to" — and `r` submits a
-  prompt (`herdr agent prompt`, tmux `send-keys -l` + Enter), sending Esc
-  first if a dialog is up. Arguments go as argv, never through a shell.
-  GUI terminals are never typed into.
-- *Waiting*, without a host status: `Agent::infer_waiting` — a pending
-  tool call in the transcript, no shell child, and no terminal output for
-  over 5s. A tool that is running shows a child process or a spinner;
-  a static screen with an unanswered call is an approval or a question.
+- *Answering*: offered when the session is waiting (a host status is
+  trusted; otherwise the inference, or a screen read in the last ~3s
+  showing a dialog). `hosts::send` re-reads the screen at send time:
+  `y` sends Enter only when `highlighted_choice` starts with "Yes"; `n`
+  sends Esc only when `shows_dialog` (a `❯ 1.` row or "Enter to confirm"
+  in the bottom 14 rows) or herdr reports *blocked*; `r` sends Esc first
+  only then, then the prompt (`herdr agent prompt`, with a leading `-`
+  space-prefixed as herdr has no `--`; tmux `send-keys -l -- text` +
+  Enter). Screen reads carry a generation bumped on every send, so a read
+  in flight is dropped; the cached screen is dropped when the preview
+  closes or the selection moves. Arguments go as argv, never through a
+  shell. GUI terminals are never typed into.
+- *Waiting*, without a host status: `Agent::infer_waiting` — a turn under
+  way (`in_turn`: the newest user/assistant/system record is a prompt, a
+  tool result or a tool call, not the `system` record a turn ends with),
+  no shell child, and either no terminal output for over 5s or a Bash
+  call pending over 5s (an approved Bash call starts its shell at once;
+  Claude Code redraws a Bash prompt every couple of seconds). Claude Code
+  doesn't always flush a tool call before asking to run it, hence
+  `in_turn`. A thinking agent animates its screen; a running tool has a
+  child or a spinner.
   It feeds `is_blocked`, so the inbox, notices and `y`/`n` use it.
 - *Unread*: `seen.json` in the state dir maps session id → the transcript
   time last seen. A session is unread when its transcript's newest record

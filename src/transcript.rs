@@ -40,6 +40,13 @@ pub struct Summary {
     /// The tool call with no result yet: `Bash: cargo test`. Running, or —
     /// when the session is blocked — waiting for approval.
     pub pending_tool: Option<String>,
+    /// Unix seconds that tool call was made.
+    pub pending_since: Option<u64>,
+    /// A turn is under way: the newest record is your prompt or a tool
+    /// result, or a tool call — not the `system` record a turn ends with.
+    /// (Claude Code doesn't always flush a tool call before asking to run
+    /// it, so this catches an approval prompt `pending_tool` misses.)
+    pub in_turn: bool,
     pub pr_url: Option<String>,
     /// Unix seconds of the newest record with a timestamp.
     pub updated: Option<u64>,
@@ -55,6 +62,8 @@ pub fn parse_tail(text: &str) -> Summary {
     let mut s = Summary::default();
     // set once the newest message (assistant/user) has been seen
     let mut seen_message = false;
+    // the newest of user / assistant / system decides `in_turn`
+    let mut turn_known = false;
     for line in text.lines().rev() {
         // metadata records lead with their type; skip the bulky ones
         // (request blobs run to hundreds of kilobytes) unparsed
@@ -73,6 +82,16 @@ pub fn parse_tail(text: &str) -> Summary {
         if s.updated.is_none() {
             s.updated = v["timestamp"].as_str().and_then(parse_ts);
         }
+        if !turn_known && matches!(kind, Some("user" | "assistant" | "system")) {
+            turn_known = true;
+            s.in_turn = match kind {
+                Some("user") => true,
+                Some("assistant") => v["message"]["content"]
+                    .as_array()
+                    .is_some_and(|b| b.iter().any(|b| b["type"] == "tool_use")),
+                _ => false, // a turn ends with a system record
+            };
+        }
         match kind {
             Some("ai-title") if s.title.is_none() => s.title = text_of(&v["aiTitle"]),
             Some("last-prompt") if s.last_prompt.is_none() => {
@@ -81,7 +100,10 @@ pub fn parse_tail(text: &str) -> Summary {
             Some("pr-link") if s.pr_url.is_none() => s.pr_url = text_of(&v["prUrl"]),
             // a recap counts only if nothing was said after it
             Some("system")
-                if v["subtype"] == "away_summary" && s.last_reply.is_none() && !seen_message =>
+                if v["subtype"] == "away_summary"
+                    && s.recap.is_none()
+                    && s.last_reply.is_none()
+                    && !seen_message =>
             {
                 s.recap = text_of(&v["content"])
             }
@@ -111,6 +133,9 @@ pub fn parse_tail(text: &str) -> Summary {
                         .rev()
                         .find(|b| b["type"] == "tool_use")
                         .map(describe_tool);
+                    if s.pending_tool.is_some() {
+                        s.pending_since = v["timestamp"].as_str().and_then(parse_ts);
+                    }
                 }
                 seen_message = true;
                 if s.last_reply.is_none() {
@@ -207,10 +232,22 @@ fn read_tail(path: &Path, bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn summarize(path: &Path) -> Option<Summary> {
+/// `prev` is the last summary of the same file: a reply older than the
+/// window is the one already found, so a long tool-heavy stretch doesn't
+/// re-read megabytes every couple of seconds.
+fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
     let len = std::fs::metadata(path).ok()?.len();
-    let s = parse_tail(&read_tail(path, TAIL)?);
+    let mut s = parse_tail(&read_tail(path, TAIL)?);
     if s.last_reply.is_some() || len <= TAIL {
+        return Some(s);
+    }
+    if let Some(p) = prev.filter(|p| p.last_reply.is_some()) {
+        s.last_reply = p.last_reply.clone();
+        s.title = s.title.or_else(|| p.title.clone());
+        s.last_prompt = s.last_prompt.or_else(|| p.last_prompt.clone());
+        s.pr_url = s.pr_url.or_else(|| p.pr_url.clone());
+        s.context_tokens = s.context_tokens.or(p.context_tokens);
+        s.model = s.model.or_else(|| p.model.clone());
         return Some(s);
     }
     // a long tool-heavy stretch since the last reply: look further back,
@@ -222,6 +259,8 @@ fn summarize(path: &Path) -> Option<Summary> {
         last_reply: wide.last_reply,
         recap: s.recap.or(wide.recap),
         pending_tool: s.pending_tool,
+        pending_since: s.pending_since,
+        in_turn: s.in_turn,
         pr_url: s.pr_url.or(wide.pr_url),
         updated: s.updated.or(wide.updated),
         context_tokens: s.context_tokens.or(wide.context_tokens),
@@ -266,7 +305,8 @@ impl Cache {
                 return Some(e.summary.clone());
             }
         }
-        let summary = summarize(&path)?;
+        let prev = self.entries.get(id).map(|e| &e.summary);
+        let summary = summarize(&path, prev)?;
         self.entries.insert(
             id.to_string(),
             Entry {
@@ -340,6 +380,7 @@ mod tests {
             Some("Releasing 0.13.0; next: pick a fix.")
         );
         assert_eq!(s.pending_tool, None, "the last message is text");
+        assert!(!s.in_turn, "a recap after the reply: the turn is over");
         assert_eq!(s.pr_url.as_deref(), Some("https://github.com/o/r/pull/33"));
         assert_eq!(s.updated, Some(1792533121), "the newest timestamp");
         assert_eq!(s.context_tokens, Some(170_302));
@@ -359,8 +400,29 @@ mod tests {
         .join("\n");
         let s = parse_tail(&t);
         assert_eq!(s.pending_tool.as_deref(), Some("Bash: cargo publish"));
+        assert!(s.in_turn);
         assert_eq!(s.last_reply.as_deref(), Some("Publishing now."));
         assert_eq!(s.recap, None, "written before the latest reply");
+
+        let two = [
+            line(serde_json::json!({"type":"assistant","isSidechain":false,
+                "message":{"content":[{"type":"text","text":"Done."}]}})),
+            line(serde_json::json!({"type":"system","subtype":"away_summary","isSidechain":false,"content":"older recap"})),
+            line(serde_json::json!({"type":"system","subtype":"away_summary","isSidechain":false,"content":"newer recap"})),
+        ]
+        .join("\n");
+        assert_eq!(parse_tail(&two).recap.as_deref(), Some("newer recap"));
+        let asked = [
+            line(serde_json::json!({"type":"system","subtype":"turn_duration","isSidechain":false})),
+            line(serde_json::json!({"type":"user","isSidechain":false,"message":{"content":"create bye.txt"}})),
+            line(serde_json::json!({"type":"api-request","x":1})),
+        ]
+        .join("\n");
+        let s = parse_tail(&asked);
+        assert!(
+            s.in_turn && s.pending_tool.is_none(),
+            "asked, nothing flushed since"
+        );
     }
 
     #[test]
@@ -395,7 +457,7 @@ mod tests {
             body.push('\n');
         }
         std::fs::write(&p, &body).unwrap();
-        let s = summarize(&p).unwrap();
+        let s = summarize(&p, None).unwrap();
         assert_eq!(
             s.last_reply.as_deref(),
             Some("early reply"),
