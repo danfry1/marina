@@ -83,17 +83,19 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
-- **Inbox** (`a`) — a mail-client view of every agent session. On the left,
-  cards grouped by what wants you (*needs you, new, working, recent,
-  earlier, stale*): a status dot, the project, its task, how long ago it
-  last said anything, and one line on what it's doing or last said.
-  Sessions that said something since you last looked are *new* (bold, like
-  unread mail) until you view them in the inbox or preview, or jump to them;
-  what you've read is kept in `~/.local/state/marina/seen.json`. On the
-  right, the selected session: how full its context window is, repo,
-  branch and uncommitted changes, what it's running, its PR, then *you asked*, Claude's *status* recap and its
-  full reply (`[` `]` or the wheel to scroll). `p` flips that pane to the
-  session's live screen (herdr and tmux panes).
+- **Inbox** — where marina opens when agents are running (`a` switches to
+  the servers view), organised by what each session needs from you:
+  *needs you* (an approval or a question is up), *your turn* (it finished
+  and asks you something — "Want me to commit it all now?"), *working*,
+  and, folded away, *parked* (finished, nothing asked) and *ended*
+  (exited lately; Enter resumes one). One line per session says what it
+  wants, from Claude's own "Next…" recap or the question its reply ends
+  with. Sessions with something new are bold until you look; the order
+  only changes when a session finishes, and holds still while you browse.
+  The detail beside it leads with *your turn* and *what it did*, then one
+  line of context (directory, branch and changes, PR, servers, shared
+  tree, context size) and the full conversation (`[` `]` to scroll); `p`
+  switches it to the session's live screen (herdr and tmux panes).
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
   a session counts as waiting when a turn is under way in its transcript
@@ -219,7 +221,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a group · on an agent row: jump to its pane |
 | `D` | uncommitted diff of the selected agent's / server's work tree |
-| `a` | inbox: every agent session, what needs you first |
+| `a` | switch between the agent inbox (where marina opens when agents run) and the servers view |
 | `p` | preview an agent: last prompt, recap and reply · again: its live screen |
 | `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `1`–`9` | quick reply: opens the reply box with a canned reply (Enter sends) |
@@ -345,6 +347,7 @@ transcripts = false            # don't read Claude Code transcript tails
                                # (preview, inbox, agents --long)
 quick = ["commit it", "push it", "run the tests", "continue"]
                                # replies on keys 1-9 (these are the default)
+start = "servers"              # open on the servers view instead of the inbox
 ```
 
 ## Privacy & security

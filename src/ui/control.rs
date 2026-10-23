@@ -16,6 +16,13 @@ use super::state::{App, Entry};
 use crate::hosts::{self, HostInfo, Send};
 use crate::model::Agent;
 
+/// A session's question stays *your turn* this long; after, it's parked.
+const YOUR_TURN_FOR: u64 = 3 * 86_400;
+
+/// The inbox keeps its order this long after a keypress, so rows don't
+/// move under the cursor while you browse.
+pub(crate) const INBOX_HOLD: Duration = Duration::from_secs(8);
+
 /// How often an open preview re-reads the session's screen.
 pub(crate) const SCREEN_EVERY: Duration = Duration::from_millis(1500);
 /// Screen rows fetched for the preview.
@@ -66,6 +73,11 @@ pub(crate) struct Control {
     pub new_session: Option<NewDraft>,
     /// `X` pressed once on this agent: press again to end it.
     pub pending_end: Option<(u32, Instant)>,
+    /// Open on the inbox once the first snapshot shows agent sessions.
+    pub start_in_inbox: bool,
+    /// The inbox's parked / ended groups are unfolded.
+    pub parked_open: bool,
+    pub ended_open: bool,
 }
 
 /// `N`: where and with what to start a session.
@@ -255,6 +267,19 @@ impl App {
         self.ctl.inbox || self.ctl.preview.is_some()
     }
 
+    /// Enter on a fold row: show or hide the parked / ended sessions.
+    pub fn toggle_fold(&mut self) -> bool {
+        match self.selected {
+            Some(Entry::Fold(0)) => self.ctl.parked_open = !self.ctl.parked_open,
+            Some(Entry::Fold(_)) => self.ctl.ended_open = !self.ctl.ended_open,
+            _ => return false,
+        }
+        // let the list reflow now, not after the browsing hold
+        self.last_input = Instant::now() - INBOX_HOLD;
+        self.dirty = true;
+        true
+    }
+
     /// Start a new selection's detail at the top.
     pub(crate) fn sync_detail(&mut self) {
         let pid = self.selected_agent().map(|a| a.pid);
@@ -304,11 +329,24 @@ impl App {
         !a.is_working(now) && self.ctl.seen.get(id).is_none_or(|seen| at > seen)
     }
 
-    /// Inbox order with unread replies counted as finished.
+    /// The inbox's groups, by what's needed of you: 0 *needs you* (an
+    /// approval or a question is up), 1 *your turn* (it finished and asks
+    /// you something, or has a reply you haven't read), 2 *working*,
+    /// 3 *parked* (finished, nothing asked).
     pub(crate) fn inbox_urgency(&self, a: &Agent, now: u64) -> u8 {
-        match a.urgency(now) {
-            3 | 4 if self.is_unread(a, now) => 1,
-            u => u,
+        if self.waiting_on_you(a) {
+            return 0;
+        }
+        if a.is_working(now) {
+            return 2;
+        }
+        let recent = now.saturating_sub(a.settled_at()) < YOUR_TURN_FOR;
+        let asks = a.summary.as_ref().is_some_and(|s| s.ask().is_some());
+        let done = a.host_status() == Some(crate::hosts::HostStatus::Done);
+        if (asks && recent) || done || self.is_unread(a, now) {
+            1
+        } else {
+            3
         }
     }
 
@@ -700,6 +738,31 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn set_start_in_inbox(&mut self, yes: bool) {
+        self.ctl.start_in_inbox = yes;
+    }
+
+    /// On the first snapshot: open on the inbox when there are agent
+    /// sessions, and say how to get around.
+    pub(crate) fn first_look(&mut self) {
+        let n = self.snapshot.agents.len();
+        if n == 0 {
+            return;
+        }
+        if std::mem::take(&mut self.ctl.start_in_inbox) {
+            self.ctl.inbox = true;
+        }
+        let other = if self.ctl.inbox {
+            "servers"
+        } else {
+            "the agent inbox"
+        };
+        self.set_status(format!(
+            "{n} agent session{} · a: {other} · Enter: jump · ?: all keys",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+
     pub fn inbox_open(&self) -> bool {
         self.ctl.inbox
     }
@@ -716,26 +779,61 @@ impl App {
         agents.sort_by_key(|a| {
             (
                 self.inbox_urgency(a, now),
-                std::cmp::Reverse(a.last_active()),
+                std::cmp::Reverse(a.settled_at()),
             )
         });
-        let mut out: Vec<Entry> = agents.into_iter().map(|a| Entry::Agent(a.pid)).collect();
-        // then what exited lately, to resume
+        // a filter shows everything it matches; otherwise parked and ended
+        // sessions fold away behind one row each
         let q = self.filter.to_lowercase();
-        out.extend(
-            self.snapshot
-                .ended
+        let searching = !q.is_empty();
+        let (active, parked): (Vec<&Agent>, Vec<&Agent>) = agents
+            .into_iter()
+            .partition(|a| self.inbox_urgency(a, now) < 3);
+        let mut out: Vec<Entry> = active.iter().map(|a| Entry::Agent(a.pid)).collect();
+        if !parked.is_empty() {
+            out.push(Entry::Fold(0));
+            if self.ctl.parked_open || searching {
+                out.extend(parked.iter().map(|a| Entry::Agent(a.pid)));
+            }
+        }
+        let ended: Vec<Entry> = self
+            .snapshot
+            .ended
+            .iter()
+            .filter(|e| {
+                !searching
+                    || e.cwd.to_string_lossy().to_lowercase().contains(&q)
+                    || e.summary
+                        .title
+                        .as_deref()
+                        .is_some_and(|t| t.to_lowercase().contains(&q))
+            })
+            .map(|e| Entry::Ended(e.id.clone()))
+            .collect();
+        if !ended.is_empty() {
+            out.push(Entry::Fold(1));
+            if self.ctl.ended_open || searching {
+                out.extend(ended);
+            }
+        }
+        // while you're moving through it, hold the order still: rows that
+        // are still there keep their place, new ones go at the end
+        let browsing = self.last_input.elapsed() < INBOX_HOLD && !self.display.is_empty();
+        if browsing
+            && self
+                .display
                 .iter()
-                .filter(|e| {
-                    q.is_empty()
-                        || e.cwd.to_string_lossy().to_lowercase().contains(&q)
-                        || e.summary
-                            .title
-                            .as_deref()
-                            .is_some_and(|t| t.to_lowercase().contains(&q))
-                })
-                .map(|e| Entry::Ended(e.id.clone())),
-        );
+                .all(|e| matches!(e, Entry::Agent(_) | Entry::Ended(_) | Entry::Fold(_)))
+        {
+            let mut held: Vec<Entry> = self
+                .display
+                .iter()
+                .filter(|e| out.contains(e))
+                .cloned()
+                .collect();
+            held.extend(out.into_iter().filter(|e| !self.display.contains(e)));
+            return held;
+        }
         out
     }
 }
@@ -867,6 +965,55 @@ mod tests {
                 .iter()
                 .any(|(t, _)| t.contains("same tree")),
             "once"
+        );
+    }
+
+    #[test]
+    fn the_inbox_orders_by_finished_turns_and_holds_still_while_browsing() {
+        let mut app = App::new();
+        let make = |seq: u64, b_working: bool| {
+            let mut s = Snapshot::sample();
+            s.seq = seq;
+            let mut a = Agent::sample(1, "aaaa1111", "a");
+            let mut b = Agent::sample(2, "bbbb2222", "b");
+            for (x, ended) in [(&mut a, 500), (&mut b, 100)] {
+                x.summary = Some(crate::transcript::Summary {
+                    turn_ended: Some(ended),
+                    updated: Some(ended),
+                    recap: Some("Done. Next: say go.".into()),
+                    ..Default::default()
+                });
+            }
+            a.children.retain(|c| !c.shell);
+            if !b_working {
+                b.children.retain(|c| !c.shell);
+            }
+            s.agents = vec![a, b];
+            Arc::new(s)
+        };
+        app.apply(make(1, false));
+        app.ctl.seen.mark("aaaa1111", 500);
+        app.ctl.seen.mark("bbbb2222", 100);
+        app.toggle_inbox();
+        app.last_input = Instant::now() - INBOX_HOLD * 2;
+        let order = app.inbox_entries(10_000);
+        assert_eq!(
+            order[..2],
+            [Entry::Agent(1), Entry::Agent(2)],
+            "newest finished turn first"
+        );
+        // b starts working: still after a (working follows your turn)
+        app.apply(make(2, true));
+        assert_eq!(
+            app.inbox_entries(10_000)[..2],
+            [Entry::Agent(1), Entry::Agent(2)]
+        );
+        // while browsing, even a real reorder waits
+        app.display = vec![Entry::Agent(2), Entry::Agent(1)];
+        app.last_input = Instant::now();
+        assert_eq!(
+            app.inbox_entries(10_000)[..2],
+            [Entry::Agent(2), Entry::Agent(1)]
         );
     }
 

@@ -355,7 +355,13 @@ mod tests {
         let other = std::fs::File::open(&p).unwrap();
         assert!(!try_lock(&other), "taken while the first is open");
         drop(held);
-        assert!(try_lock(&other), "released when the holder goes");
+        // a child forked by a parallel test can hold a copy of the fd until
+        // it execs; give it a moment
+        let freed = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            try_lock(&other)
+        });
+        assert!(freed, "released when the holder goes");
         let _ = std::fs::remove_file(&p);
     }
 }

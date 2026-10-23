@@ -99,7 +99,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         )
     } else {
         format!(
-            " marina · {} targets{agents} · sort:{}{} ",
+            " inbox (a) · ▸ SERVERS │ {} targets{agents} · sort:{}{} ",
             app.snapshot.targets.len(),
             app.sort.label(),
             match app.group_by {
@@ -137,7 +137,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // a mail client: cards on the left, the selected session on the
         // right; stacked when the terminal is narrow
         let (list, detail) = if table_area.width >= 120 {
-            let w = (table_area.width * 2 / 5).clamp(56, 80);
+            // the list carries the asks now: give it half
+            let w = (table_area.width / 2).clamp(60, 110);
             let c =
                 Layout::horizontal([Constraint::Length(w), Constraint::Min(40)]).split(table_area);
             (c[0], c[1])
@@ -233,12 +234,36 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         let lines = help_lines();
-        let area = centered_rect(72, lines.len() as u16 + 2, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" keys ")),
-            area,
-        );
+        let full = frame.area();
+        // two columns (agents | servers + everywhere) when it wouldn't fit
+        // tall, and there's the width
+        let split = lines.len() as u16 + 2 > full.height && full.width >= 150;
+        if split {
+            let at = lines
+                .iter()
+                .position(|l| l.to_string().trim() == "SERVERS")
+                .unwrap_or(lines.len() / 2);
+            let (left, right) = lines.split_at(at);
+            let mut right = right.to_vec();
+            right.insert(0, Line::from(""));
+            let h = left.len().max(right.len()) as u16 + 2;
+            let area = centered_rect(146, h, full);
+            frame.render_widget(Clear, area);
+            let block = Block::bordered().title(" keys ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
+            frame.render_widget(Paragraph::new(left.to_vec()), cols[0]);
+            frame.render_widget(Paragraph::new(right), cols[1]);
+        } else {
+            let area = centered_rect(76, lines.len() as u16 + 2, full);
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(" keys ")),
+                area,
+            );
+        }
     }
 }
 
@@ -670,7 +695,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
         },
         Entry::Agents => agents_section_row(app),
         // only the inbox lists these, and draws its own rows
-        Entry::Ended(_) => Row::new(Vec::<Cell>::new()),
+        Entry::Ended(_) | Entry::Fold(_) => Row::new(Vec::<Cell>::new()),
     }
 }
 
@@ -1110,32 +1135,47 @@ fn help_lines() -> Vec<Line<'static>> {
             Span::styled(d.to_string(), dim),
         ])
     };
+    let head = |t: &str| {
+        Line::from(Span::styled(
+            format!(" {t}"),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ))
+    };
     vec![
         Line::from(""),
-        row("j / k", "move (mouse: click, wheel)"),
-        row("g / G", "top / bottom"),
-        row("Enter", "fold / unfold group · on an agent: jump to it"),
-        row("D", "uncommitted diff of the agent / server's tree"),
-        row("a", "inbox: every agent session, what needs you first"),
-        row("p", "preview an agent: last reply · again: live screen"),
-        row("y · n", "approve / reject what the agent is asking"),
-        row("r", "reply to the agent (herdr / tmux panes)"),
-        row("1 – 9", "quick reply ([agents] quick), Enter sends"),
-        row("N", "new agent session here (Tab: in its own git worktree)"),
-        row("X", "end the agent session (press twice; sends /exit)"),
-        row("i", "inspect selection"),
+        head("AGENTS"),
+        row(
+            "a",
+            "inbox ↔ servers: every agent session, what needs you first",
+        ),
+        row("Enter", "jump to the session · on an ended one: resume it"),
+        row("p", "preview its conversation · again: its live screen"),
+        row("y · n", "approve / reject what it's asking"),
+        row(
+            "r · 1–9",
+            "reply · quick reply ([agents] quick); Enter sends",
+        ),
+        row("N", "new session here (Tab: in its own git worktree)"),
+        row("X", "end the session (press twice; sends /exit)"),
+        row("D", "uncommitted diff of its work tree"),
+        Line::from(""),
+        head("SERVERS"),
+        row("Enter", "fold / unfold a group"),
+        row("K · u", "kill · cancel the force-kill"),
+        row("R · T", "restart (output to a log) · tail logs"),
+        row("Y · O", "copy URL · open in the browser"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
+        row("v", "group by project / by agent session"),
+        Line::from(""),
+        head("EVERYWHERE"),
+        row("j k · g G", "move · top / bottom (mouse: click, wheel)"),
         row(
             "/",
             "filter (project · command · port · cwd · branch · via)",
         ),
-        row("v", "group by project / agent session (lists agents)"),
-        row("K · u", "kill · cancel force-kill"),
-        row("R", "restart (output captured to a log)"),
-        row("T", "tail logs"),
-        row("[ · ]", "scroll logs · +/- resize"),
-        row("Y · O", "copy URL · open"),
-        row("Esc", "close pane / clear filter"),
+        row("i", "inspect the selection"),
+        row("[ ]", "scroll the log / detail pane · +/- resize the log"),
+        row("Esc", "close a pane / clear the filter"),
         row("? · q", "this help · quit (also Ctrl+C)"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1260,7 +1300,12 @@ mod tests {
     fn help_overlay_lists_keys_version_and_config() {
         let mut app = app_with_sample();
         app.toggle_help();
-        let out = render_to_string(&mut app, 120, 28);
+        let short = render_to_string(&mut app, 160, 30);
+        assert!(
+            short.contains(env!("CARGO_PKG_VERSION")) && short.contains("SERVERS"),
+            "two columns on a short, wide terminal: {short}"
+        );
+        let out = render_to_string(&mut app, 120, 40);
         assert!(out.contains("keys"));
         assert!(out.contains("fold / unfold"));
         assert!(out.contains("tail logs"));

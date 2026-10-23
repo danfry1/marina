@@ -38,6 +38,8 @@
 //!                       # session previews and the inbox (default: true)
 //! quick = ["commit it", "push it", "run the tests", "continue"]
 //!                       # replies on keys 1-9 (these are the default)
+//! start = "servers"     # open on the servers view, not the agent inbox
+//!                       # (default: the inbox, when agent sessions run)
 //! ```
 
 use std::path::PathBuf;
@@ -73,6 +75,9 @@ pub struct AgentsCfg {
     /// Canned replies on keys 1-9.
     #[serde(default = "quick_default")]
     pub quick: Vec<String>,
+    /// The view marina opens on: `inbox` (default) or `servers`.
+    #[serde(default)]
+    pub start: Option<String>,
 }
 
 fn quick_default() -> Vec<String> {
@@ -86,6 +91,7 @@ impl Default for AgentsCfg {
         AgentsCfg {
             transcripts: true,
             quick: quick_default(),
+            start: None,
         }
     }
 }

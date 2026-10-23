@@ -208,6 +208,15 @@ impl Agent {
         }
     }
 
+    /// When it last settled — its last turn ended — for a stable inbox
+    /// order: unchanged while it works. Falls back to `last_active`.
+    pub fn settled_at(&self) -> u64 {
+        self.summary
+            .as_ref()
+            .and_then(|s| s.turn_ended)
+            .unwrap_or_else(|| self.last_active())
+    }
+
     /// The session's task title: the host's (herdr), else the agent's own,
     /// else its transcript's.
     pub fn title(&self) -> Option<&str> {

@@ -198,7 +198,7 @@ impl Sampler {
                 if let Some(g) = self.resolver.group_name(&ports, &project, &label) {
                     project = g;
                 }
-                let git_branch = agg.root.as_deref().and_then(resolve::git_branch);
+                let git_branch = branch_of(agg.root.as_deref(), &cwd);
                 let exposed = ports
                     .iter()
                     .any(|p| exposed_ports.get(p).copied().unwrap_or(false));
@@ -295,8 +295,8 @@ impl Sampler {
                     pids,
                     project: w.project,
                     command_label: w.label,
+                    git_branch: branch_of(None, &w.cwd),
                     cwd: w.cwd,
-                    git_branch: None,
                     cpu_pct: cpu,
                     mem_bytes: mem,
                     url: None,
@@ -327,9 +327,17 @@ impl Sampler {
                 a.host = self
                     .hosts
                     .lookup(procs, a.pid, a.tty_path.as_deref(), &a.cwd);
-                // the host tracks /clear and resume; markers can lag
+                // the host tracks /clear and resume; markers can lag. But
+                // only take a Claude session id whose transcript belongs to
+                // this directory: a session started from inside the pane
+                // (inheriting its variables) can report itself to it.
                 if let Some(s) = a.host.as_ref().and_then(|h| h.session.clone()) {
-                    a.session = Some(s);
+                    let plausible = a.name != "claude"
+                        || a.session.is_none()
+                        || crate::transcript::belongs_to(&s, &a.cwd).unwrap_or(true);
+                    if plausible {
+                        a.session = Some(s);
+                    }
                 }
             }
             self.opencode.fill(procs, &mut agents);
@@ -367,6 +375,19 @@ impl Sampler {
                     .unwrap_or(0);
                 for a in &mut agents {
                     a.infer_waiting(now);
+                    // where its screen can be read (tmux), confirm the
+                    // inference: there must be a dialog on it
+                    if a.waiting {
+                        if let Some(h) = a
+                            .host
+                            .as_ref()
+                            .filter(|h| h.kind == crate::hosts::HostKind::Tmux)
+                        {
+                            if let Some(screen) = crate::hosts::read_screen(h, 30) {
+                                a.waiting = crate::hosts::shows_dialog(&screen);
+                            }
+                        }
+                    }
                 }
             }
             (out, agents)
@@ -645,7 +666,7 @@ fn build_agents(
                 pid,
                 start_time: p.start_time,
                 session,
-                git_branch: root.as_deref().and_then(resolve::git_branch),
+                git_branch: branch_of(root.as_deref(), &cwd),
                 cwd,
                 project,
                 argv0: p.argv.first().cloned().unwrap_or_else(|| p.name.clone()),
@@ -775,6 +796,17 @@ fn root_of(cwd: &Path, cache: &mut RootCache, home: Option<&Path>) -> Option<Pat
 /// the username. Name it after the tool instead (`opencode`, not `danielfry`).
 fn home_project(label: &str) -> String {
     label.split_whitespace().next().unwrap_or(label).to_string()
+}
+
+/// The branch checked out where `cwd` is: from the project root when it's
+/// the git root, else from the work tree containing `cwd` (a monorepo
+/// package's root isn't the repo's; a linked worktree has its own HEAD).
+fn branch_of(root: Option<&Path>, cwd: &Path) -> Option<String> {
+    root.and_then(resolve::git_branch).or_else(|| {
+        crate::model::work_tree(cwd)
+            .as_deref()
+            .and_then(resolve::git_branch)
+    })
 }
 
 fn project_name(root: Option<&Path>, cwd: &Path, cache: &mut NameCache) -> String {
