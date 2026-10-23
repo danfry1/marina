@@ -449,10 +449,19 @@ impl Sampler {
         }
 
         self.seq += 1;
+        // recently exited sessions, for resuming (when reading transcripts)
+        let ended = match self.transcripts.as_mut() {
+            Some(tc) => {
+                let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
+                tc.ended(&live)
+            }
+            None => Vec::new(),
+        };
         Snapshot {
             seq: self.seq,
             targets,
             agents,
+            ended,
             error,
         }
     }

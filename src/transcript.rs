@@ -54,7 +54,26 @@ pub struct Summary {
     /// (input + cache read + cache write), and that message's model.
     pub context_tokens: Option<u64>,
     pub model: Option<String>,
+    /// The session's working directory, as its newest record says.
+    pub cwd: Option<PathBuf>,
 }
+
+/// A Claude Code session that has exited but could be resumed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ended {
+    pub id: String,
+    /// When its transcript was last written: roughly when it ended.
+    pub at: u64,
+    pub cwd: PathBuf,
+    pub summary: Summary,
+}
+
+/// Ended sessions listed: the most recent this many…
+const ENDED_MAX: usize = 8;
+/// …from this far back…
+const ENDED_WITHIN: u64 = 2 * 86_400;
+/// …looked for at most this often.
+const ENDED_EVERY: Duration = Duration::from_secs(30);
 
 /// The transcript tail, newest record first. Lines are filtered by their
 /// type before parsing: request blobs can be hundreds of kilobytes each.
@@ -81,6 +100,9 @@ pub fn parse_tail(text: &str) -> Summary {
         }
         if s.updated.is_none() {
             s.updated = v["timestamp"].as_str().and_then(parse_ts);
+        }
+        if s.cwd.is_none() {
+            s.cwd = v["cwd"].as_str().map(PathBuf::from);
         }
         if !turn_known && matches!(kind, Some("user" | "assistant" | "system")) {
             turn_known = true;
@@ -265,6 +287,7 @@ fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
         updated: s.updated.or(wide.updated),
         context_tokens: s.context_tokens.or(wide.context_tokens),
         model: s.model.or(wide.model),
+        cwd: s.cwd.or(wide.cwd),
     })
 }
 
@@ -286,6 +309,8 @@ struct Entry {
 #[derive(Default)]
 pub struct Cache {
     entries: HashMap<String, Entry>,
+    /// The last look for ended sessions, and what it found.
+    ended: Option<(Instant, Vec<Ended>)>,
 }
 
 impl Cache {
@@ -319,9 +344,83 @@ impl Cache {
         Some(summary)
     }
 
-    /// Forget sessions not in `live`.
+    /// Forget sessions not in `live` (nor listed as ended).
     pub fn retain(&mut self, live: &[&str]) {
-        self.entries.retain(|id, _| live.contains(&id.as_str()));
+        let ended: Vec<String> = self
+            .ended
+            .iter()
+            .flat_map(|(_, e)| e.iter().map(|e| e.id.clone()))
+            .collect();
+        self.entries
+            .retain(|id, _| live.contains(&id.as_str()) || ended.contains(id));
+    }
+
+    /// Recently exited Claude Code sessions, newest first: transcripts
+    /// written in the last two days whose session isn't running.
+    pub fn ended(&mut self, live: &[&str]) -> Vec<Ended> {
+        if let Some((at, found)) = &self.ended {
+            if at.elapsed() < ENDED_EVERY {
+                return found
+                    .iter()
+                    .filter(|e| !live.contains(&e.id.as_str()))
+                    .cloned()
+                    .collect();
+            }
+        }
+        let now = SystemTime::now();
+        let mut recent: Vec<(String, PathBuf, u64)> = Vec::new();
+        if let Some(projects) = claude_dir().map(|d| d.join("projects")) {
+            for dir in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+                for f in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let p = f.path();
+                    let Some(id) = p
+                        .file_stem()
+                        .filter(|_| p.extension().is_some_and(|x| x == "jsonl"))
+                        .and_then(|s| s.to_str())
+                        .filter(|id| crate::launcher::is_session_id(id) && !live.contains(id))
+                    else {
+                        continue;
+                    };
+                    let Some(mtime) = f.metadata().ok().and_then(|m| m.modified().ok()) else {
+                        continue;
+                    };
+                    let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+                    if age <= ENDED_WITHIN {
+                        let at = mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        recent.push((id.to_string(), p, at));
+                    }
+                }
+            }
+        }
+        recent.sort_by_key(|r| std::cmp::Reverse(r.2));
+        let mut found = Vec::new();
+        for (id, path, at) in recent {
+            if found.len() == ENDED_MAX {
+                break;
+            }
+            let Some(summary) = summarize(&path, None) else {
+                continue;
+            };
+            // only sessions that said something, with a place to resume in
+            let Some(cwd) = summary.cwd.clone().filter(|_| summary.last_reply.is_some()) else {
+                continue;
+            };
+            found.push(Ended {
+                id,
+                at,
+                cwd,
+                summary,
+            });
+        }
+        self.ended = Some((Instant::now(), found.clone()));
+        found
     }
 }
 

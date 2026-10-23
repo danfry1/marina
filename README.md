@@ -112,6 +112,16 @@ developer-process-centric.
   on their card and a warning in the detail; when two are *working* in one
   at once, marina says so, since their edits can overwrite each other (a
   `git worktree` each keeps them apart).
+- **Start, end and resume sessions** — `N` starts a session in the
+  selected row's directory with an optional first prompt, where you work:
+  a new herdr workspace, a new tmux window, or a new Ghostty / iTerm2 /
+  Terminal window (the command is typed into that window's shell, so it
+  gets your PATH); `Tab` puts it in its own `git worktree` beside the repo
+  so it can't collide with sessions already there. `X` (twice) ends a
+  herdr/tmux session with its exit command, warning first about
+  uncommitted work or servers it leaves running. The inbox lists sessions
+  that exited in the last two days under *ended*; `Enter` resumes one
+  (`claude --resume <id>`) the same way `N` starts one.
 - **Quick replies** — `1`–`9` on a session open the reply box with a canned
   reply (`commit it`, `push it`, `run the tests`, `continue` — set your own
   with `[agents] quick`); Enter sends it.
@@ -204,6 +214,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `p` | preview an agent: last prompt, recap and reply · again: its live screen |
 | `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `1`–`9` | quick reply: opens the reply box with a canned reply (Enter sends) |
+| `N` · `X` | start a session here (Tab: own git worktree) · end the selected one (twice) |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |

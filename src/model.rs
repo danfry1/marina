@@ -399,6 +399,8 @@ pub struct Snapshot {
     pub targets: Vec<Target>,
     /// Live coding-agent sessions, kept apart from `targets` (see [`Agent`]).
     pub agents: Vec<Agent>,
+    /// Claude Code sessions that exited recently and can be resumed.
+    pub ended: Vec<crate::transcript::Ended>,
     /// A data-source failure (e.g. the port scan errored). Shown persistently
     /// in the UI — an empty cockpit must never silently mean "enumeration broke".
     pub error: Option<String>,
@@ -410,6 +412,7 @@ impl Snapshot {
             seq: 0,
             targets: Vec::new(),
             agents: Vec::new(),
+            ended: Vec::new(),
             error: None,
         }
     }
@@ -514,6 +517,7 @@ impl Snapshot {
             seq: 0,
             targets,
             agents: Vec::new(),
+            ended: Vec::new(),
             error: None,
         }
     }

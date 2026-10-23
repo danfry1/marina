@@ -51,7 +51,7 @@ pub(crate) struct Control {
     /// Inbox list: first visible row, and (screen row, agent pid) per
     /// visible card row, for mouse hits.
     pub list_top: usize,
-    pub hits: Vec<(u16, u32)>,
+    pub hits: Vec<(u16, Entry)>,
     pub list_rect: Rect,
     /// Detail pane: where it was drawn, its scroll, and whose it was.
     pub detail_rect: Rect,
@@ -61,6 +61,18 @@ pub(crate) struct Control {
     pub seen: Seen,
     /// Canned replies on keys 1-9 (`[agents] quick`).
     pub quick: Vec<String>,
+    /// A new session being set up (`N`).
+    pub new_session: Option<NewDraft>,
+    /// `X` pressed once on this agent: press again to end it.
+    pub pending_end: Option<(u32, Instant)>,
+}
+
+/// `N`: where and with what to start a session.
+pub(crate) struct NewDraft {
+    pub dir: PathBuf,
+    pub agent: String,
+    pub prompt: String,
+    pub worktree: bool,
 }
 
 /// The newest transcript time you've seen per session, so a session that
@@ -253,7 +265,7 @@ impl App {
     }
 
     /// Mouse: the inbox card at (`x`, `y`), if any.
-    pub(crate) fn card_at(&self, x: u16, y: u16) -> Option<u32> {
+    pub(crate) fn card_at(&self, x: u16, y: u16) -> Option<Entry> {
         let r = self.ctl.list_rect;
         if x < r.x || x >= r.x + r.width {
             return None;
@@ -262,7 +274,7 @@ impl App {
             .hits
             .iter()
             .find(|(row, _)| *row == y)
-            .map(|(_, p)| *p)
+            .map(|(_, e)| e.clone())
     }
 
     /// Other live sessions in `a`'s git work tree.
@@ -491,6 +503,177 @@ impl App {
             .unwrap_or_else(|| a.name.clone())
     }
 
+    // --- start / end sessions ------------------------------------------------
+
+    pub fn is_ended_selected(&self) -> bool {
+        self.selected_ended().is_some()
+    }
+
+    /// The ended session under the cursor (inbox).
+    pub(crate) fn selected_ended(&self) -> Option<&crate::transcript::Ended> {
+        match &self.selected {
+            Some(Entry::Ended(id)) => self.snapshot.ended.iter().find(|e| &e.id == id),
+            _ => None,
+        }
+    }
+
+    /// Enter on an ended session: resume it where you work.
+    pub fn resume_selected(&mut self) -> Option<(crate::launch::Launch, crate::launch::Place)> {
+        let e = self.selected_ended()?;
+        let req = crate::launch::Launch {
+            dir: e.cwd.clone(),
+            agent: "claude".into(),
+            args: vec!["--resume".into(), e.id.clone()],
+            worktree: false,
+        };
+        let Some(place) = crate::launch::here() else {
+            self.set_status(format!(
+                "resume it with: cd {} && claude --resume {}",
+                req.dir.display(),
+                req.args[1]
+            ));
+            return None;
+        };
+        self.set_status(format!("resuming in {}…", place.name()));
+        Some((req, place))
+    }
+
+    /// `N`: start a session in the selected row's directory (an agent's, a
+    /// server's, a group's), with an optional first prompt.
+    pub fn start_new(&mut self) {
+        let agent = self.selected_agent();
+        let dir = agent
+            .map(|a| a.cwd.clone())
+            .or_else(|| self.selected_target().map(|t| t.cwd.clone()))
+            .or_else(|| match &self.selected {
+                Some(Entry::Group(p)) => self.group_members(p).first().map(|t| t.cwd.clone()),
+                _ => None,
+            })
+            .or_else(|| std::env::current_dir().ok());
+        let Some(dir) = dir else {
+            return;
+        };
+        let name = agent
+            .map(|a| a.name.clone())
+            .filter(|n| matches!(n.as_str(), "claude" | "opencode" | "codex"))
+            .unwrap_or_else(|| "claude".into());
+        self.ctl.new_session = Some(NewDraft {
+            dir,
+            agent: name,
+            prompt: String::new(),
+            worktree: false,
+        });
+        self.dirty = true;
+    }
+
+    pub fn is_new_session(&self) -> bool {
+        self.ctl.new_session.is_some()
+    }
+
+    pub fn new_push(&mut self, c: char) {
+        if let Some(d) = self.ctl.new_session.as_mut() {
+            d.prompt.push(c);
+            self.dirty = true;
+        }
+    }
+
+    pub fn new_backspace(&mut self) {
+        if let Some(d) = self.ctl.new_session.as_mut() {
+            d.prompt.pop();
+            self.dirty = true;
+        }
+    }
+
+    pub fn new_toggle_worktree(&mut self) {
+        if let Some(d) = self.ctl.new_session.as_mut() {
+            d.worktree = !d.worktree;
+            self.dirty = true;
+        }
+    }
+
+    pub fn new_cancel(&mut self) {
+        self.ctl.new_session = None;
+        self.dirty = true;
+    }
+
+    /// Enter: what to launch, and where — or why it can't.
+    pub fn new_commit(&mut self) -> Option<(crate::launch::Launch, crate::launch::Place)> {
+        let d = self.ctl.new_session.take()?;
+        self.dirty = true;
+        let Some(place) = crate::launch::here() else {
+            self.set_status(
+                "marina can open sessions from herdr, tmux, Ghostty, iTerm2 or Terminal — run it in one",
+            );
+            return None;
+        };
+        let prompt = d.prompt.trim();
+        let args = if prompt.is_empty() {
+            Vec::new()
+        } else {
+            vec![prompt.to_string()]
+        };
+        self.set_status(format!("starting {} in {}…", d.agent, place.name()));
+        Some((
+            crate::launch::Launch {
+                dir: d.dir,
+                agent: d.agent,
+                args,
+                worktree: d.worktree,
+            },
+            place,
+        ))
+    }
+
+    /// The draft, for the footer: (agent, dir, prompt, worktree, where).
+    pub(crate) fn new_draft(&self) -> Option<&NewDraft> {
+        self.ctl.new_session.as_ref()
+    }
+
+    /// `X`: end the selected session by sending its exit command — on a
+    /// second press, after saying what it would leave behind.
+    pub fn end_session(&mut self) -> Action {
+        let Some(a) = self.selected_agent() else {
+            return Action::None;
+        };
+        let Some(host) = a.host.clone().filter(|h| h.kind.interactive()) else {
+            self.set_status(cant_type(a));
+            return Action::None;
+        };
+        let pid = a.pid;
+        let label = self.agent_label(a);
+        let confirmed = self
+            .ctl
+            .pending_end
+            .is_some_and(|(p, at)| p == pid && at.elapsed() < Duration::from_secs(4));
+        if !confirmed {
+            let mut warn = Vec::new();
+            if let Some(g) = a.git.filter(|g| !g.is_clean()) {
+                warn.push(g.describe());
+            }
+            let servers = self.agent_servers(a).len();
+            if servers > 0 {
+                warn.push(format!(
+                    "{servers} server{} it started keep running",
+                    if servers == 1 { "" } else { "s" }
+                ));
+            }
+            let warn = if warn.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", warn.join(" · "))
+            };
+            self.ctl.pending_end = Some((pid, Instant::now()));
+            self.set_status(format!(
+                "press X again to end {label}{warn} (resumable later)"
+            ));
+            return Action::None;
+        }
+        let exit = if a.name == "codex" { "/quit" } else { "/exit" };
+        self.ctl.pending_end = None;
+        self.drop_screen();
+        Action::Send(host, Send::Reply(exit.into()))
+    }
+
     // --- inbox ------------------------------------------------------------------
 
     /// `a`: the inbox — every session, what wants you first.
@@ -523,7 +706,24 @@ impl App {
                 std::cmp::Reverse(a.last_active()),
             )
         });
-        agents.into_iter().map(|a| Entry::Agent(a.pid)).collect()
+        let mut out: Vec<Entry> = agents.into_iter().map(|a| Entry::Agent(a.pid)).collect();
+        // then what exited lately, to resume
+        let q = self.filter.to_lowercase();
+        out.extend(
+            self.snapshot
+                .ended
+                .iter()
+                .filter(|e| {
+                    q.is_empty()
+                        || e.cwd.to_string_lossy().to_lowercase().contains(&q)
+                        || e.summary
+                            .title
+                            .as_deref()
+                            .is_some_and(|t| t.to_lowercase().contains(&q))
+                })
+                .map(|e| Entry::Ended(e.id.clone())),
+        );
+        out
     }
 }
 
@@ -617,8 +817,8 @@ mod tests {
 
         // inbox clicks must land in the list, not the detail beside it
         app.ctl.list_rect = Rect::new(0, 0, 60, 30);
-        app.ctl.hits = vec![(5, 7)];
-        assert_eq!(app.card_at(10, 5), Some(7));
+        app.ctl.hits = vec![(5, Entry::Agent(7))];
+        assert_eq!(app.card_at(10, 5), Some(Entry::Agent(7)));
         assert_eq!(app.card_at(90, 5), None);
     }
 
