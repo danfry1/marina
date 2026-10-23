@@ -85,9 +85,10 @@ developer-process-centric.
   section and at the end of `marina agents`.
 - **Inbox** — a mail-client view of every agent session, where marina
   opens when agents are running (`a` switches to the servers view). On the left,
-  cards grouped by what wants you (*needs you, new, working, recent,
-  earlier, stale*): a status dot, the project, its task, how long ago it
-  last said anything, and one line on what it's doing or last said.
+  cards grouped by what wants you (*needs you, new, recent, earlier,
+  stale*), ordered by when each last finished a turn so cards don't move
+  while you read: a status dot (◐ working), the project, its task, how long
+  ago it finished, and one line on what it's doing or last said.
   Sessions that said something since you last looked are *new* (bold, like
   unread mail) until you view them in the inbox or preview, or jump to them;
   what you've read is kept in `~/.local/state/marina/seen.json`. On the
