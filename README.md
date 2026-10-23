@@ -83,14 +83,15 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
-- **Inbox** (`a`) — every agent session on one screen, what wants you first
-  (waiting on you, finished, working, idle, stale), each with where it runs,
-  how long ago it last did anything, and the latest thing it said: Claude's
-  own recap, its last reply, or what it's waiting to run.
-- **Preview** (`p`) — on an agent row, a pane with your last prompt, its
-  recap and its last reply (markdown rendered); `p` again shows the
-  session's live screen (herdr and tmux panes), including a pending
-  approval dialog.
+- **Inbox** (`a`) — a mail-client view of every agent session. On the left,
+  cards grouped by what wants you (*needs you, finished, working, recent,
+  earlier, stale*): a status dot, the project, its task, how long ago it
+  last did anything, and one line on what it's doing or last said. On the
+  right, the selected session: repo, branch and uncommitted changes, what
+  it's running, its PR, then *you asked*, Claude's *status* recap and its
+  full reply (`[` `]` or the wheel to scroll). `p` flips that pane to the
+  session's live screen (herdr and tmux panes).
+- **Preview** (`p`) — the same session detail under the project view.
 - **Answer from marina** — on a herdr or tmux session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
   dialog first). Only on your keystroke, only to the selected session, and

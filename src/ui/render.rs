@@ -87,7 +87,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.snapshot
                 .agents
                 .iter()
-                .filter(|a| super::control::inbox_rank(a, now) == r)
+                .filter(|a| a.urgency(now) == r)
                 .count()
         };
         format!(
@@ -133,27 +133,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(hint, table_area);
     } else if app.inbox_open() {
         app.header_hits.clear();
-        let rows: Vec<Row> = app
-            .display
-            .iter()
-            .filter_map(|e| match e {
-                Entry::Agent(pid) => app.snapshot.agents.iter().find(|a| a.pid == *pid),
-                _ => None,
-            })
-            .map(|a| super::agent_view::inbox_row(a, app))
-            .collect();
-        let table = Table::new(rows, super::agent_view::inbox_widths())
-            .header(super::agent_view::inbox_header())
-            .block(block)
-            .row_highlight_style(
-                Style::new()
-                    .fg(Color::Reset)
-                    .bg(Color::Reset)
-                    .add_modifier(Modifier::REVERSED),
-            )
-            .highlight_symbol("▌ ")
-            .highlight_spacing(HighlightSpacing::Always);
-        frame.render_stateful_widget(table, table_area, &mut app.table_state);
+        app.sync_detail();
+        // a mail client: cards on the left, the selected session on the
+        // right; stacked when the terminal is narrow
+        let (list, detail) = if table_area.width >= 120 {
+            let w = (table_area.width * 2 / 5).clamp(56, 80);
+            let c =
+                Layout::horizontal([Constraint::Length(w), Constraint::Min(40)]).split(table_area);
+            (c[0], c[1])
+        } else {
+            let c = Layout::vertical([Constraint::Percentage(45), Constraint::Min(8)])
+                .split(table_area);
+            (c[0], c[1])
+        };
+        super::agent_view::render_list(frame, app, list);
+        super::agent_view::render_detail(frame, app, detail);
     } else {
         // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
         let cols = visible_columns(table_area.width);
@@ -207,10 +201,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(area) = preview_area {
-        frame.render_widget(
-            super::agent_view::preview_panel(app, area.width, area.height),
-            area,
-        );
+        app.sync_detail();
+        super::agent_view::render_detail(frame, app, area);
     }
 
     if let (Some(area), Some(l)) = (log_area, app.log.as_ref()) {

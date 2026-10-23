@@ -7,6 +7,8 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::layout::Rect;
+
 use super::state::{App, Entry};
 use crate::hosts::{self, HostInfo, Send};
 use crate::model::Agent;
@@ -41,6 +43,14 @@ pub(crate) struct Control {
     pub reply: Option<(u32, String)>,
     /// The inbox view replaces the project/session table.
     pub inbox: bool,
+    /// Inbox list: first visible row, and (screen row, agent pid) per
+    /// visible card row, for mouse hits.
+    pub list_top: usize,
+    pub hits: Vec<(u16, u32)>,
+    /// Detail pane: where it was drawn, its scroll, and whose it was.
+    pub detail_rect: Rect,
+    pub detail_scroll: usize,
+    pub detail_pid: Option<u32>,
 }
 
 /// What the main loop should do after a control key.
@@ -57,6 +67,21 @@ impl App {
     /// the screen), switch between the two, close from the second.
     pub fn toggle_preview(&mut self) {
         let a = self.selected_agent();
+        if self.ctl.inbox {
+            // the inbox always shows the detail: p flips conversation/screen
+            let screen = a.is_some_and(|a| a.host.as_ref().is_some_and(|h| h.kind.interactive()));
+            self.ctl.preview = match self.ctl.preview {
+                Some(PreviewMode::Screen) => None,
+                _ if screen => Some(PreviewMode::Screen),
+                _ => {
+                    self.set_status("marina can show the screen of herdr and tmux panes only");
+                    None
+                }
+            };
+            self.ctl.detail_scroll = 0;
+            self.dirty = true;
+            return;
+        }
         let has_reply = a.is_some_and(|a| a.summary.is_some());
         let has_screen = a.is_some_and(|a| a.host.as_ref().is_some_and(|h| h.kind.interactive()));
         self.ctl.preview = match self.ctl.preview {
@@ -113,6 +138,32 @@ impl App {
     /// (herdr), or its screen shows one.
     pub(crate) fn waiting_on_you(&self, a: &Agent) -> bool {
         a.is_blocked() || self.screen_of(a.pid).is_some_and(hosts::shows_dialog)
+    }
+
+    /// Scroll the detail pane (`[` / `]`, PgUp / PgDn, wheel). Positive is
+    /// further down the conversation, or further back up the screen.
+    pub fn detail_scroll_by(&mut self, delta: isize) {
+        self.ctl.detail_scroll = self.ctl.detail_scroll.saturating_add_signed(delta);
+        self.dirty = true;
+    }
+
+    /// Is a detail pane showing (inbox, or the preview)?
+    pub fn detail_visible(&self) -> bool {
+        self.ctl.inbox || self.ctl.preview.is_some()
+    }
+
+    /// Start a new selection's detail at the top.
+    pub(crate) fn sync_detail(&mut self) {
+        let pid = self.selected_agent().map(|a| a.pid);
+        if pid != self.ctl.detail_pid {
+            self.ctl.detail_pid = pid;
+            self.ctl.detail_scroll = 0;
+        }
+    }
+
+    /// Mouse: the inbox card at screen row `y`, if any.
+    pub(crate) fn card_at(&self, y: u16) -> Option<u32> {
+        self.ctl.hits.iter().find(|(r, _)| *r == y).map(|(_, p)| *p)
     }
 
     // --- approve / reject / reply ------------------------------------------
@@ -246,15 +297,6 @@ impl App {
         agents.sort_by_key(|a| (a.urgency(now), std::cmp::Reverse(a.last_active())));
         agents.into_iter().map(|a| Entry::Agent(a.pid)).collect()
     }
-}
-
-/// 0 waiting on you, 1 finished, 2 working, 3 idle, 4 stale.
-pub(crate) fn inbox_rank(a: &Agent, now: u64) -> u8 {
-    a.urgency(now)
-}
-
-pub(crate) fn last_active(a: &Agent) -> u64 {
-    a.last_active()
 }
 
 fn cant_type(a: &Agent) -> String {

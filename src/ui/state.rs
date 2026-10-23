@@ -871,6 +871,15 @@ impl App {
                     self.close_help();
                     return;
                 }
+                if self.ctl.inbox {
+                    // a card selects; the table geometry below doesn't apply
+                    if let Some(pid) = self.card_at(y) {
+                        self.selected = Some(Entry::Agent(pid));
+                        self.last_input = Instant::now();
+                        self.dirty = true;
+                    }
+                    return;
+                }
                 let t = self.table_rect;
                 if !rect_contains(t, x, y) {
                     return;
@@ -906,6 +915,8 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_up(3);
+                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
+                    self.detail_scroll_by(-3);
                 } else {
                     self.select_prev();
                 }
@@ -913,6 +924,8 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_down(3);
+                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
+                    self.detail_scroll_by(3);
                 } else {
                     self.select_next();
                 }

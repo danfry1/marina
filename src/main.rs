@@ -168,6 +168,17 @@ fn run(
                             KeyCode::Char('Y') => verb_copy(app),
                             KeyCode::Char('O') => verb_open(app),
                             KeyCode::Char('T') => verb_tail(app, &ev_tx),
+                            // the log pane when it's open, else the detail pane
+                            KeyCode::Char('[') | KeyCode::PageUp
+                                if !app.log_open() && app.detail_visible() =>
+                            {
+                                app.detail_scroll_by(-8)
+                            }
+                            KeyCode::Char(']') | KeyCode::PageDown
+                                if !app.log_open() && app.detail_visible() =>
+                            {
+                                app.detail_scroll_by(8)
+                            }
                             KeyCode::Char('[') => app.log_scroll_up(5),
                             KeyCode::Char(']') => app.log_scroll_down(5),
                             KeyCode::Char('+') | KeyCode::Char('=') => app.log_grow(),

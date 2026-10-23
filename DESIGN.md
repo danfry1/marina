@@ -575,7 +575,13 @@ window.
   first if a dialog is up. Arguments go as argv, never through a shell.
   GUI terminals are never typed into.
 - *Inbox* (`a`): agents only, ordered by `Agent::urgency` (blocked, done,
-  working, idle, stale) then most recently active.
+  working, idle, stale) then most recently active; drawn as grouped
+  two-line cards (idle split into *recent* < 1h and *earlier*) beside the
+  selected session's detail (stacked under 120 columns). The detail — also
+  the `p` preview — is a fixed context header (state, task, repo / branch /
+  changes, shells and servers, PR, a waiting banner) over a scrollable
+  body: *you asked*, *status* (recap), *<agent> said* (reply, markdown), or
+  the live screen pinned to its bottom.
 
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
