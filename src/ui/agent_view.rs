@@ -27,9 +27,8 @@ fn group_of(app: &App, a: &Agent, now: u64) -> &'static str {
     match app.inbox_urgency(a, now) {
         0 => "NEEDS YOU",
         1 => "NEW",
-        2 => "WORKING",
         4 => "STALE",
-        _ if now.saturating_sub(a.last_active()) < 3600 => "RECENT",
+        _ if now.saturating_sub(a.settled_at()) < 3600 => "RECENT",
         _ => "EARLIER",
     }
 }
@@ -38,6 +37,7 @@ fn group_of(app: &App, a: &Agent, now: u64) -> &'static str {
 fn dot(app: &App, a: &Agent, now: u64) -> Span<'static> {
     let (c, color) = match app.inbox_urgency(a, now) {
         0 => ("●", Color::Red),
+        _ if a.is_working(now) => ("◐", Color::Yellow),
         1 => ("●", Color::Cyan),
         2 => ("◐", Color::Yellow),
         4 => ("·", Color::DarkGray),
@@ -149,7 +149,9 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         let sel = selected == Some(Entry::Agent(pid));
         let label = short_label(app, a);
-        let ago = match a.last_active() {
+        // a working session is active now; otherwise when it last finished
+        let ago = match a.settled_at() {
+            _ if a.is_working(now) => "now".to_string(),
             0 => String::new(),
             t => fmt_age(now.saturating_sub(t)),
         };
@@ -311,7 +313,11 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             " inbox · {} need you · {} new · {} working · {} sessions ",
             count(0),
             count(1),
-            count(2),
+            app.snapshot
+                .agents
+                .iter()
+                .filter(|a| a.is_working(now))
+                .count(),
             app.snapshot.agents.len()
         )
     };

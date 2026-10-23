@@ -597,9 +597,12 @@ window.
   it, so a first run starts with everything read.
 - *Last active* is the transcript's newest record time when there is one —
   terminal output misleads, as a multiplexer redrawing touches every pane.
-- *Inbox* (`a`): agents only, ordered by urgency (blocked, then herdr
-  *done* or unread as *new*, working, idle, stale) then most recently
-  active; drawn as grouped
+- *Inbox* (`a`): agents only, ordered by urgency (needs you, then herdr
+  *done* or unread as *new*, the rest, stale) then by when each last
+  finished a turn (`Agent::settled_at`, from `turn_duration` /
+  `task_complete`), so a session doesn't move while it works — its ◐ dot
+  and *now* say it's working. The order holds for 8s after a keypress
+  (`INBOX_HOLD`) so rows don't move under the cursor; drawn as grouped
   two-line cards (idle split into *recent* < 1h and *earlier*) beside the
   selected session's detail (stacked under 120 columns). The detail — also
   the `p` preview — is a fixed context header (state, task, repo / branch /

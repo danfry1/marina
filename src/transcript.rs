@@ -58,6 +58,9 @@ pub struct Summary {
     pub model: Option<String>,
     /// The session's working directory, as its newest record says.
     pub cwd: Option<PathBuf>,
+    /// Unix seconds its last turn ended — what the inbox orders by, so a
+    /// session doesn't move while it works, only when it finishes.
+    pub turn_ended: Option<u64>,
 }
 
 /// A Claude Code session that has exited but could be resumed.
@@ -108,6 +111,9 @@ pub fn parse_tail(text: &str) -> Summary {
         }
         if s.cwd.is_none() {
             s.cwd = v["cwd"].as_str().map(PathBuf::from);
+        }
+        if s.turn_ended.is_none() && kind == Some("system") && v["subtype"] == "turn_duration" {
+            s.turn_ended = v["timestamp"].as_str().and_then(parse_ts);
         }
         if !turn_known && matches!(kind, Some("user" | "assistant" | "system")) {
             turn_known = true;
@@ -293,7 +299,27 @@ fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
         context_tokens: s.context_tokens.or(wide.context_tokens),
         model: s.model.or(wide.model),
         cwd: s.cwd.or(wide.cwd),
+        turn_ended: s.turn_ended.or(wide.turn_ended),
     })
+}
+
+/// Claude Code keeps a session's transcript under its starting directory,
+/// encoded (`/Users/me/dev/app` → `-Users-me-dev-app`). Is session `id`'s
+/// transcript there for `dir`? `None` when transcripts can't be checked.
+pub fn belongs_to(id: &str, dir: &Path) -> Option<bool> {
+    if !crate::launcher::is_session_id(id) {
+        return Some(false);
+    }
+    let projects = claude_dir()?.join("projects");
+    if !projects.is_dir() {
+        return None;
+    }
+    let enc: String = dir
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    Some(projects.join(enc).join(format!("{id}.jsonl")).is_file())
 }
 
 /// Claude Code transcripts (top-level sessions, not subagents') written
@@ -354,6 +380,9 @@ pub fn parse_codex(meta: &str, tail: &str) -> Summary {
         let p = &v["payload"];
         match (v["type"].as_str(), p["type"].as_str()) {
             (Some("event_msg"), Some("task_complete")) => {
+                if s.turn_ended.is_none() {
+                    s.turn_ended = v["timestamp"].as_str().and_then(parse_ts);
+                }
                 if !turn_known {
                     turn_known = true;
                     s.in_turn = false;
@@ -856,6 +885,30 @@ mod tests {
         assert_eq!(s.context_tokens, Some(10_270));
         assert!(!s.in_turn);
         assert!(parse_opencode("nope").is_none());
+    }
+
+    #[test]
+    fn transcripts_belong_to_their_encoded_directory() {
+        let base = std::env::temp_dir().join(format!("marina-belongs-{}", std::process::id()));
+        let proj = base.join("projects/-Users-me-dev-danfry-dev");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("abc123.jsonl"), "{}").unwrap();
+        // SAFETY: tests touching CLAUDE_CONFIG_DIR run in this one test
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &base) };
+        assert_eq!(
+            belongs_to("abc123", Path::new("/Users/me/dev/danfry.dev")),
+            Some(true)
+        );
+        assert_eq!(
+            belongs_to("abc123", Path::new("/Users/me/dev/other")),
+            Some(false)
+        );
+        assert_eq!(
+            belongs_to("$(x)", Path::new("/Users/me/dev/danfry.dev")),
+            Some(false)
+        );
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
