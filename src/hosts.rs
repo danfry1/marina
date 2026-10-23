@@ -386,16 +386,26 @@ const TERMINAL_FOCUS: &str = r#"on run argv
 end run"#;
 
 /// Ghostty doesn't expose ttys: focus a terminal in the session's directory,
-/// reporting how many were there.
-const GHOSTTY_FOCUS: &str = r#"on run argv
-  tell application "Ghostty"
-    set ts to every terminal whose working directory is (item 1 of argv)
-    if (count of ts) is 0 then return "missing"
-    focus (item 1 of ts)
-    activate
-    return (count of ts) as text
-  end tell
-end run"#;
+/// preferring one whose title is the agent's (Claude Code titles its
+/// terminal `✳ …`, or a braille spinner while working; opencode `OC | …`) so
+/// marina's own terminal in the same directory isn't picked. JXA, because it
+/// can address the instance by pid — AppleScript by name reaches only one of
+/// several running Ghostty instances. argv: pid (0 = by name), dir, agent.
+const GHOSTTY_FOCUS: &str = r#"function run(argv) {
+  var pid = parseInt(argv[0], 10), dir = argv[1], agent = argv[2].toLowerCase();
+  var g = pid > 0 ? Application(pid) : Application("Ghostty");
+  var ts = g.terminals().filter(function (t) { return t.workingDirectory() === dir; });
+  if (ts.length === 0) return "missing";
+  var mine = function (t) {
+    var n = t.name(), l = n.toLowerCase(), c = n.charCodeAt(0);
+    return l.indexOf(agent) >= 0 || n.charAt(0) === "\u2733" ||
+      (c >= 0x2800 && c <= 0x28ff) || (agent === "opencode" && l.indexOf("oc |") === 0);
+  };
+  var hits = ts.filter(mine);
+  g.focus((hits.length ? hits : ts)[0]);
+  g.activate();
+  return String(hits.length || ts.length);
+}"#;
 
 #[derive(Deserialize)]
 struct WezPane {
@@ -412,8 +422,10 @@ fn wezterm_pane(json: &str, tty: &str) -> Option<u64> {
         .map(|p| p.pane_id)
 }
 
-/// Focus the session's pane. Returns a line for the status bar.
-pub fn jump(host: &HostInfo) -> Result<String, String> {
+/// Focus the session's pane. Returns a line for the status bar. `agent`
+/// (`claude`, `opencode`) helps pick it where a host can only narrow down by
+/// directory.
+pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
     match host.kind {
         HostKind::Herdr => run("herdr", &["agent", "focus", &host.target])
             .map(|_| format!("focused herdr pane {}", host.target))
@@ -452,24 +464,35 @@ pub fn jump(host: &HostInfo) -> Result<String, String> {
                 )),
             }
         }
-        HostKind::Ghostty => match osascript(GHOSTTY_FOCUS, &[&host.target]).as_deref() {
-            Some("1") => Ok(format!("focused the {}", host.describe())),
-            Some(n) if n.parse::<u32>().is_ok() => Ok(format!(
-                "focused a Ghostty terminal in {} ({n} are open there)",
-                host.target
-            )),
-            // Several Ghostty instances: AppleScript reaches only one, which
-            // may not be this session's. Bring its own instance forward.
-            Some(_) if host.app_pid.is_some_and(activate_pid) => Ok(format!(
-                "brought its Ghostty window forward — Ghostty's scripting couldn't pick the terminal in {} (more than one Ghostty is running)",
-                host.target
-            )),
-            Some(_) => Err(format!("no {} any more", host.describe())),
-            None => Err(
-                "couldn't script Ghostty — allow marina's terminal under System Settings › Privacy › Automation"
-                    .into(),
-            ),
-        },
+        HostKind::Ghostty => {
+            let pid = host.app_pid.unwrap_or(0).to_string();
+            let mut cmd = Command::new("osascript");
+            cmd.args(["-l", "JavaScript", "-e", GHOSTTY_FOCUS]).args([
+                pid.as_str(),
+                host.target.as_str(),
+                agent,
+            ]);
+            // a first jump may wait on the automation permission prompt
+            match crate::exec::output(cmd, Duration::from_secs(20))
+                .map(|o| o.trim().to_string())
+                .as_deref()
+            {
+                Some("1") => Ok(format!("focused the {}", host.describe())),
+                Some(n) if n.parse::<u32>().is_ok() => Ok(format!(
+                    "focused a Ghostty terminal in {} ({n} look like {agent} there)",
+                    host.target
+                )),
+                Some(_) if host.app_pid.is_some_and(activate_pid) => Ok(format!(
+                    "brought Ghostty forward — no terminal in {} reports that directory",
+                    host.target
+                )),
+                Some(_) => Err(format!("no {} any more", host.describe())),
+                None => Err(
+                    "couldn't script Ghostty — allow marina's terminal under System Settings › Privacy › Automation"
+                        .into(),
+                ),
+            }
+        }
         HostKind::WezTerm => {
             let pane = run("wezterm", &["cli", "list", "--format", "json"])
                 .and_then(|j| wezterm_pane(&j, &host.target))

@@ -294,9 +294,10 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
     match a.host.clone() {
         Some(host) => {
             let ev = ev.clone();
+            let agent = a.name.clone();
             app.set_status(format!("jumping to the {}…", host.describe()));
             std::thread::spawn(move || {
-                let msg = hosts::jump(&host).unwrap_or_else(|e| e);
+                let msg = hosts::jump(&host, &agent).unwrap_or_else(|e| e);
                 let _ = ev.send(UiEvent::Status(msg));
             });
         }

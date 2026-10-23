@@ -530,14 +530,17 @@ approval or question, and *done*), its session id overrides env markers
 (those lag a `/clear`), and its terminal title is shown as the session's task.
 Without a multiplexer, the terminal app is recognised from the agent's
 ancestry (the first ancestor whose argv0 is iTerm2 / its `iTermServer`,
-Terminal.app, Ghostty or `wezterm-gui`) — no scripting while sampling, so
+Terminal.app, Ghostty or `wezterm-gui`; past a root `login`, whose parent
+is unreadable, by finding which terminal app lists it as a child) — no scripting while sampling, so
 no automation prompt until the user jumps.
 `Enter` on an agent row jumps: `herdr agent focus <pane>`, tmux
 `switch-client`/`select-window` + `select-pane`; iTerm2 and Terminal by
-AppleScript matching the session's/tab's `tty`; Ghostty by AppleScript
-focusing a terminal whose `working directory` is the agent's (Ghostty
-exposes no tty, so with several terminals in one directory it picks the
-first and says so); WezTerm by `wezterm cli list` (tty → pane) and
+AppleScript matching the session's/tab's `tty`; Ghostty by JXA addressed to the
+session's own Ghostty process (`Application(pid)` — AppleScript by name
+reaches only one of several running instances), focusing a terminal whose
+`working directory` is the agent's; Ghostty exposes no tty, so among
+several there it prefers one titled like the agent (`✳ …` or a braille
+spinner for Claude Code, `OC | …` for opencode) over, say, marina's own; WezTerm by `wezterm cli list` (tty → pane) and
 `activate-pane`; else copy `cd <dir> && <resume command>`. Values reach
 AppleScript as `on run argv` arguments, never spliced into the script.
 Adding a host (kitty, …) is a lookup arm keyed by pid, tty or directory plus
