@@ -22,8 +22,10 @@ pub struct Launch {
     pub dir: PathBuf,
     /// `claude`, `opencode`, `codex`.
     pub agent: String,
-    /// Arguments after the agent: a first prompt, or `--resume <id>`.
-    pub args: Vec<String>,
+    /// A first prompt.
+    pub prompt: Option<String>,
+    /// A session to resume instead of starting fresh.
+    pub resume: Option<String>,
     /// Make a git worktree for it first.
     pub worktree: bool,
 }
@@ -50,8 +52,28 @@ impl Place {
     }
 }
 
+/// The agent's arguments for a first prompt or a resume — each agent spells
+/// them differently, and a prompt must never read as a flag or a
+/// subcommand (`opencode <dir>` takes its prompt from `--prompt`).
+pub fn agent_args(agent: &str, prompt: Option<&str>, resume: Option<&str>) -> Vec<String> {
+    let mut a = Vec::new();
+    match (agent, resume) {
+        ("codex", Some(id)) => a.extend(["resume".to_string(), id.to_string()]),
+        ("opencode", Some(id)) => a.extend(["--session".to_string(), id.to_string()]),
+        (_, Some(id)) => a.extend(["--resume".to_string(), id.to_string()]),
+        _ => {}
+    }
+    if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
+        match agent {
+            "opencode" => a.extend(["--prompt".to_string(), p.to_string()]),
+            _ => a.extend(["--".to_string(), p.to_string()]),
+        }
+    }
+    a
+}
+
 /// From marina's own environment: inside tmux or herdr, else the terminal
-/// app (`TERM_PROGRAM`).
+/// app (`TERM_PROGRAM`, macOS only — they're driven by AppleScript).
 pub fn here() -> Option<Place> {
     let env = |k: &str| std::env::var(k).ok();
     // innermost first: tmux started inside a herdr pane inherits herdr's
@@ -62,6 +84,9 @@ pub fn here() -> Option<Place> {
     if env("HERDR_PANE_ID").is_some() {
         return Some(Place::Herdr);
     }
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     match env("TERM_PROGRAM").as_deref()? {
         "ghostty" => Some(Place::Ghostty),
         "iTerm.app" => Some(Place::ITerm),
@@ -70,17 +95,28 @@ pub fn here() -> Option<Place> {
     }
 }
 
-/// POSIX single-quoting.
-pub fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Single-quoting for the user's shell: POSIX `'…'\''…'`, or fish's,
+/// which also treats `\\` and `\'` as escapes inside single quotes.
+pub fn sh_quote_for(s: &str, fish: bool) -> String {
+    if fish {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
-/// `cd '<dir>' && claude '<arg>'…` — for a shell.
-fn shell_line(dir: &Path, agent: &str, args: &[String]) -> String {
-    let mut line = format!("cd {} && {}", sh_quote(&dir.display().to_string()), agent);
+/// Is the login shell fish? (Its quoting differs.)
+fn user_shell_is_fish() -> bool {
+    std::env::var("SHELL").is_ok_and(|s| s.rsplit('/').next() == Some("fish"))
+}
+
+/// `cd '<dir>' && claude '<arg>'…` — typed into the user's shell.
+fn shell_line(dir: &Path, agent: &str, args: &[String], fish: bool) -> String {
+    let q = |s: &str| sh_quote_for(s, fish);
+    let mut line = format!("cd {} && {}", q(&dir.display().to_string()), agent);
     for a in args {
         line.push(' ');
-        line.push_str(&sh_quote(a));
+        line.push_str(&q(a));
     }
     line
 }
@@ -92,10 +128,11 @@ fn make_worktree(dir: &Path) -> Result<PathBuf, String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".into());
+    // seconds plus sub-second digits: unique across launches
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() % 1_000_000)
-        .unwrap_or(0);
+        .map(|d| format!("{}{:03}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_default();
     let path = root
         .parent()
         .ok_or("repository has no parent directory")?
@@ -164,21 +201,65 @@ const ITERM_NEW: &str = r#"on run argv
   end tell
 end run"#;
 
-/// Start it. Returns a status line.
+/// Start it. Returns a status line. A failure undoes what it made — the
+/// worktree and its branch, a herdr workspace — so nothing is left behind.
 pub fn start(req: &Launch, place: Place) -> Result<String, String> {
-    let dir = if req.worktree {
-        make_worktree(&req.dir)?
+    let args = agent_args(&req.agent, req.prompt.as_deref(), req.resume.as_deref());
+    let made = if req.worktree {
+        Some(make_worktree(&req.dir)?)
     } else {
-        req.dir.clone()
+        None
     };
+    let dir = made.clone().unwrap_or_else(|| req.dir.clone());
+    let started = open(&dir, &req.agent, &args, place);
+    if started.is_err() {
+        if let Some(wt) = &made {
+            remove_worktree(wt);
+        }
+    }
+    started?;
+    Ok(format!(
+        "started {} in {} ({})",
+        req.agent,
+        crate::ui::tildify(&dir.display().to_string()),
+        place.name()
+    ))
+}
+
+/// Undo `make_worktree`: the worktree, then its branch.
+fn remove_worktree(dir: &Path) {
+    let Some(root) = crate::model::work_tree(dir) else {
+        return;
+    };
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&root)
+        .output();
+    if let Some(b) = branch.filter(|b| b.starts_with("marina/")) {
+        let _ = Command::new("git")
+            .args(["branch", "-D", &b])
+            .current_dir(root.parent().unwrap_or(Path::new("/")))
+            .output();
+    }
+}
+
+fn open(dir: &Path, agent: &str, args: &[String], place: Place) -> Result<(), String> {
     let label = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| req.agent.clone());
-    let where_ = crate::ui::tildify(&dir.display().to_string());
+        .unwrap_or_else(|| agent.to_string());
+    let d = dir.display().to_string();
     match place {
         Place::Herdr => {
-            let d = dir.display().to_string();
             let created = run(
                 "herdr",
                 &[
@@ -192,39 +273,62 @@ pub fn start(req: &Launch, place: Place) -> Result<String, String> {
                 ],
                 TIMEOUT,
             )?;
-            let pane = serde_json::from_str::<HerdrCreated>(&created)
-                .map_err(|_| "herdr didn't say which pane it created")?
-                .result
-                .root_pane
-                .pane_id;
+            let created: HerdrCreated = serde_json::from_str(&created)
+                .map_err(|_| "herdr didn't say which pane it created")?;
+            let pane = created.result.root_pane.pane_id;
             // herdr names agents; keep it unique per launch
             let name = format!("{label}-{}", suffix());
             // `agent start` needs the new pane at its shell prompt
             std::thread::sleep(Duration::from_millis(800));
-            let mut args = vec![
+            let mut argv = vec![
                 "agent".to_string(),
                 "start".into(),
                 name,
                 "--kind".into(),
-                req.agent.clone(),
+                agent.to_string(),
                 "--pane".into(),
-                pane,
+                pane.clone(),
                 "--".into(),
             ];
-            args.extend(req.args.iter().cloned());
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            argv.extend(args.iter().cloned());
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             // it waits for the agent to be ready for input
-            run("herdr", &args, Duration::from_secs(45))?;
+            if let Err(e) = run("herdr", &argv, Duration::from_secs(45)) {
+                // don't leave an empty workspace behind
+                if let Some(ws) = pane.split(':').next() {
+                    let _ = run("herdr", &["workspace", "close", ws], TIMEOUT);
+                }
+                return Err(e);
+            }
         }
         Place::Tmux => {
-            let d = dir.display().to_string();
-            let mut args = vec!["new-window", "-c", &d, "-n", &label, "--", &req.agent];
-            args.extend(req.args.iter().map(String::as_str));
-            run("tmux", &args, TIMEOUT)?;
+            // through the user's login shell, so it has their PATH and
+            // aliases; the shell `exec`s the agent
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let fish = user_shell_is_fish();
+            let mut cmd = format!("exec {agent}");
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(&sh_quote_for(a, fish));
+            }
+            run(
+                "tmux",
+                &[
+                    "new-window",
+                    "-c",
+                    &d,
+                    "-n",
+                    &label,
+                    "--",
+                    &shell,
+                    "-lc",
+                    &cmd,
+                ],
+                TIMEOUT,
+            )?;
         }
         Place::Ghostty | Place::Terminal | Place::ITerm => {
-            let line = shell_line(&dir, &req.agent, &req.args);
-            let d = dir.display().to_string();
+            let line = shell_line(dir, agent, args, user_shell_is_fish());
             let (script, argv): (&str, Vec<&str>) = match place {
                 Place::Ghostty => (GHOSTTY_NEW, vec![d.as_str(), line.as_str()]),
                 Place::Terminal => (TERMINAL_NEW, vec![line.as_str()]),
@@ -233,15 +337,12 @@ pub fn start(req: &Launch, place: Place) -> Result<String, String> {
             let mut cmd = Command::new("osascript");
             cmd.arg("-e").arg(script).args(&argv);
             // a first use may wait on the automation permission prompt
-            crate::exec::output(cmd, Duration::from_secs(30))
-                .ok_or("couldn't open a window — allow marina's terminal under System Settings › Privacy › Automation")?;
+            crate::exec::output(cmd, Duration::from_secs(30)).ok_or(
+                "couldn't open a window — allow marina's terminal under System Settings › Privacy › Automation",
+            )?;
         }
     }
-    Ok(format!(
-        "started {} in {where_} ({})",
-        req.agent,
-        place.name()
-    ))
+    Ok(())
 }
 
 /// Four varying digits, so launches get distinct herdr agent names.
@@ -261,16 +362,41 @@ mod tests {
         let l = shell_line(
             Path::new("/Users/me/dev/it's"),
             "claude",
-            &["fix the tests; rm -rf ~".into()],
+            &["--".into(), "fix the tests; rm -rf ~".into()],
+            false,
         );
         assert_eq!(
             l,
-            r#"cd '/Users/me/dev/it'\''s' && claude 'fix the tests; rm -rf ~'"#
+            r#"cd '/Users/me/dev/it'\''s' && claude '--' 'fix the tests; rm -rf ~'"#
         );
         assert_eq!(
-            shell_line(Path::new("/x"), "claude", &[]),
+            shell_line(Path::new("/x"), "claude", &[], false),
             "cd '/x' && claude"
         );
+        // fish: backslash and quote escapes inside single quotes
+        assert_eq!(sh_quote_for(r"x\'; rm", true), r"'x\\\'; rm'");
+    }
+
+    #[test]
+    fn prompts_never_read_as_flags_or_subcommands() {
+        assert_eq!(
+            agent_args("claude", Some("-p hi"), None),
+            vec!["--", "-p hi"]
+        );
+        assert_eq!(
+            agent_args("opencode", Some("upgrade"), None),
+            vec!["--prompt", "upgrade"]
+        );
+        assert_eq!(
+            agent_args("claude", None, Some("abc")),
+            vec!["--resume", "abc"]
+        );
+        assert_eq!(agent_args("codex", None, Some("t1")), vec!["resume", "t1"]);
+        assert_eq!(
+            agent_args("opencode", None, Some("ses_1")),
+            vec!["--session", "ses_1"]
+        );
+        assert!(agent_args("claude", Some("  "), None).is_empty());
     }
 
     #[test]

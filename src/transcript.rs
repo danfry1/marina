@@ -291,6 +291,17 @@ fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
     })
 }
 
+/// The first `cwd` a transcript records: where its session started.
+fn first_cwd(path: &Path) -> Option<PathBuf> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(64 * 1024).read_to_end(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["cwd"].as_str().map(PathBuf::from))
+}
+
 fn claude_dir() -> Option<PathBuf> {
     match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(d) => Some(PathBuf::from(d)),
@@ -356,8 +367,10 @@ impl Cache {
     }
 
     /// Recently exited Claude Code sessions, newest first: transcripts
-    /// written in the last two days whose session isn't running.
-    pub fn ended(&mut self, live: &[&str]) -> Vec<Ended> {
+    /// written in the last two days whose session isn't running. `busy_dirs`
+    /// are directories with a running session marina couldn't identify —
+    /// a transcript there may be its, so it isn't offered for resuming.
+    pub fn ended(&mut self, live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
         if let Some((at, found)) = &self.ended {
             if at.elapsed() < ENDED_EVERY {
                 return found
@@ -389,7 +402,8 @@ impl Cache {
                         continue;
                     };
                     let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
-                    if age <= ENDED_WITHIN {
+                    // written in the last minute: likely still running
+                    if (60..=ENDED_WITHIN).contains(&age) {
                         let at = mtime
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
@@ -401,15 +415,50 @@ impl Cache {
         }
         recent.sort_by_key(|r| std::cmp::Reverse(r.2));
         let mut found = Vec::new();
-        for (id, path, at) in recent {
+        // bounded work per scan, and unchanged files aren't re-read
+        for (id, path, at) in recent.into_iter().take(ENDED_MAX * 2) {
             if found.len() == ENDED_MAX {
                 break;
             }
-            let Some(summary) = summarize(&path, None) else {
-                continue;
+            let stamp = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len())));
+            let cached = self
+                .entries
+                .get(&id)
+                .filter(|e| Some(e.stamp) == stamp)
+                .map(|e| e.summary.clone());
+            let summary = match cached {
+                Some(s) => s,
+                None => {
+                    let Some(mut s) = summarize(&path, None) else {
+                        continue;
+                    };
+                    // resume looks the session up from the directory it
+                    // started in: the transcript's first recorded cwd
+                    s.cwd = first_cwd(&path).or(s.cwd);
+                    if let Some(stamp) = stamp {
+                        self.entries.insert(
+                            id.clone(),
+                            Entry {
+                                path: path.clone(),
+                                stamp,
+                                read_at: Instant::now(),
+                                summary: s.clone(),
+                            },
+                        );
+                    }
+                    s
+                }
             };
-            // only sessions that said something, with a place to resume in
-            let Some(cwd) = summary.cwd.clone().filter(|_| summary.last_reply.is_some()) else {
+            // only sessions that said something, in a directory that's still
+            // there and isn't busy with an unidentified session
+            let Some(cwd) = summary
+                .cwd
+                .clone()
+                .filter(|c| c.is_absolute() && c.is_dir() && !busy_dirs.contains(c))
+                .filter(|_| summary.last_reply.is_some())
+            else {
                 continue;
             };
             found.push(Ended {

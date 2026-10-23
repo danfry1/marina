@@ -163,6 +163,9 @@ fn run(
                             _ => {}
                         }
                     } else {
+                        if key.code != KeyCode::Char('X') {
+                            app.clear_pending_end();
+                        }
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),

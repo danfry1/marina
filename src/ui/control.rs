@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use super::format::unix_now;
 use super::state::{App, Entry};
 use crate::hosts::{self, HostInfo, Send};
 use crate::model::Agent;
@@ -505,6 +506,11 @@ impl App {
 
     // --- start / end sessions ------------------------------------------------
 
+    /// Any key but `X` cancels a half-confirmed end.
+    pub fn clear_pending_end(&mut self) {
+        self.ctl.pending_end = None;
+    }
+
     pub fn is_ended_selected(&self) -> bool {
         self.selected_ended().is_some()
     }
@@ -523,14 +529,15 @@ impl App {
         let req = crate::launch::Launch {
             dir: e.cwd.clone(),
             agent: "claude".into(),
-            args: vec!["--resume".into(), e.id.clone()],
+            prompt: None,
+            resume: Some(e.id.clone()),
             worktree: false,
         };
         let Some(place) = crate::launch::here() else {
             self.set_status(format!(
                 "resume it with: cd {} && claude --resume {}",
                 req.dir.display(),
-                req.args[1]
+                e.id
             ));
             return None;
         };
@@ -544,6 +551,7 @@ impl App {
         let agent = self.selected_agent();
         let dir = agent
             .map(|a| a.cwd.clone())
+            .or_else(|| self.selected_ended().map(|e| e.cwd.clone()))
             .or_else(|| self.selected_target().map(|t| t.cwd.clone()))
             .or_else(|| match &self.selected {
                 Some(Entry::Group(p)) => self.group_members(p).first().map(|t| t.cwd.clone()),
@@ -606,18 +614,14 @@ impl App {
             );
             return None;
         };
-        let prompt = d.prompt.trim();
-        let args = if prompt.is_empty() {
-            Vec::new()
-        } else {
-            vec![prompt.to_string()]
-        };
+        let prompt = Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty());
         self.set_status(format!("starting {} in {}…", d.agent, place.name()));
         Some((
             crate::launch::Launch {
                 dir: d.dir,
                 agent: d.agent,
-                args,
+                prompt,
+                resume: None,
                 worktree: d.worktree,
             },
             place,
@@ -641,6 +645,15 @@ impl App {
         };
         let pid = a.pid;
         let label = self.agent_label(a);
+        // /exit while it works would be queued (or typed into its prompt),
+        // and at a dialog the Esc first would reject the pending call
+        if a.is_working(unix_now()) || self.waiting_on_you(a) {
+            self.set_status(format!(
+                "{label} is busy — let it finish (or answer it) before ending it, or Enter to jump there"
+            ));
+            self.ctl.pending_end = None;
+            return Action::None;
+        }
         let confirmed = self
             .ctl
             .pending_end
