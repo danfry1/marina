@@ -29,4 +29,5 @@ pub fn control_rows() -> usize {
 pub use render::render;
 pub use state::App;
 
+pub(crate) use agent_view::first_sentence;
 pub(crate) use format::{fmt_age, fmt_uptime, tildify};

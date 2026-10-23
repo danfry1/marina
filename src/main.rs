@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod digest;
 mod docker;
 mod exec;
 mod git;

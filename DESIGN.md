@@ -651,6 +651,20 @@ in the last two days whose id isn't live (at most 8, rescanned every 30s,
 needing a reply and a recorded `cwd`); `Enter` resumes one with
 `claude --resume <id>` through the same launcher.
 
+**Other agents' history**: Codex rollouts (`$CODEX_HOME/sessions/**/rollout-…-<thread id>.jsonl`)
+give the cwd (first `session_meta` line), user messages, assistant
+messages, `task_complete` / `task_started` (end and start of a turn, for
+`in_turn`) and `token_count`; opencode's `session export <id>` (only
+while its service runs, at most every 5s) gives the title, token totals,
+messages and an `idle` end-of-turn marker.
+
+**Digest** (`digest.rs`): transcripts written since the window's start
+(`today` = local midnight, or `90m` / `24h` / `3d`); from each tail (8MB):
+`turn_duration` records in the window (time working, turns; subagents'
+excluded), assistant `usage` (input + cache tokens, output tokens),
+`pr-link`s, the first cwd, and the summary's recap or reply. Grouped by
+work tree, with `git log --since` commit counts and subjects per repo.
+
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
 the peak and memory drift. Helpers several sessions each run a copy of

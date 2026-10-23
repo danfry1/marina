@@ -58,6 +58,8 @@ USAGE:
                      [--long]        … and what each last said: recap, last
                                      prompt and reply, what it's waiting on
                                      (with --json: the `summary` field)
+    marina digest [24h|3d|today] [--json]   what your agents did: per project,
+                                 time working, tokens, commits, PRs, recaps
     marina jump <session>        focus an agent session's terminal (session id,
                                  pid, or project) — what clicking a notice does
     marina watch                 send agent notices without the TUI open
@@ -153,6 +155,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "port" => port(&selectors, json, list, release),
         "agents" => agents(&selectors, json, flags.contains(&"--long")),
         "jump" => jump(&selectors),
+        "digest" => crate::digest::run(selectors.first().copied(), json),
         "watch" => {
             if flags.contains(&"--install") {
                 crate::watch::install()

@@ -474,12 +474,20 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         .as_ref()
         .map(|h| h.short())
         .unwrap_or_else(|| "no terminal".into());
-    let context = a
-        .summary
-        .as_ref()
-        .and_then(|s| s.context_tokens)
-        .map(|n| format!(" · {}k context", n / 1000))
-        .unwrap_or_default();
+    // a full context window degrades answers: nudge toward /clear
+    let tokens = a.summary.as_ref().and_then(|s| s.context_tokens);
+    let context = match tokens {
+        Some(n) if n >= 700_000 => Span::styled(
+            format!(" · {}k context — time to /clear", n / 1000),
+            Style::new().fg(Color::Red),
+        ),
+        Some(n) if n >= 400_000 => Span::styled(
+            format!(" · {}k context", n / 1000),
+            Style::new().fg(Color::Yellow),
+        ),
+        Some(n) => Span::styled(format!(" · {}k context", n / 1000), DIM),
+        None => Span::raw(""),
+    };
     out.push(Line::from(vec![
         Span::raw(" "),
         dot(app, a, now),
@@ -490,7 +498,8 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         ),
         Span::styled(" · ", DIM),
         state,
-        Span::styled(format!(" · {place}{context}"), DIM),
+        Span::styled(format!(" · {place}"), DIM),
+        context,
     ]));
     if let Some(t) = a.title() {
         out.push(Line::styled(
