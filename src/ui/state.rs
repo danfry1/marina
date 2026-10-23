@@ -1072,11 +1072,6 @@ impl App {
                         .then_with(|| agent_label(a).cmp(agent_label(b)))
                 });
                 entries.extend(section.iter().map(|&i| Entry::Agent(agents[i].pid)));
-                entries.extend(
-                    services
-                        .iter()
-                        .map(|&i| Entry::Member(targets[i].key.clone())),
-                );
             }
         }
 
@@ -1411,6 +1406,19 @@ mod tests {
             "{e:?}"
         );
         assert!(!e.contains(&Entry::Agents), "no sessions, no section");
+
+        // with the section open, it's listed once, not again inside it
+        let mut snap = Snapshot::sample();
+        snap.seq = 2;
+        snap.targets
+            .push(app.snapshot.targets.last().unwrap().clone());
+        snap.agents = vec![Agent::sample(7, "aaaa1111", "marina")];
+        app.apply(Arc::new(snap));
+        app.agents_open = true;
+        let e = app.compute_entries();
+        let svc = |x: &&Entry| matches!(x, Entry::Target(k) | Entry::Member(k) if *k == TargetKey::Port(49374));
+        assert_eq!(e.iter().filter(svc).count(), 1, "{e:?}");
+        assert_eq!(e.last(), Some(&Entry::Agent(7)));
     }
 
     #[test]
