@@ -170,6 +170,8 @@ pub struct App {
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
+    /// Preview, reply box and inbox (`ui::control`).
+    pub(crate) ctl: super::control::Control,
     /// PROJECT column width at the last render (it grows with the pane).
     pub(crate) project_w: u16,
     /// Recent cpu/mem per target and per agent session, for the inspect
@@ -215,6 +217,7 @@ impl App {
             log_rect: None,
             header_hits: Vec::new(),
             project_w: 22,
+            ctl: Default::default(),
             history: HashMap::new(),
         }
     }
@@ -725,7 +728,7 @@ impl App {
             })
     }
 
-    fn matches_agent(&self, a: &Agent) -> bool {
+    pub(crate) fn matches_agent(&self, a: &Agent) -> bool {
         if self.filter.is_empty() {
             return true;
         }
@@ -749,6 +752,9 @@ impl App {
     pub fn escape(&mut self) {
         if self.log.is_some() {
             self.close_log();
+        } else if self.ctl.preview.is_some() {
+            self.ctl.preview = None;
+            self.dirty = true;
         } else if self.inspect {
             self.inspect = false;
             self.dirty = true;
@@ -948,6 +954,9 @@ impl App {
     /// flatten to visible entries (collapsing folded groups). Volatile sorts
     /// freeze for `FREEZE` after a keystroke.
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
+        if self.ctl.inbox {
+            return self.inbox_entries(unix_now());
+        }
         let targets = &self.snapshot.targets;
         let agents = &self.snapshot.agents;
         let mut visible: Vec<usize> = (0..targets.len())

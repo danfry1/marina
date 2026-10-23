@@ -31,4 +31,6 @@ pub enum UiEvent {
         project: String,
         path: Option<PathBuf>,
     },
+    /// An agent session's screen, read off-thread for the preview pane.
+    Screen { pid: u32, rows: Option<Vec<String>> },
 }

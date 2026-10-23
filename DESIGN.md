@@ -470,7 +470,8 @@ values are never read), and other variables — including tokens agents export
 alongside them — are never stored. Session ids are validated as
 `[A-Za-z0-9_-]{1,80}`.
 Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
-hold auth tokens).
+hold auth tokens); only session transcripts' tails are, for summaries (see
+*Agent control*).
 
 ### Agent sessions — IMPLEMENTED
 
@@ -518,7 +519,8 @@ and no terminal input (keystrokes, or focus events from switching to it) for
 over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
 and open time. CPU alone was tried first and misread working sessions as
 idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
-are touched in idle sessions too, so marina reads nothing under `~/.claude`.
+are touched in idle sessions too, so activity never comes from transcripts
+(their contents feed only the summaries under *Agent control*).
 
 **Terminal hosts** (`hosts.rs`): the multiplexer an agent's terminal lives
 in, when marina can drive it — herdr (matched by pid via `herdr pane
@@ -552,6 +554,28 @@ client) or else from a client process (a detached tmux server has none
 above it) — shown as `herdr·ghostty` in an agent row's VIA column, and
 raised by pid after the pane switch so the jump lands even from another
 window.
+
+**Agent control** (`transcript.rs`, `ui/control.rs`, `ui/agent_view.rs`):
+- *Summaries*: for a Claude Code session with a known id, the tail of
+  `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/<id>.jsonl` (256KB, widened
+  once to 4MB when the last reply is further back) gives the newest
+  `ai-title`, `last-prompt`, assistant text, an `away_summary` written after
+  it (recap), `pr-link`, and — when the newest message is an assistant
+  `tool_use` — the pending tool. Metadata records are skipped by their
+  leading `{"type":…` without parsing (request blobs are huge); sidechain
+  (subagent) records are ignored. Cached per session, re-read when the file
+  changes, at most every 2s. `[agents] transcripts = false` disables it.
+- *Preview* (`p`): the summary, or the session's live screen via
+  `herdr agent read --source visible` / `tmux capture-pane`, read
+  off-thread every 1.5s while open.
+- *Answering*: `y`/`n` send `enter`/`esc` (herdr `agent send-keys`, tmux
+  `send-keys`) only when the session is waiting — herdr says *blocked*, or
+  its screen shows a numbered choice / "Do you want to" — and `r` submits a
+  prompt (`herdr agent prompt`, tmux `send-keys -l` + Enter), sending Esc
+  first if a dialog is up. Arguments go as argv, never through a shell.
+  GUI terminals are never typed into.
+- *Inbox* (`a`): agents only, ordered by `Agent::urgency` (blocked, done,
+  working, idle, stale) then most recently active.
 
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with

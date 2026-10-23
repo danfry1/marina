@@ -83,6 +83,18 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
+- **Inbox** (`a`) — every agent session on one screen, what wants you first
+  (waiting on you, finished, working, idle, stale), each with where it runs,
+  how long ago it last did anything, and the latest thing it said: Claude's
+  own recap, its last reply, or what it's waiting to run.
+- **Preview** (`p`) — on an agent row, a pane with your last prompt, its
+  recap and its last reply (markdown rendered); `p` again shows the
+  session's live screen (herdr and tmux panes), including a pending
+  approval dialog.
+- **Answer from marina** — on a herdr or tmux session: `y` approves what
+  it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
+  dialog first). Only on your keystroke, only to the selected session, and
+  never into a GUI terminal window — `Enter` jumps there instead.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
   and `D` opens the uncommitted diff (stat, untracked files, patch) in the
@@ -161,6 +173,9 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a group · on an agent row: jump to its pane |
 | `D` | uncommitted diff of the selected agent's / server's work tree |
+| `a` | inbox: every agent session, what needs you first |
+| `p` | preview an agent: last prompt, recap and reply · again: its live screen |
+| `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -271,6 +286,10 @@ match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 [notify]
 desktop = false                # no desktop notifications at all
 agents  = false                # no "finished" / "needs you" agent notices
+
+[agents]
+transcripts = false            # don't read Claude Code transcript tails
+                               # (preview, inbox, agents --long)
 ```
 
 ## Privacy & security
@@ -309,6 +328,15 @@ marina is deliberately boring on this front:
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
+- **Agent transcripts and screens.** For the preview, the inbox and
+  `marina agents --long/--json`, marina reads the *tail* of each running
+  Claude Code session's transcript (`~/.claude/projects/*/<session>.jsonl`;
+  the last 256KB, more only if the last reply is further back): its title,
+  your last prompt, its last reply and recap, a pending tool call, and a PR
+  link. Nothing else from `~/.claude` is read — never credentials or
+  settings — and nothing is written or sent anywhere. `[agents] transcripts
+  = false` turns this off. The live screen of a herdr/tmux pane is read
+  (`herdr agent read`, `tmux capture-pane`) only while its preview is open.
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
   `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
@@ -316,7 +344,9 @@ marina is deliberately boring on this front:
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
-  `Enter` on an agent asks its multiplexer or terminal app to focus it. The one unprompted
+  `Enter` on an agent asks its multiplexer or terminal app to focus it,
+  and `y` / `n` / `r` on an agent send that keystroke or your reply to its
+  herdr/tmux pane (`herdr agent send-keys` / `prompt`, `tmux send-keys`). The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind, finishes, or needs you (`[notify] desktop = false` disables it).
 

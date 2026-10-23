@@ -59,6 +59,8 @@ pub struct Sampler {
     hosts: crate::hosts::Hosts,
     /// opencode session ids, asked of its background service.
     opencode: crate::opencode::Sessions,
+    /// Claude Code transcript summaries; `None` when turned off in config.
+    transcripts: Option<crate::transcript::Cache>,
     /// Agents' working-tree status.
     git: crate::git::Cache,
     home: Option<PathBuf>,
@@ -80,6 +82,10 @@ impl Sampler {
             docker_cache: None,
             hosts: Default::default(),
             opencode: Default::default(),
+            transcripts: crate::config::load()
+                .agents
+                .transcripts
+                .then(Default::default),
             git: Default::default(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             last_topology: Vec::new(),
@@ -324,6 +330,13 @@ impl Sampler {
                 }
             }
             self.opencode.fill(procs, &mut agents);
+            if let Some(tc) = self.transcripts.as_mut() {
+                for a in agents.iter_mut().filter(|a| a.name == "claude") {
+                    a.summary = a.session.as_deref().and_then(|id| tc.get(id));
+                }
+                let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
+                tc.retain(&live);
+            }
             (out, agents)
         };
 
@@ -598,6 +611,7 @@ fn build_agents(
                 host: None,
                 git: None,
                 title: None,
+                summary: None,
             })
         })
         .collect();
@@ -1018,6 +1032,7 @@ mod tests {
             docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
             hosts: Default::default(),
             opencode: Default::default(),
+            transcripts: None, // never read ~/.claude in tests
             git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),
             last_topology: Vec::new(),

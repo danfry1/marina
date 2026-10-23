@@ -577,6 +577,114 @@ pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
     }
 }
 
+/// Something to send to a session from marina — only ever on an explicit
+/// keystroke on that session's row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Send {
+    /// Accept the highlighted option of the dialog it's waiting on.
+    Approve,
+    /// Dismiss the dialog (Claude Code: "No, and tell Claude what to do").
+    Reject,
+    /// Submit a prompt; dismisses a waiting dialog first.
+    Reply(String),
+}
+
+impl HostKind {
+    /// Hosts marina can read a session's screen from and type into.
+    pub fn interactive(self) -> bool {
+        matches!(self, HostKind::Herdr | HostKind::Tmux)
+    }
+}
+
+/// The last `lines` rows of the session's screen, from its multiplexer.
+pub fn read_screen(host: &HostInfo, lines: usize) -> Option<Vec<String>> {
+    let n = lines.to_string();
+    let text = match host.kind {
+        HostKind::Herdr => run(
+            "herdr",
+            &[
+                "agent",
+                "read",
+                &host.target,
+                "--source",
+                "visible",
+                "--lines",
+                &n,
+            ],
+        )?,
+        HostKind::Tmux => run("tmux", &["capture-pane", "-p", "-t", &host.target])?,
+        _ => return None,
+    };
+    let mut rows: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    while rows.last().is_some_and(|l| l.is_empty()) {
+        rows.pop();
+    }
+    let skip = rows.len().saturating_sub(lines);
+    Some(rows.split_off(skip))
+}
+
+/// Does the screen show an approval or question dialog? (A numbered choice
+/// with a cursor on it, or Claude Code's "Do you want to …?".)
+pub fn shows_dialog(screen: &[String]) -> bool {
+    screen.iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("❯ 1.") || t.contains("Do you want to")
+    })
+}
+
+/// Send `what` to the session. `waiting` = it's at a dialog now.
+pub fn send(host: &HostInfo, what: &Send, waiting: bool) -> Result<String, String> {
+    let t = host.target.as_str();
+    let ok = |o: Option<String>, what: &str| {
+        o.map(|_| format!("{what} → {}", host.describe()))
+            .ok_or_else(|| format!("{} didn't take it", host.kind.name()))
+    };
+    match (host.kind, what) {
+        (HostKind::Herdr, Send::Approve) => ok(
+            run("herdr", &["agent", "send-keys", t, "enter"]),
+            "approved",
+        ),
+        (HostKind::Herdr, Send::Reject) => {
+            ok(run("herdr", &["agent", "send-keys", t, "esc"]), "rejected")
+        }
+        (HostKind::Herdr, Send::Reply(text)) => {
+            if waiting {
+                run("herdr", &["agent", "send-keys", t, "esc"])
+                    .ok_or("herdr couldn't dismiss the dialog")?;
+            }
+            // herdr refuses a prompt while it still sees the dialog; give
+            // the agent a moment to leave it
+            for _ in 0..6 {
+                if let Some(o) = run("herdr", &["agent", "prompt", t, text]) {
+                    return ok(Some(o), "sent");
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Err("herdr didn't accept the prompt (is the agent still at a dialog?)".into())
+        }
+        (HostKind::Tmux, Send::Approve) => {
+            ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "approved")
+        }
+        (HostKind::Tmux, Send::Reject) => {
+            ok(run("tmux", &["send-keys", "-t", t, "Escape"]), "rejected")
+        }
+        (HostKind::Tmux, Send::Reply(text)) => {
+            if waiting {
+                run("tmux", &["send-keys", "-t", t, "Escape"])
+                    .ok_or("tmux couldn't dismiss the dialog")?;
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            // literal text, then Enter as a key
+            run("tmux", &["send-keys", "-t", t, "-l", text]).ok_or("tmux didn't take the text")?;
+            ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "sent")
+        }
+        _ => Err(format!(
+            "marina can't type into {} — only herdr and tmux panes",
+            host.describe()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +816,32 @@ mod tests {
             None,
             "no tty, nothing to match"
         );
+    }
+
+    #[test]
+    fn recognises_dialogs_on_screen() {
+        let screen = |t: &str| t.lines().map(String::from).collect::<Vec<_>>();
+        assert!(shows_dialog(&screen(
+            " Bash command\n   cargo publish\n Do you want to proceed?\n ❯ 1. Yes\n   2. No"
+        )));
+        assert!(shows_dialog(&screen(
+            "Which one?\n❯ 1. Commit it\n  2. Pause"
+        )));
+        assert!(!shows_dialog(&screen("⏺ Done.\n❯ \n  auto mode on")));
+        let ghostty = HostInfo {
+            kind: HostKind::Ghostty,
+            target: "/x".into(),
+            status: None,
+            title: None,
+            session: None,
+            app_pid: None,
+            outer: None,
+        };
+        assert!(
+            send(&ghostty, &Send::Approve, true).is_err(),
+            "never types into a GUI terminal"
+        );
+        assert!(read_screen(&ghostty, 10).is_none());
     }
 
     #[test]

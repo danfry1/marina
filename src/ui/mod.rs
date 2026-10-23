@@ -6,9 +6,18 @@
 //!   beyond recording layout rects for mouse hit-testing.
 //! - `format` — small display helpers.
 
+mod agent_view;
+mod control;
 mod format;
 mod render;
 mod state;
+
+pub use control::Action;
+
+/// Screen rows the preview reads.
+pub fn control_rows() -> usize {
+    control::SCREEN_ROWS
+}
 
 pub use render::render;
 pub use state::App;

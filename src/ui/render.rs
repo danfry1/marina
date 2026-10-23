@@ -39,6 +39,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         };
         constraints.push(Constraint::Length(h));
     }
+    let preview_open = app.ctl.preview.is_some();
+    if preview_open {
+        // most of the screen: it's where you read what the agent said
+        let h = (frame.area().height * 45 / 100).max(10);
+        constraints.push(Constraint::Length(h));
+    }
     if log_open {
         constraints.push(Constraint::Length(app.log_height));
     }
@@ -50,6 +56,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let table_area = chunks[i];
     i += 1;
     let inspect_area = inspect_open.then(|| {
+        let a = chunks[i];
+        i += 1;
+        a
+    });
+    let preview_area = preview_open.then(|| {
         let a = chunks[i];
         i += 1;
         a
@@ -70,15 +81,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         (0, _) => String::new(),
         (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
-    let title = format!(
-        " marina · {} targets{agents} · sort:{}{} ",
-        app.snapshot.targets.len(),
-        app.sort.label(),
-        match app.group_by {
-            GroupBy::Project => "",
-            GroupBy::Session => " · by:session",
-        }
-    );
+    let title = if app.inbox_open() {
+        let now = unix_now();
+        let count = |r: u8| {
+            app.snapshot
+                .agents
+                .iter()
+                .filter(|a| super::control::inbox_rank(a, now) == r)
+                .count()
+        };
+        format!(
+            " marina · inbox · {} need you · {} done · {} working · {} sessions ",
+            count(0),
+            count(1),
+            count(2),
+            app.snapshot.agents.len()
+        )
+    } else {
+        format!(
+            " marina · {} targets{agents} · sort:{}{} ",
+            app.snapshot.targets.len(),
+            app.sort.label(),
+            match app.group_by {
+                GroupBy::Project => "",
+                GroupBy::Session => " · by:session",
+            }
+        )
+    };
     let block = Block::bordered().title(title);
 
     if app.display.is_empty() {
@@ -102,6 +131,29 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ])
         .block(block);
         frame.render_widget(hint, table_area);
+    } else if app.inbox_open() {
+        app.header_hits.clear();
+        let rows: Vec<Row> = app
+            .display
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Agent(pid) => app.snapshot.agents.iter().find(|a| a.pid == *pid),
+                _ => None,
+            })
+            .map(|a| super::agent_view::inbox_row(a, app))
+            .collect();
+        let table = Table::new(rows, super::agent_view::inbox_widths())
+            .header(super::agent_view::inbox_header())
+            .block(block)
+            .row_highlight_style(
+                Style::new()
+                    .fg(Color::Reset)
+                    .bg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED),
+            )
+            .highlight_symbol("▌ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        frame.render_stateful_widget(table, table_area, &mut app.table_state);
     } else {
         // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
         let cols = visible_columns(table_area.width);
@@ -152,6 +204,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let Some(area) = inspect_area {
         frame.render_widget(inspect_panel(app), area);
+    }
+
+    if let Some(area) = preview_area {
+        frame.render_widget(
+            super::agent_view::preview_panel(app, area.width, area.height),
+            area,
+        );
     }
 
     if let (Some(area), Some(l)) = (log_area, app.log.as_ref()) {
@@ -213,6 +272,19 @@ fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
 }
 
 fn footer_line(app: &App) -> Line<'static> {
+    if let Some((who, text)) = app.reply_draft() {
+        return Line::from(vec![
+            Span::styled(
+                format!("  reply to {who} › "),
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{text}▏"), Style::new().fg(Color::White)),
+            Span::styled(
+                "  Enter send · Esc discard",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]);
+    }
     if app.is_filtering() {
         Line::styled(
             format!("  /{}▏  (Enter: apply · Esc: clear)", app.filter),
@@ -230,9 +302,19 @@ fn footer_line(app: &App) -> Line<'static> {
             format!("  [filter: {}] · / edit · Esc clear · q quit", app.filter),
             Style::new().fg(Color::DarkGray),
         )
+    } else if app.inbox_open() {
+        Line::styled(
+            "  inbox · Enter jump · p preview · r reply · y/n answer · D diff · a back · ? help · q quit",
+            Style::new().fg(Color::DarkGray),
+        )
+    } else if app.selected_agent().is_some() {
+        Line::styled(
+            "  Enter jump · p preview · r reply · y/n answer · a inbox · i inspect · ? help · q quit",
+            Style::new().fg(Color::DarkGray),
+        )
     } else {
         Line::styled(
-            "  j/k move · / filter · s sort · v by session · i inspect · K kill · ? help · q quit",
+            "  j/k move · / filter · s sort · v by session · a inbox · i inspect · K kill · ? help · q quit",
             Style::new().fg(Color::DarkGray),
         )
     }
@@ -1019,6 +1101,10 @@ fn help_lines() -> Vec<Line<'static>> {
         row("g / G", "top / bottom"),
         row("Enter", "fold / unfold group · on an agent: jump to it"),
         row("D", "uncommitted diff of the agent / server's tree"),
+        row("a", "inbox: every agent session, what needs you first"),
+        row("p", "preview an agent: last reply · again: live screen"),
+        row("y · n", "approve / reject what the agent is asking"),
+        row("r", "reply to the agent (herdr / tmux panes)"),
         row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row(

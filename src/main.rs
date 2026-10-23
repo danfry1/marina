@@ -15,6 +15,7 @@ mod ports;
 mod resolve;
 mod sampler;
 mod sources;
+mod transcript;
 mod ui;
 mod verbs;
 
@@ -112,6 +113,20 @@ fn run(
                     if app.help_open() {
                         // Any key dismisses the help overlay.
                         app.close_help();
+                    } else if app.is_replying() {
+                        // The reply box captures keystrokes until Enter/Esc.
+                        match key.code {
+                            KeyCode::Esc => app.reply_cancel(),
+                            KeyCode::Enter => {
+                                let action = app.reply_commit();
+                                run_action(app, action, &ev_tx);
+                            }
+                            KeyCode::Backspace => app.reply_backspace(),
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.reply_push(c)
+                            }
+                            _ => {}
+                        }
                     } else if app.is_filtering() {
                         // Filter input mode captures keystrokes.
                         match key.code {
@@ -138,6 +153,13 @@ fn run(
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('i') => app.toggle_inspect(),
+                            KeyCode::Char('p') => app.toggle_preview(),
+                            KeyCode::Char('a') => app.toggle_inbox(),
+                            KeyCode::Char('r') => app.start_reply(),
+                            KeyCode::Char(c @ ('y' | 'n')) => {
+                                let action = app.answer(c == 'y');
+                                run_action(app, action, &ev_tx);
+                            }
                             KeyCode::Char('v') => app.toggle_group_by(),
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Char('K') => verb_kill(app, &ev_tx, &ctl),
@@ -187,7 +209,17 @@ fn run(
             match ev {
                 UiEvent::Status(s) => app.set_status(s),
                 UiEvent::LogReady { project, path } => on_log_ready(app, project, path),
+                UiEvent::Screen { pid, rows } => app.screen_ready(pid, rows),
             }
+        }
+
+        // The open preview's live screen, read off the UI thread.
+        if let Some((pid, host)) = app.screen_due() {
+            let ev = ev_tx.clone();
+            std::thread::spawn(move || {
+                let rows = hosts::read_screen(&host, ui::control_rows());
+                let _ = ev.send(UiEvent::Screen { pid, rows });
+            });
         }
 
         // New log lines; expire status / kill-undo window / row flashes.
@@ -318,6 +350,20 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
             }
         }
     }
+}
+
+/// Carry out a control action (approve / reject / reply) off the UI thread:
+/// herdr and tmux calls can take a moment.
+fn run_action(app: &mut ui::App, action: ui::Action, ev: &Sender<UiEvent>) {
+    let ui::Action::Send(host, what, waiting) = action else {
+        return;
+    };
+    app.set_status(format!("sending to the {}…", host.describe()));
+    let ev = ev.clone();
+    std::thread::spawn(move || {
+        let msg = hosts::send(&host, &what, waiting).unwrap_or_else(|e| e);
+        let _ = ev.send(UiEvent::Status(msg));
+    });
 }
 
 /// Single-quote for a POSIX shell.

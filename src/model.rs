@@ -93,6 +93,8 @@ pub struct Agent {
     /// The session's task title from the agent itself (opencode), when no
     /// host reports one.
     pub title: Option<String>,
+    /// What the session last said, from its transcript (Claude Code).
+    pub summary: Option<crate::transcript::Summary>,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -156,12 +158,38 @@ impl Agent {
         }
     }
 
-    /// The session's task title: the host's (herdr), else the agent's own.
+    /// How much it wants you, for the inbox: 0 waiting on you, 1 finished
+    /// (herdr's *done*), 2 working, 3 idle, 4 stale.
+    pub fn urgency(&self, now: u64) -> u8 {
+        if self.is_blocked() {
+            0
+        } else if self.host_status() == Some(HostStatus::Done) {
+            1
+        } else if self.is_working(now) {
+            2
+        } else if self.is_stale(now) {
+            4
+        } else {
+            3
+        }
+    }
+
+    /// Unix seconds it last did anything: terminal output, else its
+    /// transcript.
+    pub fn last_active(&self) -> u64 {
+        let tty = self.tty.map(|t| t.output).unwrap_or(0);
+        let said = self.summary.as_ref().and_then(|s| s.updated).unwrap_or(0);
+        tty.max(said)
+    }
+
+    /// The session's task title: the host's (herdr), else the agent's own,
+    /// else its transcript's.
     pub fn title(&self) -> Option<&str> {
         self.host
             .as_ref()
             .and_then(|h| h.title.as_deref())
             .or(self.title.as_deref())
+            .or(self.summary.as_ref().and_then(|s| s.title.as_deref()))
     }
 
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
@@ -193,7 +221,7 @@ impl Agent {
         self.tty.map(|t| t.input).unwrap_or(self.start_time)
     }
 
-    fn host_status(&self) -> Option<HostStatus> {
+    pub fn host_status(&self) -> Option<HostStatus> {
         self.host.as_ref().and_then(|h| h.status)
     }
 
@@ -269,6 +297,7 @@ impl Agent {
             host: None,
             git: None,
             title: None,
+            summary: None,
         }
     }
 }
