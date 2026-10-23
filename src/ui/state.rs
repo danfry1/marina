@@ -912,11 +912,6 @@ impl App {
 
     // --- layout -------------------------------------------------------------
 
-    /// Agents' background services among the targets (see `is_agent_service`).
-    pub(crate) fn agent_services(&self) -> impl Iterator<Item = &Target> {
-        self.snapshot.targets.iter().filter(|t| is_agent_service(t))
-    }
-
     /// Group targets by project, sort groups + members by the active mode, and
     /// flatten to visible entries (collapsing folded groups). Volatile sorts
     /// freeze for `FREEZE` after a keystroke.
@@ -926,7 +921,7 @@ impl App {
         let mut visible: Vec<usize> = (0..targets.len())
             .filter(|&i| self.matches(&targets[i]))
             .collect();
-        // Project view: agents' background services sit with the agents.
+        // Project view: agents' background services sit beside the agents.
         let services: Vec<usize> = match self.group_by {
             GroupBy::Project => visible
                 .iter()
@@ -1060,7 +1055,13 @@ impl App {
                 }
             }
         }
-        if !section.is_empty() || !services.is_empty() {
+        // always visible, right above the (folded) sessions they serve
+        entries.extend(
+            services
+                .iter()
+                .map(|&i| Entry::Target(targets[i].key.clone())),
+        );
+        if !section.is_empty() {
             entries.push(Entry::Agents);
             // a filter that hits an agent opens the section
             if self.agents_open || !self.filter.is_empty() {
@@ -1249,7 +1250,7 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
 }
 
 /// A target that is an agent's background service (`opencode serve`), which
-/// the project view lists in the agents section rather than as a project.
+/// the project view lists beside the agents section rather than as a project.
 pub(crate) fn is_agent_service(t: &Target) -> bool {
     crate::launcher::agent_service(&t.anchor_argv).is_some()
 }
@@ -1387,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_services_sit_in_the_agents_section() {
+    fn agent_servers_sit_beside_the_agents_section() {
         let mut snap = Snapshot::sample();
         snap.seq = 1;
         let mut svc = snap.targets[0].clone();
@@ -1403,19 +1404,13 @@ mod tests {
         let mut app = App::new();
         app.apply(Arc::new(snap));
         let e = app.compute_entries();
-        let svc = TargetKey::Port(49374);
-        assert!(
-            !e.contains(&Entry::Target(svc.clone())),
-            "not a project: {e:?}"
-        );
+        // shown even with the section folded, after the projects
         assert_eq!(
             e.last(),
-            Some(&Entry::Agents),
-            "a section even without sessions"
+            Some(&Entry::Target(TargetKey::Port(49374))),
+            "{e:?}"
         );
-        assert_eq!(app.agent_services().count(), 1);
-        app.agents_open = true;
-        assert_eq!(app.compute_entries().last(), Some(&Entry::Member(svc)));
+        assert!(!e.contains(&Entry::Agents), "no sessions, no section");
     }
 
     #[test]

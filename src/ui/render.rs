@@ -70,10 +70,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         (0, _) => String::new(),
         (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
-    // an agent's service is counted with the agents, not as a dev server
-    let targets = app.snapshot.targets.len() - app.agent_services().count();
     let title = format!(
-        " marina · {targets} targets{agents} · sort:{}{} ",
+        " marina · {} targets{agents} · sort:{}{} ",
+        app.snapshot.targets.len(),
         app.sort.label(),
         match app.group_by {
             GroupBy::Project => "",
@@ -269,11 +268,6 @@ fn detail_line(app: &App) -> Line<'static> {
         Some(Entry::Agents) => {
             let (working, stale, _, mem) = agents_summary(app);
             let n = app.snapshot.agents.len();
-            let services = match app.agent_services().count() {
-                0 => String::new(),
-                1 => " · 1 service".into(),
-                k => format!(" · {k} services"),
-            };
             let stale_mem: u64 = app
                 .snapshot
                 .agents
@@ -283,7 +277,7 @@ fn detail_line(app: &App) -> Line<'static> {
                 .sum();
             Line::styled(
                 format!(
-                    "  {n} agent sessions{services} · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
+                    "  {n} agent sessions · {working} working · {stale} idle and open >1d ({}) · {} total · Enter folds/unfolds · marina never stops agents",
                     fmt_mem(stale_mem),
                     fmt_mem(mem)
                 ),
@@ -581,11 +575,8 @@ fn agents_summary(app: &App) -> (usize, usize, f32, u64) {
     (
         agents.iter().filter(|a| a.is_working(now)).count(),
         agents.iter().filter(|a| a.is_stale(now)).count(),
-        // their background services count toward what agents cost
-        agents.iter().map(|a| a.cpu_pct).sum::<f32>()
-            + app.agent_services().map(|t| t.cpu_pct).sum::<f32>(),
-        agents.iter().map(|a| a.mem_bytes).sum::<u64>()
-            + app.agent_services().map(|t| t.mem_bytes).sum::<u64>(),
+        agents.iter().map(|a| a.cpu_pct).sum(),
+        agents.iter().map(|a| a.mem_bytes).sum(),
     )
 }
 
@@ -834,12 +825,10 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         Some(p) => format!(":{p}"),
         None => "—".into(),
     };
-    let service = indent
-        .then(|| crate::launcher::agent_service(&t.anchor_argv))
-        .flatten();
-    let project_text = if let Some(agent) = service {
-        // in the agents section: whose service it is
-        format!("  {agent}·service")
+    let service = crate::launcher::agent_service(&t.anchor_argv);
+    let project_text = if let Some(agent) = service.filter(|_| !indent) {
+        // beside the agents section: whose server it is
+        format!("{agent} server")
     } else if indent {
         "  ↳".to_string()
     } else {

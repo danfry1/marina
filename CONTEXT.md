@@ -105,7 +105,7 @@
   running a command now; its **helpers** are the long-lived ones (MCP servers).
   Listed in session view and by `marina agents`. Its plumbing that holds a
   port (`opencode serve`) is still a Target — an **agent service** — but the
-  project view lists it in the agents section.
+  project view shows it beside the agents section, not as a project.
 
 - **Host** — the multiplexer an agent session's terminal runs in, when marina
   can drive it (herdr, tmux). Jump target, and for herdr a source of the

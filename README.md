@@ -58,9 +58,9 @@ developer-process-centric.
   `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
   project view, and a row per session in the session view. Each shows what it
   is doing (`$ cargo test`, `working`, `idle 12m`), its cpu/mem (agent + MCP
-  helpers), dir, branch and session id; an agent's background service
-  (`opencode serve`) listening on a port sits in that section too, as
-  `opencode·service`, rather than among the dev servers; `i` lists its shells and helpers and
+  helpers), dir, branch and session id; an agent's background server
+  (`opencode serve`) is shown just above that section, always visible, as
+  `opencode server`, rather than as a project among the dev servers; `i` lists its shells and helpers and
   the resume command. Working vs idle comes from when its terminal was last
   written to, like `w`'s IDLE column. Sessions whose terminal has had no input
   for over a day are dimmed as *stale* — usually a forgotten session holding
