@@ -19,7 +19,7 @@ use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
 
 /// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
-const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
+const COLW: [u16; 8] = [22, 16, 7, 7, 9, 14, 6, 15];
 /// How far PROJECT and BRANCH grow into spare width.
 const PROJECT_MAX: u16 = 36;
 const BRANCH_MAX: u16 = 40;
@@ -327,16 +327,17 @@ fn detail_line(app: &App) -> Line<'static> {
                 if let Some(g) = &a.git {
                     spans.push(Span::styled(format!(" · {}", g.describe()), gray));
                 }
-                spans.push(Span::styled(
-                    format!(" · {}", l.describe()),
-                    launcher_style(&l),
-                ));
+                // before the long pid/dir/session part, so it's never cut off
                 spans.push(Span::styled(
                     match &a.host {
-                        Some(h) => format!(" · Enter jumps ({})", h.kind.as_str()),
+                        Some(h) => format!(" · Enter jumps ({})", h.short()),
                         None => " · Enter copies resume".into(),
                     },
                     Style::new().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    format!(" · {}", l.describe()),
+                    launcher_style(&l),
                 ));
                 Line::from(spans)
             }
@@ -681,13 +682,12 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
         Cell::from(format!("{:.1}%", a.cpu_pct)),
         Cell::from(fmt_mem(a.mem_bytes)),
-        Cell::from(Span::styled(
-            a.session
-                .as_deref()
-                .map(|s| crate::launcher::short_id(s, 8).to_string())
-                .unwrap_or_else(|| "—".into()),
-            Style::new().fg(Color::DarkGray),
-        )),
+        // where it lives, i.e. where Enter goes (the session id is in the
+        // detail line and `i`)
+        Cell::from(match &a.host {
+            Some(h) => Span::raw(h.short()),
+            None => Span::styled("—", Style::new().fg(Color::DarkGray)),
+        }),
         Cell::from(fmt_uptime(a.start_time)),
         branch_cell(a),
     ]);
@@ -993,11 +993,11 @@ fn launcher_style(l: &Launcher) -> Style {
 /// Columns that fit: each needs its width + 1 spacing, plus borders and the
 /// highlight gutter (4).
 fn visible_columns(width: u16) -> usize {
-    if width >= 105 {
+    if width >= 107 {
         8
-    } else if width >= 89 {
+    } else if width >= 91 {
         7
-    } else if width >= 82 {
+    } else if width >= 84 {
         6
     } else {
         5
@@ -1135,13 +1135,13 @@ mod tests {
 
     #[test]
     fn spare_width_goes_to_project_then_branch() {
-        assert_eq!(column_widths(105, 8), COLW.to_vec(), "no spare room");
+        assert_eq!(column_widths(107, 8), COLW.to_vec(), "no spare room");
         let w = column_widths(140, 8);
-        assert_eq!((w[0], w[7]), (36, 36));
+        assert_eq!((w[0], w[7]), (36, 34));
         let w = column_widths(300, 8);
         assert_eq!((w[0], w[7]), (PROJECT_MAX, BRANCH_MAX));
-        assert_eq!(column_widths(89, 7)[0], 22);
-        assert_eq!(column_widths(95, 7)[0], 28, "narrow panes grow PROJECT too");
+        assert_eq!(column_widths(91, 7)[0], 22);
+        assert_eq!(column_widths(97, 7)[0], 28, "narrow panes grow PROJECT too");
     }
 
     #[test]
@@ -1230,7 +1230,10 @@ mod tests {
         let out = render_to_string(&mut app, 120, 20);
         assert!(out.contains("claude·marina"), "idle agent row is labelled");
         assert!(out.contains("$ cargo test"), "COMMAND says what it's doing");
-        assert!(out.contains("41616c1a"), "session id in the VIA column");
+        assert!(
+            !out.contains("41616c1a"),
+            "VIA says where it lives, not the id"
+        );
 
         app.selected = Some(Entry::Agent(4242));
         app.toggle_inspect();
@@ -1261,6 +1264,7 @@ mod tests {
             title: Some("Agent visibility".into()),
             session: None,
             app_pid: None,
+            outer: Some(HostKind::Ghostty),
         });
         a.git = Some(GitStatus {
             changed: 3,
@@ -1292,11 +1296,12 @@ mod tests {
             "task title in the detail line"
         );
         assert!(out.contains("3 files +40 −2 · 1 untracked · 2 unpushed"));
-        assert!(out.contains("Enter jumps (herdr)"));
+        assert!(out.contains("Enter jumps (herdr·ghostty)"), "{out}");
+        assert!(out.contains("herdr·ghostty"), "where it lives, in VIA");
 
         app.toggle_inspect();
         let out = render_to_string(&mut app, 160, 30);
-        assert!(out.contains("herdr pane w2S:p1 · Enter jumps there"));
+        assert!(out.contains("herdr pane w2S:p1 in Ghostty · Enter jumps there"));
         assert!(out.contains("D shows the diff"));
     }
 

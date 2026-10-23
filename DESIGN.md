@@ -546,6 +546,13 @@ AppleScript as `on run argv` arguments, never spliced into the script.
 Adding a host (kitty, …) is a lookup arm keyed by pid, tty or directory plus
 a jump arm.
 
+A multiplexer host also records its *outer* terminal — the app its client
+runs in, up the session's own ancestry (herdr's server runs under its
+client) or else from a client process (a detached tmux server has none
+above it) — shown as `herdr·ghostty` in an agent row's VIA column, and
+raised by pid after the pane switch so the jump lands even from another
+window.
+
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
 the peak and memory drift. Helpers several sessions each run a copy of

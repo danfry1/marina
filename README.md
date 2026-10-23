@@ -68,7 +68,10 @@ developer-process-centric.
   sessions are included; daemons and pty hosts are not. marina never stops an
   agent: `K` on an agent row explains why, and `K` on its header stops only
   its servers.
-- **Jump to a session** — `Enter` on an agent row focuses where it runs:
+- **Jump to a session** — an agent row's `VIA` says where it lives
+  (`herdr·ghostty`, `tmux·iterm`, `ghostty`, `—` for no terminal), and
+  `Enter` focuses it there — switching the multiplexer's pane and raising
+  the terminal app showing it:
   a herdr or tmux pane, or the iTerm2 session / Terminal tab / WezTerm pane on
   its tty, or a Ghostty terminal in its directory (macOS asks once to let your
   terminal control that app). Anywhere else it copies

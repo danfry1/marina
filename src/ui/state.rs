@@ -1548,6 +1548,7 @@ mod tests {
                 title: None,
                 session: None,
                 app_pid: None,
+                outer: None,
             });
             snap.agents = vec![a];
             Arc::new(snap)

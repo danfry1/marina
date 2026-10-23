@@ -1114,6 +1114,8 @@ struct AgentJson {
 struct HostJson {
     kind: &'static str,
     target: String,
+    /// For herdr/tmux, the terminal app its client runs in.
+    outer: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1191,6 +1193,7 @@ impl AgentJson {
             host: a.host.as_ref().map(|h| HostJson {
                 kind: h.kind.as_str(),
                 target: h.target.clone(),
+                outer: h.outer.map(|o| o.as_str()),
             }),
             git: a.git.map(|g| GitJson {
                 changed: g.changed,

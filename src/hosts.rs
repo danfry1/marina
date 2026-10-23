@@ -50,6 +50,18 @@ impl HostKind {
         }
     }
 
+    /// Proper name, for sentences.
+    pub fn name(self) -> &'static str {
+        match self {
+            HostKind::Herdr => "herdr",
+            HostKind::Tmux => "tmux",
+            HostKind::ITerm => "iTerm2",
+            HostKind::Terminal => "Terminal",
+            HostKind::Ghostty => "Ghostty",
+            HostKind::WezTerm => "WezTerm",
+        }
+    }
+
     /// The terminal app that owns a process, from one ancestor's argv0.
     fn terminal_app(argv0: &str) -> Option<HostKind> {
         let base = argv0.rsplit('/').next().unwrap_or(argv0);
@@ -92,14 +104,33 @@ pub struct HostInfo {
     /// older helpers keep from before a `/clear`.
     pub session: Option<String>,
     /// The terminal app's own process, when it is a GUI app marina can bring
-    /// forward even if scripting can't pick the terminal (Ghostty runs one
-    /// process per instance and AppleScript reaches only one of them).
+    /// forward: the one a multiplexer's client runs in (raised after the
+    /// multiplexer switches panes), or the terminal itself.
     pub app_pid: Option<u32>,
+    /// For a multiplexer, the terminal app its client runs in (herdr in
+    /// Ghostty).
+    pub outer: Option<HostKind>,
 }
 
 impl HostInfo {
-    /// `herdr pane w2S:p1`, `iTerm2 session on /dev/ttys004`, …
+    /// Where, in a column: `herdr·ghostty`, `ghostty`, `tmux·iterm`.
+    pub fn short(&self) -> String {
+        match self.outer {
+            Some(o) => format!("{}·{}", self.kind.as_str(), o.as_str()),
+            None => self.kind.as_str().to_string(),
+        }
+    }
+
+    /// `herdr pane w2S:p1 in Ghostty`, `iTerm2 session on /dev/ttys004`, …
     pub fn describe(&self) -> String {
+        let place = self.place();
+        match self.outer {
+            Some(o) => format!("{place} in {}", o.name()),
+            None => place,
+        }
+    }
+
+    fn place(&self) -> String {
         let t = &self.target;
         match self.kind {
             HostKind::Herdr => format!("herdr pane {t}"),
@@ -172,6 +203,7 @@ fn parse_herdr_list(json: &str) -> Vec<HostInfo> {
                 .and_then(|s| s.value)
                 .filter(|v| crate::launcher::is_session_id(v)),
             app_pid: None,
+            outer: None,
         })
         .collect()
 }
@@ -276,11 +308,18 @@ impl Hosts {
             .find(|(_, &p)| p == pid)
             .and_then(|(pane, _)| self.herdr.iter().find(|h| &h.target == pane));
         if let Some(h) = by_pid {
-            return Some(h.clone());
+            let mut h = h.clone();
+            (h.outer, h.app_pid) = outer_of(procs, pid, "herdr").unzip();
+            return Some(h);
         }
         let tty = tty?;
+        let mut outer = None;
         let (kind, target, app_pid) = match self.tmux.get(tty) {
-            Some(pane) => (HostKind::Tmux, pane.clone(), None),
+            Some(pane) => {
+                let o = outer_of(procs, pid, "tmux");
+                outer = o.map(|o| o.0);
+                (HostKind::Tmux, pane.clone(), o.map(|o| o.1))
+            }
             None => match terminal_of(procs, pid)? {
                 (HostKind::Ghostty, app) => {
                     (HostKind::Ghostty, cwd.display().to_string(), Some(app))
@@ -297,8 +336,26 @@ impl Hosts {
             title: None,
             session: None,
             app_pid,
+            outer,
         })
     }
+}
+
+/// The terminal app a multiplexer session `pid` is shown in: up its own
+/// ancestry (herdr's server runs under the client that started it), else
+/// wherever a `client` process (`herdr`, `tmux`) runs — a detached server
+/// has no terminal above it. With several clients, the first found.
+fn outer_of(procs: &HashMap<u32, ProcInfo>, pid: u32, client: &str) -> Option<(HostKind, u32)> {
+    terminal_of(procs, pid).or_else(|| {
+        procs
+            .values()
+            .filter(|p| {
+                p.argv
+                    .first()
+                    .is_some_and(|a| a.rsplit('/').next() == Some(client))
+            })
+            .find_map(|p| terminal_of(procs, p.pid))
+    })
 }
 
 /// The terminal app `pid` runs in, and that app's pid: the first ancestor
@@ -335,6 +392,15 @@ fn osascript(script: &str, args: &[&str]) -> Option<String> {
     cmd.arg("-e").arg(script).args(args);
     // a first jump may wait on the automation permission prompt
     crate::exec::output(cmd, Duration::from_secs(20)).map(|s| s.trim().to_string())
+}
+
+/// After a multiplexer switched panes, bring the terminal app showing it
+/// forward too, in case marina is in another window.
+fn raise(host: &HostInfo, msg: String) -> String {
+    match (host.outer, host.app_pid) {
+        (Some(o), Some(pid)) if activate_pid(pid) => format!("{msg} · raised {}", o.name()),
+        _ => msg,
+    }
 }
 
 /// Bring the GUI app with process id `pid` to the front.
@@ -428,7 +494,7 @@ fn wezterm_pane(json: &str, tty: &str) -> Option<u64> {
 pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
     match host.kind {
         HostKind::Herdr => run("herdr", &["agent", "focus", &host.target])
-            .map(|_| format!("focused herdr pane {}", host.target))
+            .map(|_| raise(host, format!("focused herdr pane {}", host.target)))
             .ok_or_else(|| format!("herdr couldn't focus {}", host.target)),
         HostKind::Tmux => {
             // Inside tmux, switch this client; outside, make it the active
@@ -444,7 +510,10 @@ pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
                 run("tmux", &["select-window", "-t", window]).is_some()
             } && run("tmux", &["select-pane", "-t", &host.target]).is_some();
             if ok {
-                Ok(format!("switched to tmux pane {}", host.target))
+                Ok(raise(
+                    host,
+                    format!("switched to tmux pane {}", host.target),
+                ))
             } else {
                 Err(format!("tmux couldn't select {}", host.target))
             }
@@ -620,6 +689,20 @@ mod tests {
             None,
             "no known terminal"
         );
+        // a multiplexer's outer terminal: up the session's own ancestry, else
+        // where a client of it runs (a detached server has no terminal above)
+        let mut more = procs.clone();
+        for q in [
+            p(40, 1, "/opt/homebrew/bin/tmux"), // the server
+            p(41, 40, "-zsh"),
+            p(42, 41, "claude"),
+            p(43, 12, "/opt/homebrew/bin/tmux"), // a client, in Ghostty
+        ] {
+            more.insert(q.pid, q);
+        }
+        assert_eq!(outer_of(&more, 42, "tmux"), Some((HostKind::Ghostty, 10)));
+        assert_eq!(outer_of(&more, 13, "herdr"), Some((HostKind::Ghostty, 10)));
+        assert_eq!(outer_of(&procs, 31, "tmux"), None);
         assert_eq!(
             h.lookup(&procs, 22, None, dir),
             None,
