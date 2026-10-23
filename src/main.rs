@@ -65,6 +65,7 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
+    ui::load_seen(&mut app);
     let notify = config::load().notify;
     app.notify_agents = notify.agents;
     let desktop_notify = notify.desktop;
@@ -331,6 +332,10 @@ fn on_agent_row(app: &mut ui::App, verb: &str) -> bool {
 /// (herdr, tmux). With no drivable host, copy a command that gets back into
 /// the session instead.
 fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
+    let Some(pid) = app.selected_agent().map(|a| a.pid) else {
+        return;
+    };
+    app.mark_read(pid);
     let Some(a) = app.selected_agent() else {
         return;
     };

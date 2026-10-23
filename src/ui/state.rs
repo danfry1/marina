@@ -229,6 +229,7 @@ impl App {
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
         self.record_history();
+        self.update_seen();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -305,7 +306,13 @@ impl App {
                 .unwrap_or_else(|| a.name.clone());
             if a.is_blocked() {
                 if self.agent_blocked.insert(a.pid) {
-                    out.push(format!("{label} needs you"));
+                    // say what it wants, so the notification is actionable
+                    match a.summary.as_ref().and_then(|s| s.pending_tool.as_deref()) {
+                        Some(t) => {
+                            out.push(format!("{label} needs you: wants to run {}", clip(t, 90)))
+                        }
+                        None => out.push(format!("{label} needs you")),
+                    }
                 }
                 self.agent_streaks.remove(&a.pid); // the question says it all
                 continue;
@@ -320,8 +327,16 @@ impl App {
                 if now.saturating_sub(last) >= AGENT_QUIET {
                     self.agent_streaks.remove(&a.pid);
                     if last.saturating_sub(start) >= AGENT_WORK_MIN {
+                        let said = a
+                            .summary
+                            .as_ref()
+                            .and_then(|s| s.last_reply.as_deref())
+                            .map(|r| {
+                                format!(": {}", clip(&super::agent_view::first_sentence(r), 110))
+                            })
+                            .unwrap_or_default();
                         out.push(format!(
-                            "{label} finished after {}",
+                            "{label} finished after {}{said}",
                             super::format::fmt_age(last - start)
                         ));
                     }
@@ -1295,6 +1310,15 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
+    }
+}
+
+/// `s` cut to `n` chars with `…`.
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
 }
 

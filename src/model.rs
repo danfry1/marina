@@ -95,6 +95,11 @@ pub struct Agent {
     pub title: Option<String>,
     /// What the session last said, from its transcript (Claude Code).
     pub summary: Option<crate::transcript::Summary>,
+    /// Inferred, for sessions no host reports on: its transcript ends in a
+    /// tool call with no result, yet nothing runs — no shell, a still
+    /// screen. A running tool has a child or a spinner; this is an approval
+    /// prompt or a question to the human.
+    pub waiting: bool,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -174,12 +179,17 @@ impl Agent {
         }
     }
 
-    /// Unix seconds it last did anything: terminal output, else its
-    /// transcript.
+    /// Unix seconds it last did anything: when its transcript last
+    /// recorded something, else its terminal's last output. (Terminal
+    /// output alone misleads: a multiplexer redrawing every pane touches
+    /// them all at once.) While working, now-ish either way.
     pub fn last_active(&self) -> u64 {
         let tty = self.tty.map(|t| t.output).unwrap_or(0);
-        let said = self.summary.as_ref().and_then(|s| s.updated).unwrap_or(0);
-        tty.max(said)
+        match self.summary.as_ref().and_then(|s| s.updated) {
+            Some(said) if self.shells().next().is_none() => said,
+            Some(said) => said.max(tty),
+            None => tty,
+        }
     }
 
     /// The session's task title: the host's (herdr), else the agent's own,
@@ -227,7 +237,23 @@ impl Agent {
 
     /// Waiting on a human: an approval prompt or a question (host-reported).
     pub fn is_blocked(&self) -> bool {
-        self.host_status() == Some(HostStatus::Blocked)
+        match self.host_status() {
+            Some(st) => st == HostStatus::Blocked,
+            None => self.waiting,
+        }
+    }
+
+    /// Set `waiting` (see there) as of `now`.
+    pub fn infer_waiting(&mut self, now: u64) {
+        let pending = self
+            .summary
+            .as_ref()
+            .is_some_and(|s| s.pending_tool.is_some());
+        let still = self
+            .tty
+            .is_some_and(|t| now.saturating_sub(t.output) > WORKING_OUTPUT_SECS);
+        self.waiting =
+            self.host_status().is_none() && pending && self.shells().next().is_none() && still;
     }
 
     /// Not working, and its terminal has had no input for over a day —
@@ -298,6 +324,7 @@ impl Agent {
             git: None,
             title: None,
             summary: None,
+            waiting: false,
         }
     }
 }
@@ -456,6 +483,32 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pending_tool_with_nothing_running_is_waiting() {
+        use crate::sources::TtyActivity;
+        let mut a = Agent::sample(1, "aaaa", "x");
+        a.children.retain(|c| !c.shell); // no shell running
+        a.summary = Some(crate::transcript::Summary {
+            pending_tool: Some("Bash: cargo publish".into()),
+            ..Default::default()
+        });
+        a.tty = Some(TtyActivity {
+            output: 100,
+            input: 100,
+        });
+        a.infer_waiting(103);
+        assert!(!a.waiting, "the screen moved 3s ago: still running");
+        a.infer_waiting(120);
+        assert!(a.waiting && a.is_blocked() && a.urgency(120) == 0);
+        a.summary.as_mut().unwrap().pending_tool = None;
+        a.infer_waiting(120);
+        assert!(!a.waiting, "nothing pending");
+        a.summary.as_mut().unwrap().pending_tool = Some("Bash: sleep 60".into());
+        a.children = Agent::sample(1, "aaaa", "x").children; // its shell runs
+        a.infer_waiting(120);
+        assert!(!a.waiting, "a running command isn't a question");
+    }
+
     #[test]
     fn repeated_helpers_total_copies_across_sessions() {
         let mut a = Agent::sample(1, "aaaa", "x");

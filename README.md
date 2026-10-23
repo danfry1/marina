@@ -84,14 +84,23 @@ developer-process-centric.
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
 - **Inbox** (`a`) — a mail-client view of every agent session. On the left,
-  cards grouped by what wants you (*needs you, finished, working, recent,
+  cards grouped by what wants you (*needs you, new, working, recent,
   earlier, stale*): a status dot, the project, its task, how long ago it
-  last did anything, and one line on what it's doing or last said. On the
-  right, the selected session: repo, branch and uncommitted changes, what
-  it's running, its PR, then *you asked*, Claude's *status* recap and its
+  last said anything, and one line on what it's doing or last said.
+  Sessions that said something since you last looked are *new* (bold, like
+  unread mail) until you view them in the inbox or preview, or jump to them;
+  what you've read is kept in `~/.local/state/marina/seen.json`. On the
+  right, the selected session: how full its context window is, repo,
+  branch and uncommitted changes, what it's running, its PR, then *you asked*, Claude's *status* recap and its
   full reply (`[` `]` or the wheel to scroll). `p` flips that pane to the
   session's live screen (herdr and tmux panes).
 - **Preview** (`p`) — the same session detail under the project view.
+- **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
+  a session counts as waiting when its transcript ends in a tool call that
+  hasn't run, yet nothing is running (no shell, a still screen): an
+  approval prompt or a question. Notices say what it wants:
+  `claude·api needs you: wants to run Bash: cargo publish`, and finished
+  ones what it said.
 - **Answer from marina** — on a herdr or tmux session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
   dialog first). Only on your keystroke, only to the selected session, and

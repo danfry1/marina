@@ -21,11 +21,12 @@ use crate::model::Agent;
 const KEY: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
-/// The inbox's groups, by `Agent::urgency` and how recently it was active.
-fn group_of(a: &Agent, now: u64) -> &'static str {
-    match a.urgency(now) {
+/// The inbox's groups, by urgency (unread replies count as new) and how
+/// recently it was active.
+fn group_of(app: &App, a: &Agent, now: u64) -> &'static str {
+    match app.inbox_urgency(a, now) {
         0 => "NEEDS YOU",
-        1 => "FINISHED",
+        1 => "NEW",
         2 => "WORKING",
         4 => "STALE",
         _ if now.saturating_sub(a.last_active()) < 3600 => "RECENT",
@@ -33,11 +34,11 @@ fn group_of(a: &Agent, now: u64) -> &'static str {
     }
 }
 
-/// `●` coloured by state.
-fn dot(a: &Agent, now: u64) -> Span<'static> {
-    let (c, color) = match a.urgency(now) {
+/// `●` coloured by state: red needs you, cyan new, yellow working.
+fn dot(app: &App, a: &Agent, now: u64) -> Span<'static> {
+    let (c, color) = match app.inbox_urgency(a, now) {
         0 => ("●", Color::Red),
-        1 => ("●", Color::Green),
+        1 => ("●", Color::Cyan),
         2 => ("◐", Color::Yellow),
         4 => ("·", Color::DarkGray),
         _ => ("○", Color::Gray),
@@ -83,7 +84,7 @@ fn gist(app: &App, a: &Agent, now: u64) -> String {
         .unwrap_or_default()
 }
 
-fn first_sentence(s: &str) -> String {
+pub(crate) fn first_sentence(s: &str) -> String {
     let line = first_line(s);
     match line.find(". ") {
         Some(i) if i > 20 => line[..=i].to_string(),
@@ -127,7 +128,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let Some(a) = app.snapshot.agents.iter().find(|a| a.pid == pid) else {
             continue;
         };
-        let g = group_of(a, now);
+        let g = group_of(app, a, now);
         if g != group {
             if !group.is_empty() {
                 rows.push((Line::raw(""), None));
@@ -138,7 +139,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .filter(|x| {
                     app.display.contains(&super::state::Entry::Agent(x.pid))
-                        && group_of(x, now) == g
+                        && group_of(app, x, now) == g
                 })
                 .count();
             let style = if g == "NEEDS YOU" {
@@ -162,14 +163,20 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let pad = inner_w.saturating_sub(fixed + title.chars().count());
         let bar = if sel { "▌" } else { " " };
         let label_style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+        // unread: the title stands out, like an unread email's subject
+        let title_style = if app.is_unread(a, now) {
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
         let l1 = Line::from(vec![
             Span::styled(bar, Style::new().fg(Color::Magenta)),
             Span::raw(" "),
-            dot(a, now),
+            dot(app, a, now),
             Span::raw(" "),
             Span::styled(label, label_style),
             Span::raw("  "),
-            Span::styled(title, Style::new().fg(Color::White)),
+            Span::styled(title, title_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(ago, DIM),
             Span::raw(" "),
@@ -226,12 +233,13 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             app.snapshot
                 .agents
                 .iter()
-                .filter(|a| a.urgency(now) == r)
+                .filter(|a| app.inbox_urgency(a, now) == r)
                 .count()
         };
         format!(
-            " inbox · {} need you · {} working · {} sessions ",
+            " inbox · {} need you · {} new · {} working · {} sessions ",
             count(0),
+            count(1),
             count(2),
             app.snapshot.agents.len()
         )
@@ -318,9 +326,15 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         .as_ref()
         .map(|h| h.short())
         .unwrap_or_else(|| "no terminal".into());
+    let context = a
+        .summary
+        .as_ref()
+        .and_then(|s| s.context_tokens)
+        .map(|n| format!(" · {}k context", n / 1000))
+        .unwrap_or_default();
     out.push(Line::from(vec![
         Span::raw(" "),
-        dot(a, now),
+        dot(app, a, now),
         Span::raw(" "),
         Span::styled(
             label,
@@ -328,7 +342,7 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         ),
         Span::styled(" · ", DIM),
         state,
-        Span::styled(format!(" · {place}"), DIM),
+        Span::styled(format!(" · {place}{context}"), DIM),
     ]));
     if let Some(t) = a.title() {
         out.push(Line::styled(

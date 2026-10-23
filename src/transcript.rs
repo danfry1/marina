@@ -43,6 +43,10 @@ pub struct Summary {
     pub pr_url: Option<String>,
     /// Unix seconds of the newest record with a timestamp.
     pub updated: Option<u64>,
+    /// Tokens in its context window as of the newest assistant message
+    /// (input + cache read + cache write), and that message's model.
+    pub context_tokens: Option<u64>,
+    pub model: Option<String>,
 }
 
 /// The transcript tail, newest record first. Lines are filtered by their
@@ -83,6 +87,21 @@ pub fn parse_tail(text: &str) -> Summary {
             }
             Some("user") => seen_message = true,
             Some("assistant") => {
+                if s.context_tokens.is_none() {
+                    let u = &v["message"]["usage"];
+                    let n = [
+                        "input_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    ]
+                    .iter()
+                    .filter_map(|k| u[*k].as_u64())
+                    .sum::<u64>();
+                    if n > 0 {
+                        s.context_tokens = Some(n);
+                        s.model = text_of(&v["message"]["model"]);
+                    }
+                }
                 let content = v["message"]["content"].as_array();
                 let blocks = content.map(Vec::as_slice).unwrap_or_default();
                 if !seen_message {
@@ -107,7 +126,10 @@ pub fn parse_tail(text: &str) -> Summary {
             }
             _ => {}
         }
-        let done = s.title.is_some() && s.last_prompt.is_some() && s.last_reply.is_some();
+        let done = s.title.is_some()
+            && s.last_prompt.is_some()
+            && s.last_reply.is_some()
+            && s.context_tokens.is_some();
         if done && seen_message {
             break;
         }
@@ -202,6 +224,8 @@ fn summarize(path: &Path) -> Option<Summary> {
         pending_tool: s.pending_tool,
         pr_url: s.pr_url.or(wide.pr_url),
         updated: s.updated.or(wide.updated),
+        context_tokens: s.context_tokens.or(wide.context_tokens),
+        model: s.model.or(wide.model),
     })
 }
 
@@ -292,7 +316,9 @@ mod tests {
             line(serde_json::json!({"type":"assistant","isSidechain":true,
                 "message":{"content":[{"type":"text","text":"subagent chatter"}]}})),
             line(serde_json::json!({"parentUuid":"y","isSidechain":false,"type":"assistant",
-                "message":{"role":"assistant","content":[{"type":"text","text":"I stopped the run.\n\nTell me which."}]},
+                "message":{"role":"assistant","model":"claude-opus-5-5",
+                    "usage":{"input_tokens":2,"cache_read_input_tokens":169000,"cache_creation_input_tokens":1300,"output_tokens":90},
+                    "content":[{"type":"text","text":"I stopped the run.\n\nTell me which."}]},
                 "timestamp":"2026-10-20T21:48:59.114Z"})),
             line(serde_json::json!({"type":"api-request-blob","message":{"role":"assistant","content":[{"type":"text","text":"not this"}]}})),
             line(serde_json::json!({"type":"system","subtype":"away_summary","isSidechain":false,
@@ -316,6 +342,8 @@ mod tests {
         assert_eq!(s.pending_tool, None, "the last message is text");
         assert_eq!(s.pr_url.as_deref(), Some("https://github.com/o/r/pull/33"));
         assert_eq!(s.updated, Some(1792533121), "the newest timestamp");
+        assert_eq!(s.context_tokens, Some(170_302));
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
     }
 
     #[test]

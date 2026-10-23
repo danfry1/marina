@@ -5,6 +5,8 @@
 //! session's row, and only through a multiplexer that can address the pane
 //! (herdr, tmux) — never by synthesising keystrokes into a GUI terminal.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -51,6 +53,65 @@ pub(crate) struct Control {
     pub detail_rect: Rect,
     pub detail_scroll: usize,
     pub detail_pid: Option<u32>,
+    /// What you've read: session id -> transcript time last seen.
+    pub seen: Seen,
+}
+
+/// The newest transcript time you've seen per session, so a session that
+/// said something since reads as unread. Kept in marina's state dir across
+/// runs; with no file yet, everything current counts as read.
+#[derive(Default)]
+pub(crate) struct Seen {
+    path: Option<PathBuf>,
+    map: HashMap<String, u64>,
+    /// No file existed: mark what's there now as read on first sight.
+    seed: bool,
+    dirty: bool,
+}
+
+impl Seen {
+    pub fn load(path: PathBuf) -> Seen {
+        let text = std::fs::read_to_string(&path).ok();
+        let map = text
+            .as_deref()
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or_default();
+        Seen {
+            seed: text.is_none(),
+            path: Some(path),
+            map,
+            dirty: false,
+        }
+    }
+
+    fn mark(&mut self, id: &str, at: u64) {
+        let e = self.map.entry(id.to_string()).or_insert(0);
+        if at > *e {
+            *e = at;
+            self.dirty = true;
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<u64> {
+        self.map.get(id).copied()
+    }
+
+    /// Write if changed, keeping only `live` sessions.
+    fn save(&mut self, live: &[&str]) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        self.map.retain(|k, _| live.contains(&k.as_str()));
+        if let Some(p) = &self.path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_string(&self.map) {
+                let _ = std::fs::write(p, json);
+            }
+        }
+    }
 }
 
 /// What the main loop should do after a control key.
@@ -164,6 +225,73 @@ impl App {
     /// Mouse: the inbox card at screen row `y`, if any.
     pub(crate) fn card_at(&self, y: u16) -> Option<u32> {
         self.ctl.hits.iter().find(|(r, _)| *r == y).map(|(_, p)| *p)
+    }
+
+    // --- unread -----------------------------------------------------------------
+
+    /// Has `a` said something since you last looked? (Not while it's still
+    /// working: the reply isn't finished.)
+    pub(crate) fn is_unread(&self, a: &Agent, now: u64) -> bool {
+        let (Some(id), Some(at)) = (
+            a.session.as_deref(),
+            a.summary.as_ref().and_then(|s| s.updated),
+        ) else {
+            return false;
+        };
+        !a.is_working(now) && self.ctl.seen.get(id).is_none_or(|seen| at > seen)
+    }
+
+    /// Inbox order with unread replies counted as finished.
+    pub(crate) fn inbox_urgency(&self, a: &Agent, now: u64) -> u8 {
+        match a.urgency(now) {
+            3 | 4 if self.is_unread(a, now) => 1,
+            u => u,
+        }
+    }
+
+    /// After each snapshot: what you're looking at now is read (the
+    /// selected session in the inbox or preview); seed on a first run;
+    /// persist changes.
+    pub(crate) fn update_seen(&mut self) {
+        let mut marks: Vec<(String, u64)> = Vec::new();
+        let seed = std::mem::take(&mut self.ctl.seen.seed);
+        let viewing = (self.ctl.inbox || self.ctl.preview.is_some())
+            .then(|| self.selected_agent().map(|a| a.pid))
+            .flatten();
+        for a in &self.snapshot.agents {
+            let (Some(id), Some(at)) = (
+                a.session.as_deref(),
+                a.summary.as_ref().and_then(|s| s.updated),
+            ) else {
+                continue;
+            };
+            if seed || viewing == Some(a.pid) {
+                marks.push((id.to_string(), at));
+            }
+        }
+        for (id, at) in marks {
+            self.ctl.seen.mark(&id, at);
+        }
+        let live: Vec<&str> = self
+            .snapshot
+            .agents
+            .iter()
+            .filter_map(|a| a.session.as_deref())
+            .collect();
+        self.ctl.seen.save(&live);
+    }
+
+    /// Jumping to a session reads it too.
+    pub fn mark_read(&mut self, pid: u32) {
+        let hit = self
+            .snapshot
+            .agents
+            .iter()
+            .find(|a| a.pid == pid)
+            .and_then(|a| Some((a.session.clone()?, a.summary.as_ref()?.updated?)));
+        if let Some((id, at)) = hit {
+            self.ctl.seen.mark(&id, at);
+        }
     }
 
     // --- approve / reject / reply ------------------------------------------
@@ -294,7 +422,12 @@ impl App {
             .iter()
             .filter(|a| self.matches_agent(a))
             .collect();
-        agents.sort_by_key(|a| (a.urgency(now), std::cmp::Reverse(a.last_active())));
+        agents.sort_by_key(|a| {
+            (
+                self.inbox_urgency(a, now),
+                std::cmp::Reverse(a.last_active()),
+            )
+        });
         agents.into_iter().map(|a| Entry::Agent(a.pid)).collect()
     }
 }
@@ -307,5 +440,72 @@ fn cant_type(a: &Agent) -> String {
             h.describe()
         ),
         None => format!("{} has no terminal marina can reach", a.name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::model::Snapshot;
+
+    fn snap(seq: u64, updated: u64) -> Arc<Snapshot> {
+        let mut s = Snapshot::sample();
+        s.seq = seq;
+        let mut a = Agent::sample(7, "aaaa1111", "api");
+        a.children.retain(|c| !c.shell); // idle
+        a.summary = Some(crate::transcript::Summary {
+            updated: Some(updated),
+            last_reply: Some("Done. Want me to push?".into()),
+            ..Default::default()
+        });
+        s.agents = vec![a];
+        Arc::new(s)
+    }
+
+    #[test]
+    fn a_new_reply_is_unread_until_you_look() {
+        let mut app = App::new();
+        app.apply(snap(1, 100));
+        let now = 10_000;
+        let a = app.snapshot.agents[0].clone();
+        assert!(app.is_unread(&a, now), "never seen");
+        assert_eq!(app.inbox_urgency(&a, now), 1, "sorts with new");
+
+        // selecting it in the project view doesn't count as reading it
+        app.selected = Some(Entry::Agent(7));
+        app.apply(snap(2, 100));
+        assert!(app.is_unread(&a, now));
+
+        // the inbox shows its detail: read
+        app.toggle_inbox();
+        app.selected = Some(Entry::Agent(7));
+        app.apply(snap(3, 100));
+        assert!(!app.is_unread(&a, now));
+
+        // it says something new while you're elsewhere
+        app.toggle_inbox();
+        app.selected = None;
+        app.apply(snap(4, 200));
+        let a = app.snapshot.agents[0].clone();
+        assert!(app.is_unread(&a, now));
+        app.mark_read(7);
+        assert!(!app.is_unread(&a, now), "jumping to it reads it");
+    }
+
+    #[test]
+    fn a_first_run_starts_with_everything_read() {
+        let dir = std::env::temp_dir().join(format!("marina-seen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new();
+        app.ctl.seen = Seen::load(dir.join("seen.json"));
+        app.apply(snap(1, 100));
+        let a = app.snapshot.agents[0].clone();
+        assert!(!app.is_unread(&a, 10_000), "seeded from what's there");
+        assert!(dir.join("seen.json").is_file(), "persisted");
+        let again = Seen::load(dir.join("seen.json"));
+        assert_eq!(again.get("aaaa1111"), Some(100));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

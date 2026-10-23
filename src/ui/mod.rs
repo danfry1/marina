@@ -14,6 +14,13 @@ mod state;
 
 pub use control::Action;
 
+/// Load which agent replies have been read (`<state dir>/seen.json`).
+pub fn load_seen(app: &mut App) {
+    if let Some(dir) = crate::logs::state_dir() {
+        app.ctl.seen = control::Seen::load(dir.join("seen.json"));
+    }
+}
+
 /// Screen rows the preview reads.
 pub fn control_rows() -> usize {
     control::SCREEN_ROWS

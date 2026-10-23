@@ -336,6 +336,13 @@ impl Sampler {
                 }
                 let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
                 tc.retain(&live);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for a in &mut agents {
+                    a.infer_waiting(now);
+                }
             }
             (out, agents)
         };
@@ -612,6 +619,7 @@ fn build_agents(
                 git: None,
                 title: None,
                 summary: None,
+                waiting: false,
             })
         })
         .collect();

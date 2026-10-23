@@ -574,8 +574,21 @@ window.
   prompt (`herdr agent prompt`, tmux `send-keys -l` + Enter), sending Esc
   first if a dialog is up. Arguments go as argv, never through a shell.
   GUI terminals are never typed into.
-- *Inbox* (`a`): agents only, ordered by `Agent::urgency` (blocked, done,
-  working, idle, stale) then most recently active; drawn as grouped
+- *Waiting*, without a host status: `Agent::infer_waiting` — a pending
+  tool call in the transcript, no shell child, and no terminal output for
+  over 5s. A tool that is running shows a child process or a spinner;
+  a static screen with an unanswered call is an approval or a question.
+  It feeds `is_blocked`, so the inbox, notices and `y`/`n` use it.
+- *Unread*: `seen.json` in the state dir maps session id → the transcript
+  time last seen. A session is unread when its transcript's newest record
+  is newer and it isn't working; it's marked read when shown in the inbox
+  or preview detail, or jumped to. With no file, the first snapshot seeds
+  it, so a first run starts with everything read.
+- *Last active* is the transcript's newest record time when there is one —
+  terminal output misleads, as a multiplexer redrawing touches every pane.
+- *Inbox* (`a`): agents only, ordered by urgency (blocked, then herdr
+  *done* or unread as *new*, working, idle, stale) then most recently
+  active; drawn as grouped
   two-line cards (idle split into *recent* < 1h and *earlier*) beside the
   selected session's detail (stacked under 120 columns). The detail — also
   the `p` preview — is a fixed context header (state, task, repo / branch /

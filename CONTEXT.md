@@ -117,7 +117,10 @@
   Shown in the preview, the inbox and `marina agents --long/--json`.
 
 - **Inbox** — the view of all agent sessions ordered by *urgency*: waiting
-  on you, finished, working, idle, stale.
+  on you, new (said something you haven't seen), working, idle, stale.
+
+- **Unread** — a session whose transcript has news since you last viewed
+  it in marina.
 
 - **Looks finished** — an agent session that is stale, has no live servers,
   and whose work tree is clean and pushed: the safest one to close.
