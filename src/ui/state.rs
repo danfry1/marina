@@ -170,6 +170,8 @@ pub struct App {
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
+    /// PROJECT column width at the last render (it grows with the pane).
+    pub(crate) project_w: u16,
 }
 
 impl App {
@@ -209,6 +211,7 @@ impl App {
             table_rect: Rect::default(),
             log_rect: None,
             header_hits: Vec::new(),
+            project_w: 22,
         }
     }
 

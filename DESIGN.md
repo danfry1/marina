@@ -529,7 +529,7 @@ scan arm keyed by pid or tty plus a jump arm.
 
 **Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
 `diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached
-20s and refreshed at most 3 directories per tick (the CLI refreshes all).
+20s and refreshed at most 6 directories per tick, in parallel (the CLI refreshes all).
 Shown as a badge before the branch (`●4 ↑2`, `✓`); `D` streams `diff --stat`,
 untracked files and the patch into the log pane. *Looks finished* = stale, no
 live servers, clean and pushed tree — closing it loses nothing, and the

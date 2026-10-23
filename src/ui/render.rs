@@ -20,6 +20,9 @@ use crate::model::{Agent, Target, TargetKey, TargetKind};
 
 /// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
 const COLW: [u16; 8] = [22, 16, 7, 7, 9, 12, 6, 15];
+/// How far PROJECT and BRANCH grow into spare width.
+const PROJECT_MAX: u16 = 36;
+const BRANCH_MAX: u16 = 40;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
@@ -124,7 +127,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .collect::<Vec<_>>(),
         )
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-        app.header_hits = header_hits(table_area, cols);
+        let colw = column_widths(table_area.width, cols);
+        app.project_w = colw[0];
+        app.header_hits = header_hits(table_area, &colw);
         let by_key: HashMap<&TargetKey, &Target> =
             app.snapshot.targets.iter().map(|t| (&t.key, t)).collect();
         let rows: Vec<Row> = app
@@ -132,14 +137,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .iter()
             .map(|e| entry_row(e, app, &by_key))
             .collect();
-        let widths: Vec<Constraint> = COLW[..cols]
-            .iter()
-            .map(|&w| Constraint::Length(w))
-            .collect();
+        let widths: Vec<Constraint> = colw.iter().map(|&w| Constraint::Length(w)).collect();
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+            .row_highlight_style(
+                // Reset first, so cell colors can't punch holes in the bar.
+                Style::new()
+                    .fg(Color::Reset)
+                    .bg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED),
+            )
             .highlight_symbol("▌ ")
             .highlight_spacing(HighlightSpacing::Always);
         frame.render_stateful_widget(table, table_area, &mut app.table_state);
@@ -189,10 +197,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// Clickable header cells: (x_start, x_end, sort mode) for PORT/CPU/MEM.
 /// Accounts for the block border (1) and the always-reserved highlight
 /// symbol "▌ " (2), plus the default column spacing of 1.
-fn header_hits(area: Rect, cols: usize) -> Vec<(u16, u16, SortMode)> {
+fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
     let mut hits = Vec::new();
     let mut x = area.x + 1 + 2;
-    for (i, &w) in COLW[..cols].iter().enumerate() {
+    for (i, &w) in colw.iter().enumerate() {
         let mode = match i {
             2 => Some(SortMode::Port),
             3 => Some(SortMode::Cpu),
@@ -536,7 +544,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
                 _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             };
             Row::new(vec![
-                Cell::from(group_header_text(arrow, p, n)),
+                Cell::from(group_header_text(arrow, p, n, app.project_w)),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format!("{cpu:.1}%")),
@@ -602,7 +610,7 @@ fn agents_section_row(app: &App) -> Row<'static> {
         Span::raw("")
     };
     Row::new(vec![
-        Cell::from(group_header_text(arrow, "agents", n)),
+        Cell::from(group_header_text(arrow, "agents", n, app.project_w)),
         Cell::from(busy),
         Cell::from(""),
         Cell::from(format!("{cpu:.1}%")),
@@ -633,9 +641,18 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     let project = match app.group_by {
         // under its session header, which already names it
         GroupBy::Session if !app.group_members(&label).is_empty() => Cell::from("  ↳"),
-        GroupBy::Session => Cell::from(Span::styled(label, style)),
+        GroupBy::Session => Cell::from(Span::styled(
+            ellipsize(&label, app.project_w as usize),
+            style,
+        )),
         // inside the agents section
-        GroupBy::Project => Cell::from(Span::styled(format!("  {label}"), style)),
+        GroupBy::Project => Cell::from(Span::styled(
+            format!(
+                "  {}",
+                ellipsize(&label, (app.project_w as usize).saturating_sub(2))
+            ),
+            style,
+        )),
     };
     // what it's doing, not which agent (the label says that)
     let activity = a.activity(now);
@@ -889,16 +906,36 @@ fn infra_tag(label: &str) -> Option<&'static str> {
 /// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
 /// `▾ label (n)` sized to the PROJECT column: a long label is cut with `…`
 /// so the member count always stays visible.
-fn group_header_text(arrow: &str, label: &str, n: usize) -> String {
+fn group_header_text(arrow: &str, label: &str, n: usize, width: u16) -> String {
     let suffix = format!(" ({n})");
-    let room = (COLW[0] as usize).saturating_sub(2 + suffix.chars().count());
-    let label = if label.chars().count() > room {
-        let cut: String = label.chars().take(room.saturating_sub(1)).collect();
-        format!("{cut}…")
-    } else {
-        label.to_string()
-    };
-    format!("{arrow} {label}{suffix}")
+    let room = (width as usize).saturating_sub(2 + suffix.chars().count());
+    format!("{arrow} {}{suffix}", ellipsize(label, room))
+}
+
+/// `s` cut to `room` columns, ending in `…` when it doesn't fit.
+fn ellipsize(s: &str, room: usize) -> String {
+    if s.chars().count() <= room {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(room.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Column widths for a table `width` wide showing `cols` columns: the
+/// minimums in `COLW`, with spare room going to PROJECT (long session
+/// labels) and then BRANCH, so a wide terminal doesn't cut names short.
+fn column_widths(width: u16, cols: usize) -> Vec<u16> {
+    let mut w = COLW[..cols].to_vec();
+    // borders (2), highlight symbol (2), one space between columns
+    let used = 4 + w.iter().sum::<u16>() + cols.saturating_sub(1) as u16;
+    let mut spare = width.saturating_sub(used);
+    let grow = spare.min(PROJECT_MAX - COLW[0]);
+    w[0] += grow;
+    spare -= grow;
+    if cols == COLW.len() {
+        w[cols - 1] += spare.min(BRANCH_MAX - COLW[cols - 1]);
+    }
+    w
 }
 
 /// Agents stand out (an orphan — its session ended — in yellow); editors and
@@ -1053,6 +1090,17 @@ mod tests {
         assert_eq!(infra_tag("postgres"), Some("db"));
         assert_eq!(infra_tag("redis"), Some("cache"));
         assert_eq!(infra_tag("vite"), None);
+    }
+
+    #[test]
+    fn spare_width_goes_to_project_then_branch() {
+        assert_eq!(column_widths(105, 8), COLW.to_vec(), "no spare room");
+        let w = column_widths(140, 8);
+        assert_eq!((w[0], w[7]), (36, 36));
+        let w = column_widths(300, 8);
+        assert_eq!((w[0], w[7]), (PROJECT_MAX, BRANCH_MAX));
+        assert_eq!(column_widths(89, 7)[0], 22);
+        assert_eq!(column_widths(95, 7)[0], 28, "narrow panes grow PROJECT too");
     }
 
     #[test]
@@ -1212,11 +1260,11 @@ mod tests {
 
     #[test]
     fn long_group_labels_keep_their_count_visible() {
-        let t = group_header_text("▾", "claude·courts-portfolio-site", 3);
+        let t = group_header_text("▾", "claude·courts-portfolio-site", 3, COLW[0]);
         assert_eq!(t.chars().count(), COLW[0] as usize);
         assert!(t.ends_with("… (3)"), "{t}");
         assert_eq!(
-            group_header_text("▾", "client-portal", 2),
+            group_header_text("▾", "client-portal", 2, COLW[0]),
             "▾ client-portal (2)"
         );
     }

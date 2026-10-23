@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 /// How long a directory's status is trusted.
 const TTL: Duration = Duration::from_secs(20);
-/// At most this many `git` refreshes per sampler tick.
-const PER_TICK: usize = 3;
+/// At most this many `git` refreshes per sampler tick (run in parallel).
+const PER_TICK: usize = 6;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -195,8 +195,17 @@ impl Cache {
             .collect();
         due.sort_by_key(|d| self.entries.get(*d).map(|(at, _)| *at));
         due.dedup();
-        for d in due.into_iter().take(self.per_tick) {
-            self.entries.insert(d.clone(), (Instant::now(), status(d)));
+        let fresh: Vec<(PathBuf, Option<GitStatus>)> = std::thread::scope(|s| {
+            let jobs: Vec<_> = due
+                .into_iter()
+                .take(self.per_tick)
+                .map(|d| s.spawn(move || (d.clone(), status(d))))
+                .collect();
+            jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+        });
+        let now = Instant::now();
+        for (d, st) in fresh {
+            self.entries.insert(d, (now, st));
         }
         self.entries
             .iter()
