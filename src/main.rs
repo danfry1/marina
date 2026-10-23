@@ -18,6 +18,7 @@ mod sources;
 mod transcript;
 mod ui;
 mod verbs;
+mod watch;
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -66,6 +67,7 @@ fn main() -> io::Result<()> {
     }));
     let mut app = ui::App::new();
     ui::load_seen(&mut app);
+    app.set_quick_replies(config::load().agents.quick);
     let notify = config::load().notify;
     app.notify_agents = notify.agents;
     let desktop_notify = notify.desktop;
@@ -157,6 +159,9 @@ fn run(
                             KeyCode::Char('p') => app.toggle_preview(),
                             KeyCode::Char('a') => app.toggle_inbox(),
                             KeyCode::Char('r') => app.start_reply(),
+                            KeyCode::Char(c @ '1'..='9') if app.selected_agent().is_some() => {
+                                app.quick_reply(c as usize - '0' as usize)
+                            }
                             KeyCode::Char(c @ ('y' | 'n')) => {
                                 let action = app.answer(c == 'y');
                                 run_action(app, action, &ev_tx);
@@ -210,9 +215,11 @@ fn run(
         }
 
         // Orphaned servers; agent sessions finished or waiting on you.
-        for msg in app.take_notifications() {
-            if desktop_notify {
-                verbs::notify("marina", &msg);
+        let notices = app.take_notifications();
+        // the background watcher, when running, sends these itself
+        if desktop_notify && !notices.is_empty() && !watch::running() {
+            for n in notices {
+                verbs::notify("marina", &n.text, n.jump.as_deref());
             }
         }
 

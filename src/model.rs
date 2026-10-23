@@ -101,6 +101,10 @@ pub struct Agent {
     /// A thinking agent animates its screen and a running tool has a child
     /// or a spinner; this is an approval prompt or a question to the human.
     pub waiting: bool,
+    /// The git work tree it's in: the nearest directory up from `cwd` with
+    /// a `.git` (a linked worktree has its own). Sessions sharing one can
+    /// overwrite each other's edits.
+    pub tree: Option<PathBuf>,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -122,6 +126,17 @@ pub struct AgentChild {
     pub shell: bool,
     pub cpu_pct: f32,   // subtree, unsmoothed
     pub mem_bytes: u64, // subtree
+}
+
+/// The git work tree containing `dir`: the nearest ancestor (or itself)
+/// holding a `.git` directory or file — except a repo at `$HOME` (dotfiles),
+/// which would make every session under it look like it shares one.
+pub fn work_tree(dir: &std::path::Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .filter(|d| Some(d.to_path_buf()) != home)
+        .map(PathBuf::from)
 }
 
 /// Helpers that several sessions each run their own copy of — every Claude
@@ -347,6 +362,7 @@ impl Agent {
             title: None,
             summary: None,
             waiting: false,
+            tree: None,
         }
     }
 }
@@ -542,6 +558,22 @@ mod tests {
         a.children = Agent::sample(1, "aaaa", "x").children; // its shell runs
         a.infer_waiting(120);
         assert!(!a.waiting, "a running command isn't a question");
+    }
+
+    #[test]
+    fn work_trees_stop_at_the_nearest_git() {
+        let base = std::env::temp_dir().join(format!("marina-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(base.join("repo/src/deep")).unwrap();
+        std::fs::create_dir_all(base.join("repo/wt")).unwrap();
+        std::fs::write(base.join("repo/wt/.git"), "gitdir: x").unwrap(); // a linked worktree
+        assert_eq!(
+            work_tree(&base.join("repo/src/deep")),
+            Some(base.join("repo"))
+        );
+        assert_eq!(work_tree(&base.join("repo/wt")), Some(base.join("repo/wt")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -102,6 +102,19 @@ developer-process-centric.
   command never started: an approval prompt or a question. Notices say what it wants:
   `claude·api needs you: wants to run Bash: cargo publish`, and finished
   ones what it said.
+- **Background notices** — `marina watch --install` keeps a small watcher
+  running at login (a launchd agent on macOS, a systemd user service on
+  Linux) that sends the same notices with marina closed; an open TUI
+  leaves desktop notifications to it. With `terminal-notifier` installed
+  (macOS) or a `notify-send` that supports actions (Linux), clicking a
+  notice runs `marina jump <session>` and takes you to it.
+- **Shared work trees** — sessions in the same git work tree carry `⇄N`
+  on their card and a warning in the detail; when two are *working* in one
+  at once, marina says so, since their edits can overwrite each other (a
+  `git worktree` each keeps them apart).
+- **Quick replies** — `1`–`9` on a session open the reply box with a canned
+  reply (`commit it`, `push it`, `run the tests`, `continue` — set your own
+  with `[agents] quick`); Enter sends it.
 - **Answer from marina** — on a herdr or tmux session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
   dialog first). Each re-reads the session's screen at the moment of
@@ -190,6 +203,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `a` | inbox: every agent session, what needs you first |
 | `p` | preview an agent: last prompt, recap and reply · again: its live screen |
 | `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
+| `1`–`9` | quick reply: opens the reply box with a canned reply (Enter sends) |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -218,6 +232,9 @@ marina free <port>… [--json]  # stop the dev target on a port, wait until it's
 marina port [name] [--json]   # a stable, collision-free port for this project/worktree
 marina port --list            # every assigned port · --release [name] gives one back
 marina agents [sel…] [--json] # agent sessions: shells, helpers, servers, resume command
+marina agents --long          # …and what each last said, what needs you first
+marina jump <session>         # focus a session's terminal (id, pid or project)
+marina watch --install        # background notices at login (--status, --uninstall)
 marina version
 ```
 
@@ -304,6 +321,8 @@ agents  = false                # no "finished" / "needs you" agent notices
 [agents]
 transcripts = false            # don't read Claude Code transcript tails
                                # (preview, inbox, agents --long)
+quick = ["commit it", "push it", "run the tests", "continue"]
+                               # replies on keys 1-9 (these are the default)
 ```
 
 ## Privacy & security

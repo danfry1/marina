@@ -147,8 +147,12 @@ pub struct App {
     /// Agents already reported as waiting, and on what (the pending tool
     /// call): a flicker in the waiting signal doesn't repeat the notice.
     agent_blocked: HashMap<u32, String>,
+    /// Work trees with two or more sessions working at once, already
+    /// reported, and when they last were (their edits can collide). Kept
+    /// for a while after, so a flicker in "working" doesn't report again.
+    busy_trees: HashMap<std::path::PathBuf, u64>,
     /// Messages for a desktop notification, drained by the main loop.
-    pub(crate) notifications: Vec<String>,
+    pub(crate) notifications: Vec<Notice>,
     pub(crate) log: Option<LogView>,
     pub(crate) log_height: u16,
     /// A background log discovery is running (guards double-`T`).
@@ -202,6 +206,7 @@ impl App {
             notify_agents: true,
             agent_streaks: HashMap::new(),
             agent_blocked: HashMap::new(),
+            busy_trees: HashMap::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -264,13 +269,16 @@ impl App {
             // An agent session that ended and left servers running: say so
             // once, at the transition, and queue a desktop notification.
             for msg in orphan_notices(&old, &self.snapshot) {
-                self.notifications.push(msg.clone());
+                self.notifications.push(Notice {
+                    text: msg.clone(),
+                    jump: None,
+                });
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
             }
             if self.notify_agents {
-                for msg in self.agent_notices(unix_now()) {
-                    self.notifications.push(msg.clone());
+                for (msg, jump) in self.agent_notices(unix_now()) {
                     self.set_notice(format!("{msg} · Enter on its row jumps there"));
+                    self.notifications.push(Notice { text: msg, jump });
                 }
             }
         } else {
@@ -296,8 +304,45 @@ impl App {
     /// Agents that finished a stretch of work, or started waiting on a
     /// question, since the last snapshot: `claude·api finished after 12m`,
     /// `claude·api needs you`. Each transition is reported once.
-    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<String> {
+    /// Agent notices: (text, the session to jump to when it's clicked).
+    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<(String, Option<String>)> {
         let mut out = Vec::new();
+        // two sessions editing one work tree at once: say so as it starts
+        let mut working: HashMap<&std::path::Path, Vec<&Agent>> = HashMap::new();
+        for a in &self.snapshot.agents {
+            if let Some(t) = a.tree.as_deref().filter(|_| a.is_working(now)) {
+                working.entry(t).or_default().push(a);
+            }
+        }
+        let busy: Vec<std::path::PathBuf> = working
+            .iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(t, _)| t.to_path_buf())
+            .collect();
+        self.busy_trees
+            .retain(|_, last| now.saturating_sub(*last) < BUSY_TREE_FORGET);
+        for t in &busy {
+            if self.busy_trees.insert(t.clone(), now).is_some() {
+                continue; // reported already
+            }
+            let who: Vec<String> = working[t.as_path()]
+                .iter()
+                .map(|a| {
+                    self.agent_session_of
+                        .get(&a.pid)
+                        .cloned()
+                        .unwrap_or_else(|| a.name.clone())
+                })
+                .collect();
+            out.push((
+                format!(
+                    "{} are working in the same tree ({}) — their edits can collide",
+                    who.join(" and "),
+                    tildify(&t.display().to_string())
+                ),
+                None,
+            ));
+        }
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
         self.agent_streaks.retain(|pid, _| live.contains(pid));
         self.agent_blocked.retain(|pid, _| live.contains(pid));
@@ -316,12 +361,11 @@ impl App {
                 if self.agent_blocked.get(&a.pid) != Some(&what) {
                     self.agent_blocked.insert(a.pid, what);
                     // say what it wants, so the notification is actionable
-                    match a.pending_tool() {
-                        Some(t) => {
-                            out.push(format!("{label} needs you: wants to run {}", clip(&t, 90)))
-                        }
-                        None => out.push(format!("{label} needs you")),
-                    }
+                    let text = match a.pending_tool() {
+                        Some(t) => format!("{label} needs you: wants to run {}", clip(&t, 90)),
+                        None => format!("{label} needs you"),
+                    };
+                    out.push((text, jump_key(a)));
                 }
                 self.agent_streaks.remove(&a.pid); // the question says it all
                 continue;
@@ -344,9 +388,12 @@ impl App {
                                 format!(": {}", clip(&super::agent_view::first_sentence(r), 110))
                             })
                             .unwrap_or_default();
-                        out.push(format!(
-                            "{label} finished after {}{said}",
-                            super::format::fmt_age(last - start)
+                        out.push((
+                            format!(
+                                "{label} finished after {}{said}",
+                                super::format::fmt_age(last - start)
+                            ),
+                            jump_key(a),
                         ));
                     }
                 }
@@ -427,7 +474,7 @@ impl App {
     }
 
     /// Notification texts queued since the last call.
-    pub fn take_notifications(&mut self) -> Vec<String> {
+    pub fn take_notifications(&mut self) -> Vec<Notice> {
         std::mem::take(&mut self.notifications)
     }
 
@@ -1323,6 +1370,24 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
     }
 }
 
+/// How long a shared tree stays reported after two sessions stop working
+/// in it at once.
+const BUSY_TREE_FORGET: u64 = 600;
+
+/// A desktop notification: its text, and the session `marina jump` should
+/// bring up when it's clicked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub text: String,
+    pub jump: Option<String>,
+}
+
+/// What `marina jump` is given to find `a` again: its session id, else
+/// its pid.
+fn jump_key(a: &Agent) -> Option<String> {
+    Some(a.session.clone().unwrap_or_else(|| a.pid.to_string()))
+}
+
 /// `s` cut to `n` chars with `…`.
 fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -1451,11 +1516,11 @@ mod tests {
         let n = app.take_notifications();
         assert_eq!(n.len(), 1, "one notice per session, not per server: {n:?}");
         assert!(
-            n[0].starts_with(
+            n[0].text.starts_with(
                 "claude session in /Users/me/dev/portal ended — left 2 servers running"
             ),
             "{}",
-            n[0]
+            n[0].text
         );
         assert!(app
             .status
@@ -1623,7 +1688,9 @@ mod tests {
             "a pause, not done yet"
         );
         let n = app.agent_notices(t0 + 135);
-        assert_eq!(n, vec!["claude·api finished after 2m".to_string()]);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].0, "claude·api finished after 2m");
+        assert!(n[0].1.is_some(), "clicking it jumps to the session");
         assert!(app.agent_notices(t0 + 200).is_empty(), "once");
 
         // a short burst isn't worth a ping
@@ -1634,10 +1701,9 @@ mod tests {
 
         // blocked: right away, once
         app.snapshot = snap_with(6, false, Some(HostStatus::Blocked));
-        assert_eq!(
-            app.agent_notices(t0 + 400),
-            vec!["claude·api needs you".to_string()]
-        );
+        let n = app.agent_notices(t0 + 400);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].0, "claude·api needs you");
         assert!(app.agent_notices(t0 + 410).is_empty());
     }
 

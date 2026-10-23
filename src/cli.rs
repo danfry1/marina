@@ -58,6 +58,11 @@ USAGE:
                      [--long]        … and what each last said: recap, last
                                      prompt and reply, what it's waiting on
                                      (with --json: the `summary` field)
+    marina jump <session>        focus an agent session's terminal (session id,
+                                 pid, or project) — what clicking a notice does
+    marina watch                 send agent notices without the TUI open
+          [--install|--uninstall|--status]   …as a login service (launchd /
+                                 systemd), and manage it
     marina version               print the version
 
 SELECTOR:
@@ -88,7 +93,15 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if let Some(bad) = flags.iter().find(|f| {
         !matches!(
             **f,
-            "--json" | "--mine" | "--orphaned" | "--list" | "--release" | "--long"
+            "--json"
+                | "--mine"
+                | "--orphaned"
+                | "--list"
+                | "--release"
+                | "--long"
+                | "--install"
+                | "--uninstall"
+                | "--status"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -114,6 +127,14 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         return Some(2);
     }
     let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
+    if ["--install", "--uninstall", "--status"]
+        .iter()
+        .any(|f| flags.contains(f))
+        && cmd != "watch"
+    {
+        eprintln!("marina: --install / --uninstall / --status only apply to `marina watch`");
+        return Some(2);
+    }
     if flags.contains(&"--long") && cmd != "agents" {
         eprintln!("marina: --long only applies to `marina agents`");
         return Some(2);
@@ -131,6 +152,18 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
         "agents" => agents(&selectors, json, flags.contains(&"--long")),
+        "jump" => jump(&selectors),
+        "watch" => {
+            if flags.contains(&"--install") {
+                crate::watch::install()
+            } else if flags.contains(&"--uninstall") {
+                crate::watch::uninstall()
+            } else if flags.contains(&"--status") {
+                crate::watch::status()
+            } else {
+                crate::watch::run()
+            }
+        }
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -400,6 +433,78 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
         );
     }
     0
+}
+
+/// `marina jump <session>`: focus that agent session's terminal, as Enter
+/// does in the TUI (and as clicking a notice does).
+fn jump(selectors: &[&str]) -> i32 {
+    let Some(sel) = selectors.first() else {
+        eprintln!("jump: which session? (a session id, pid, or project)");
+        return 2;
+    };
+    let snap = snapshot(false);
+    // an exact pid or session id (what a notice passes) wins outright
+    let exact: Vec<&Agent> = snap
+        .agents
+        .iter()
+        .filter(|a| a.pid.to_string() == *sel || a.session.as_deref() == Some(*sel))
+        .collect();
+    let hits: Vec<&Agent> = if exact.is_empty() {
+        snap.agents
+            .iter()
+            .filter(|a| agent_matches(a, sel))
+            .collect()
+    } else {
+        exact
+    };
+    let a = match hits.as_slice() {
+        [a] => *a,
+        [] => {
+            eprintln!("jump: no agent session matches {sel:?}");
+            return 1;
+        }
+        many => {
+            eprintln!(
+                "jump: {sel:?} matches {} sessions — be more specific:",
+                many.len()
+            );
+            for a in many {
+                eprintln!(
+                    "  {} {} {}",
+                    a.pid,
+                    a.project,
+                    a.session
+                        .as_deref()
+                        .map(|s| crate::launcher::short_id(s, 8))
+                        .unwrap_or("—")
+                );
+            }
+            return 1;
+        }
+    };
+    match &a.host {
+        Some(h) => match crate::hosts::jump(h, &a.name) {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("jump: {e}");
+                1
+            }
+        },
+        None => {
+            let resume = a
+                .as_launcher()
+                .resume_hint()
+                .unwrap_or_else(|| a.name.clone());
+            println!(
+                "no terminal marina can drive — resume it with: cd {} && {resume}",
+                a.cwd.display()
+            );
+            1
+        }
+    }
 }
 
 /// `--long`: each session, what wants you first, with what it last said.
