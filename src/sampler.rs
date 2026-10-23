@@ -59,6 +59,8 @@ pub struct Sampler {
     hosts: crate::hosts::Hosts,
     /// opencode session ids, asked of its background service.
     opencode: crate::opencode::Sessions,
+    /// Work tree per agent cwd.
+    trees: HashMap<PathBuf, Option<PathBuf>>,
     /// Claude Code transcript summaries; `None` when turned off in config.
     transcripts: Option<crate::transcript::Cache>,
     /// Agents' working-tree status.
@@ -82,6 +84,7 @@ impl Sampler {
             docker_cache: None,
             hosts: Default::default(),
             opencode: Default::default(),
+            trees: HashMap::new(),
             transcripts: crate::config::load()
                 .agents
                 .transcripts
@@ -330,8 +333,15 @@ impl Sampler {
                 }
             }
             self.opencode.fill(procs, &mut agents);
+            // by cwd, cached: it stats every ancestor
+            self.trees
+                .retain(|cwd, _| agents.iter().any(|a| &a.cwd == cwd));
             for a in &mut agents {
-                a.tree = crate::model::work_tree(&a.cwd);
+                a.tree = self
+                    .trees
+                    .entry(a.cwd.clone())
+                    .or_insert_with(|| crate::model::work_tree(&a.cwd))
+                    .clone();
             }
             if let Some(tc) = self.transcripts.as_mut() {
                 for a in agents.iter_mut().filter(|a| a.name == "claude") {
@@ -1044,6 +1054,7 @@ mod tests {
             docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
             hosts: Default::default(),
             opencode: Default::default(),
+            trees: HashMap::new(),
             transcripts: None, // never read ~/.claude in tests
             git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),

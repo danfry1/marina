@@ -19,43 +19,62 @@ fn pid_file() -> Option<PathBuf> {
     Some(crate::logs::state_dir()?.join("watch.pid"))
 }
 
-/// Is a watcher running (other than this process)?
+/// Is a watcher running? It holds an exclusive lock on `watch.pid` for its
+/// whole life, so this asks the lock — not the pid inside, which can be
+/// stale or reused (the TUI is named marina too).
 pub fn running() -> bool {
-    let Some(pid) = pid_file()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    else {
+    let Some(f) = pid_file().and_then(|p| std::fs::File::open(p).ok()) else {
         return false;
     };
-    pid != std::process::id() && alive_marina(pid)
+    !try_lock(&f)
 }
 
-/// `pid` is a live process named marina (not a recycled pid).
-fn alive_marina(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return false;
+/// Take the exclusive lock without waiting; `true` if we got it. (Dropping
+/// the file releases it.)
+fn try_lock(f: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a file descriptor we own.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Keep `watch.log` from growing forever: start over past 1MB.
+fn cap_log() {
+    if let Some(log) = crate::logs::state_dir().map(|d| d.join("watch.log")) {
+        if std::fs::metadata(&log).is_ok_and(|m| m.len() > 1 << 20) {
+            let _ = std::fs::write(&log, "");
+        }
     }
-    let name = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    name.trim().rsplit('/').next() == Some("marina")
 }
 
 /// Run the watcher in the foreground until killed.
 pub fn run() -> i32 {
-    if running() {
-        eprintln!("marina watch: already running");
+    let Some(p) = pid_file() else {
+        eprintln!("marina watch: no state directory");
         return 1;
+    };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    if let Some(p) = pid_file() {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&p, std::process::id().to_string());
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&p);
+    let Ok(mut lock) = lock else {
+        eprintln!("marina watch: can't open {}", p.display());
+        return 1;
+    };
+    if !try_lock(&lock) {
+        // another watcher holds it; exit quietly (launchd retries later)
+        eprintln!("marina watch: already running");
+        return 0;
     }
+    {
+        use std::io::Write;
+        let _ = lock.set_len(0);
+        let _ = write!(lock, "{}", std::process::id());
+    }
+    cap_log();
     let cfg = crate::config::load();
     let mut sampler = crate::sampler::Sampler::new();
     let mut app = crate::ui::App::new();
@@ -64,6 +83,7 @@ pub fn run() -> i32 {
     eprintln!("marina watch: watching (pid {})", std::process::id());
     loop {
         app.apply(Arc::new(sampler.build()));
+        app.tick(); // prunes per-row bookkeeping, as the TUI loop does
         for n in app.take_notifications() {
             eprintln!("{}", n.text);
             if cfg.notify.desktop {
@@ -101,10 +121,22 @@ fn xml(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The launchd agent: run `marina watch` at login and keep it running, with
-/// the installing shell's PATH (herdr, tmux, git, terminal-notifier live
-/// there, not in launchd's default).
-pub fn plist(exe: &str, path_env: &str, log: &str) -> String {
+/// The installing shell's environment the watcher needs: PATH (herdr,
+/// tmux, git, terminal-notifier live there, not in launchd's default) and
+/// the XDG directories, so it finds the same config and state as the TUI.
+pub fn service_env() -> Vec<(String, String)> {
+    ["PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+        .iter()
+        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
+        .collect()
+}
+
+/// The launchd agent: run `marina watch` at login and keep it running.
+pub fn plist(exe: &str, env: &[(String, String)], log: &str) -> String {
+    let env: String = env
+        .iter()
+        .map(|(k, v)| format!("<key>{}</key><string>{}</string>", xml(k), xml(v)))
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -114,7 +146,7 @@ pub fn plist(exe: &str, path_env: &str, log: &str) -> String {
   <key>ProgramArguments</key>
   <array><string>{}</string><string>watch</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{}</string></dict>
+  <dict>{}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
@@ -123,16 +155,32 @@ pub fn plist(exe: &str, path_env: &str, log: &str) -> String {
 </plist>
 "#,
         xml(exe),
-        xml(path_env),
+        env,
         xml(log)
     )
 }
 
-pub fn unit(exe: &str, path_env: &str) -> String {
+/// A systemd value: quoted, with `%` specifiers and `$` expansion escaped.
+fn sd(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('$', "$$")
+    )
+}
+
+pub fn unit(exe: &str, env: &[(String, String)]) -> String {
+    let env: String = env
+        .iter()
+        .map(|(k, v)| format!("Environment={}\n", sd(&format!("{k}={v}"))))
+        .collect();
     format!(
         "[Unit]\nDescription=marina watch: agent session notices\n\n\
-         [Service]\nExecStart={exe} watch\nEnvironment=PATH={path_env}\nRestart=always\n\n\
-         [Install]\nWantedBy=default.target\n"
+         [Service]\nExecStart={} watch\n{env}Restart=always\n\n\
+         [Install]\nWantedBy=default.target\n",
+        sd(exe)
     )
 }
 
@@ -143,7 +191,7 @@ pub fn install() -> i32 {
         return 1;
     };
     let exe = exe.display().to_string();
-    let path_env = std::env::var("PATH").unwrap_or_default();
+    let env = service_env();
     if cfg!(target_os = "macos") {
         let (Some(plist_at), Some(state)) = (plist_path(), crate::logs::state_dir()) else {
             return 1;
@@ -153,7 +201,7 @@ pub fn install() -> i32 {
         if let Some(dir) = plist_at.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&plist_at, plist(&exe, &path_env, &log)) {
+        if let Err(e) = std::fs::write(&plist_at, plist(&exe, &env, &log)) {
             eprintln!("marina watch: writing {}: {e}", plist_at.display());
             return 1;
         }
@@ -163,11 +211,18 @@ pub fn install() -> i32 {
         let _ = Command::new("launchctl")
             .args(["bootout", &format!("{domain}/{LABEL}")])
             .output();
-        let ok = Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_at)
-            .status()
-            .is_ok_and(|s| s.success());
+        // bootout returns before the old job is gone; bootstrap can fail
+        // until it is
+        let ok = (0..10).any(|i| {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            Command::new("launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&plist_at)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
         if !ok {
             eprintln!(
                 "marina watch: launchctl couldn't start {}",
@@ -188,14 +243,21 @@ pub fn install() -> i32 {
         if let Some(dir) = unit_at.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&unit_at, unit(&exe, &path_env)) {
+        if let Err(e) = std::fs::write(&unit_at, unit(&exe, &env)) {
             eprintln!("marina watch: writing {}: {e}", unit_at.display());
             return 1;
         }
-        let ok = Command::new("systemctl")
-            .args(["--user", "enable", "--now", "marina-watch.service"])
-            .status()
-            .is_ok_and(|s| s.success());
+        // pick up a rewritten unit, and restart one already running
+        let sc = |args: &[&str]| {
+            Command::new("systemctl")
+                .arg("--user")
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let ok = sc(&["daemon-reload"])
+            && sc(&["enable", "marina-watch.service"])
+            && sc(&["restart", "marina-watch.service"]);
         if !ok {
             eprintln!(
                 "marina watch: systemctl couldn't start {}",
@@ -261,18 +323,39 @@ mod tests {
 
     #[test]
     fn service_files_carry_the_path_and_escape_it() {
-        let p = plist("/opt/homebrew/bin/marina", "/a:/b&c", "/x/watch.log");
+        let env = vec![
+            ("PATH".to_string(), "/a:/b&c".to_string()),
+            ("XDG_STATE_HOME".to_string(), "/s".to_string()),
+        ];
+        let p = plist("/opt/homebrew/bin/marina", &env, "/x/watch.log");
         assert!(p.contains("<string>/opt/homebrew/bin/marina</string><string>watch</string>"));
-        assert!(p.contains("<string>/a:/b&amp;c</string>"), "{p}");
+        assert!(
+            p.contains("<key>PATH</key><string>/a:/b&amp;c</string>"),
+            "{p}"
+        );
+        assert!(p.contains("<key>XDG_STATE_HOME</key><string>/s</string>"));
         assert!(p.contains("<key>KeepAlive</key><true/>"));
-        let u = unit("/usr/bin/marina", "/usr/bin");
-        assert!(u.contains("ExecStart=/usr/bin/marina watch"));
-        assert!(u.contains("Environment=PATH=/usr/bin"));
+        let u = unit(
+            "/home/me/my bin/marina",
+            &[("PATH".into(), "/usr/bin:$X%h".into())],
+        );
+        assert!(
+            u.contains("ExecStart=\"/home/me/my bin/marina\" watch"),
+            "{u}"
+        );
+        assert!(u.contains("Environment=\"PATH=/usr/bin:$$X%%h\""), "{u}");
     }
 
     #[test]
-    fn a_dead_or_foreign_pid_is_not_a_watcher() {
-        assert!(!alive_marina(u32::MAX - 7));
-        assert!(!alive_marina(1), "launchd/init isn't marina");
+    fn the_lock_not_the_pid_says_who_is_watching() {
+        let p = std::env::temp_dir().join(format!("marina-lock-{}", std::process::id()));
+        std::fs::write(&p, "1").unwrap(); // a stale pid file, unlocked
+        let held = std::fs::File::open(&p).unwrap();
+        assert!(try_lock(&held), "nobody holds it");
+        let other = std::fs::File::open(&p).unwrap();
+        assert!(!try_lock(&other), "taken while the first is open");
+        drop(held);
+        assert!(try_lock(&other), "released when the holder goes");
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -129,10 +129,13 @@ pub struct AgentChild {
 }
 
 /// The git work tree containing `dir`: the nearest ancestor (or itself)
-/// holding a `.git` directory or file.
+/// holding a `.git` directory or file — except a repo at `$HOME` (dotfiles),
+/// which would make every session under it look like it shares one.
 pub fn work_tree(dir: &std::path::Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     dir.ancestors()
         .find(|d| d.join(".git").exists())
+        .filter(|d| Some(d.to_path_buf()) != home)
         .map(PathBuf::from)
 }
 

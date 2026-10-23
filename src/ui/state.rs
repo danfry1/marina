@@ -148,8 +148,9 @@ pub struct App {
     /// call): a flicker in the waiting signal doesn't repeat the notice.
     agent_blocked: HashMap<u32, String>,
     /// Work trees with two or more sessions working at once, already
-    /// reported (their edits can collide).
-    busy_trees: HashSet<std::path::PathBuf>,
+    /// reported, and when they last were (their edits can collide). Kept
+    /// for a while after, so a flicker in "working" doesn't report again.
+    busy_trees: HashMap<std::path::PathBuf, u64>,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<Notice>,
     pub(crate) log: Option<LogView>,
@@ -205,7 +206,7 @@ impl App {
             notify_agents: true,
             agent_streaks: HashMap::new(),
             agent_blocked: HashMap::new(),
-            busy_trees: HashSet::new(),
+            busy_trees: HashMap::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -313,12 +314,17 @@ impl App {
                 working.entry(t).or_default().push(a);
             }
         }
-        let busy: HashSet<std::path::PathBuf> = working
+        let busy: Vec<std::path::PathBuf> = working
             .iter()
             .filter(|(_, v)| v.len() > 1)
             .map(|(t, _)| t.to_path_buf())
             .collect();
-        for t in busy.difference(&self.busy_trees) {
+        self.busy_trees
+            .retain(|_, last| now.saturating_sub(*last) < BUSY_TREE_FORGET);
+        for t in &busy {
+            if self.busy_trees.insert(t.clone(), now).is_some() {
+                continue; // reported already
+            }
             let who: Vec<String> = working[t.as_path()]
                 .iter()
                 .map(|a| {
@@ -337,7 +343,6 @@ impl App {
                 None,
             ));
         }
-        self.busy_trees = busy;
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
         self.agent_streaks.retain(|pid, _| live.contains(pid));
         self.agent_blocked.retain(|pid, _| live.contains(pid));
@@ -1364,6 +1369,10 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (None, None) => a.project.cmp(&b.project),
     }
 }
+
+/// How long a shared tree stays reported after two sessions stop working
+/// in it at once.
+const BUSY_TREE_FORGET: u64 = 600;
 
 /// A desktop notification: its text, and the session `marina jump` should
 /// bring up when it's clicked.

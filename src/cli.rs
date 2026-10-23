@@ -443,11 +443,20 @@ fn jump(selectors: &[&str]) -> i32 {
         return 2;
     };
     let snap = snapshot(false);
-    let hits: Vec<&Agent> = snap
+    // an exact pid or session id (what a notice passes) wins outright
+    let exact: Vec<&Agent> = snap
         .agents
         .iter()
-        .filter(|a| a.pid.to_string() == *sel || agent_matches(a, sel))
+        .filter(|a| a.pid.to_string() == *sel || a.session.as_deref() == Some(*sel))
         .collect();
+    let hits: Vec<&Agent> = if exact.is_empty() {
+        snap.agents
+            .iter()
+            .filter(|a| agent_matches(a, sel))
+            .collect()
+    } else {
+        exact
+    };
     let a = match hits.as_slice() {
         [a] => *a,
         [] => {

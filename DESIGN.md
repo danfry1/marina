@@ -609,22 +609,28 @@ window.
 
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
 every 2s and sends the same notices (`App::take_notifications`) as desktop
-notifications. It holds `<state dir>/watch.pid`; the TUI checks it
-(`watch::running`, pid alive and named marina) and leaves desktop
-notifications to the watcher. `--install` writes a launchd agent
+notifications. It holds an exclusive `flock` on `<state dir>/watch.pid`
+for its life; the TUI asks the lock (`watch::running`), not the pid inside,
+which can be stale or reused, and leaves desktop notifications to the
+watcher. `--install` writes a launchd agent
 (`~/Library/LaunchAgents/dev.marina.watch.plist`, RunAtLoad + KeepAlive,
-the installing shell's PATH, log in the state dir) and bootstraps it, or a
-systemd user unit on Linux; the program path is the `$PATH` entry that
+the installing shell's PATH and XDG directories, log in the state dir,
+capped at 1MB) and bootstraps it (retrying while a previous job is torn
+down), or a systemd user unit on Linux (values quoted and `%`/`$`
+escaped; daemon-reload and restart on reinstall); the program path is the `$PATH` entry that
 resolves to the running binary, so a Homebrew upgrade doesn't break it.
 Notices carry a jump key (session id, else pid); `verbs::notify` makes
-them clickable with `terminal-notifier -execute "<marina> jump <id>"`
-(macOS, when installed) or `notify-send --action` (Linux). The id is
+them clickable with `terminal-notifier -execute "PATH=… <marina> jump <id>"`
+(macOS, when installed; the click runs with launchd's bare PATH otherwise)
+or `notify-send --action` (Linux, at most 8 waiting at once). The id is
 validated as a session id before it reaches a command line.
 
 **Shared trees**: `Agent::tree` is the nearest ancestor of its cwd with a
-`.git` (directory or file, so linked worktrees are distinct). Sessions
+`.git` (directory or file, so linked worktrees are distinct), cached by cwd;
+a repo at `$HOME` doesn't count. Sessions
 sharing one get `⇄N` and a detail warning; when two or more are working
-in one at once, a notice fires once per such episode (`busy_trees`).
+in one at once, a notice fires once, and not again until that tree has
+gone 10 minutes without two working in it (`busy_trees`).
 
 **Quick replies**: `1`–`9` open the reply box pre-filled from
 `[agents] quick`; nothing is sent until Enter.

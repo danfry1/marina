@@ -367,8 +367,11 @@ pub fn notify(title: &str, body: &str, jump: Option<&str>) {
                 c.args(["-title", &title, "-message", &body, "-group"])
                     .arg(format!("marina-{id}"))
                     .arg("-execute")
+                    // run on click by a shell with launchd's bare PATH:
+                    // give it ours, so tmux/herdr are found
                     .arg(format!(
-                        "{} jump {id}",
+                        "PATH={} {} jump {id}",
+                        shell_quote(&std::env::var("PATH").unwrap_or_default()),
                         shell_quote(&exe.display().to_string())
                     ));
                 quiet(&mut c);
@@ -385,13 +388,22 @@ pub fn notify(title: &str, body: &str, jump: Option<&str>) {
             quiet(&mut c);
             let _ = c.status();
         } else {
-            if let (Some(id), Some(exe)) = (&jump, &exe) {
+            // each waits for a click; daemons that keep notices forever
+            // would pile these up, so only a few wait at once
+            static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let room = WAITING.fetch_add(1, Ordering::SeqCst) < 8;
+            let clickable = room && jump.is_some() && exe.is_some();
+            if !clickable {
+                WAITING.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let (true, Some(id), Some(exe)) = (clickable, &jump, &exe) {
                 // waits for a click or dismissal, printing the action taken
                 let out = Command::new("notify-send")
                     .args(["--action=jump=Jump", "--wait", &title, &body])
                     .stdin(Stdio::null())
                     .stderr(Stdio::null())
                     .output();
+                WAITING.fetch_sub(1, Ordering::SeqCst);
                 match out {
                     Ok(o) if o.status.success() => {
                         if String::from_utf8_lossy(&o.stdout).trim() == "jump" {
