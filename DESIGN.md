@@ -470,7 +470,8 @@ values are never read), and other variables — including tokens agents export
 alongside them — are never stored. Session ids are validated as
 `[A-Za-z0-9_-]{1,80}`.
 Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
-hold auth tokens).
+hold auth tokens); only session transcripts' tails are, for summaries (see
+*Agent control*).
 
 ### Agent sessions — IMPLEMENTED
 
@@ -518,7 +519,8 @@ and no terminal input (keystrokes, or focus events from switching to it) for
 over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
 and open time. CPU alone was tried first and misread working sessions as
 idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
-are touched in idle sessions too, so marina reads nothing under `~/.claude`.
+are touched in idle sessions too, so activity never comes from transcripts
+(their contents feed only the summaries under *Agent control*).
 
 **Terminal hosts** (`hosts.rs`): the multiplexer an agent's terminal lives
 in, when marina can drive it — herdr (matched by pid via `herdr pane
@@ -552,6 +554,58 @@ client) or else from a client process (a detached tmux server has none
 above it) — shown as `herdr·ghostty` in an agent row's VIA column, and
 raised by pid after the pane switch so the jump lands even from another
 window.
+
+**Agent control** (`transcript.rs`, `ui/control.rs`, `ui/agent_view.rs`):
+- *Summaries*: for a Claude Code session with a known id, the tail of
+  `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/<id>.jsonl` (256KB, widened
+  once to 4MB when the last reply is further back) gives the newest
+  `ai-title`, `last-prompt`, assistant text, an `away_summary` written after
+  it (recap), `pr-link`, and — when the newest message is an assistant
+  `tool_use` — the pending tool. Metadata records are skipped by their
+  leading `{"type":…` without parsing (request blobs are huge); sidechain
+  (subagent) records are ignored. Cached per session, re-read when the file
+  changes, at most every 2s. `[agents] transcripts = false` disables it.
+- *Preview* (`p`): the summary, or the session's live screen via
+  `herdr agent read --source visible` / `tmux capture-pane`, read
+  off-thread every 1.5s while open.
+- *Answering*: offered when the session is waiting (a host status is
+  trusted; otherwise the inference, or a screen read in the last ~3s
+  showing a dialog). `hosts::send` re-reads the screen at send time:
+  `y` sends Enter only when `highlighted_choice` starts with "Yes"; `n`
+  sends Esc only when `shows_dialog` (a `❯ 1.` row or "Enter to confirm"
+  in the bottom 14 rows) or herdr reports *blocked*; `r` sends Esc first
+  only then, then the prompt (`herdr agent prompt`, with a leading `-`
+  space-prefixed as herdr has no `--`; tmux `send-keys -l -- text` +
+  Enter). Screen reads carry a generation bumped on every send, so a read
+  in flight is dropped; the cached screen is dropped when the preview
+  closes or the selection moves. Arguments go as argv, never through a
+  shell. GUI terminals are never typed into.
+- *Waiting*, without a host status: `Agent::infer_waiting` — a turn under
+  way (`in_turn`: the newest user/assistant/system record is a prompt, a
+  tool result or a tool call, not the `system` record a turn ends with),
+  no shell child, and either no terminal output for over 5s or a Bash
+  call pending over 5s (an approved Bash call starts its shell at once;
+  Claude Code redraws a Bash prompt every couple of seconds). Claude Code
+  doesn't always flush a tool call before asking to run it, hence
+  `in_turn`. A thinking agent animates its screen; a running tool has a
+  child or a spinner.
+  It feeds `is_blocked`, so the inbox, notices and `y`/`n` use it.
+- *Unread*: `seen.json` in the state dir maps session id → the transcript
+  time last seen. A session is unread when its transcript's newest record
+  is newer and it isn't working; it's marked read when shown in the inbox
+  or preview detail, or jumped to. With no file, the first snapshot seeds
+  it, so a first run starts with everything read.
+- *Last active* is the transcript's newest record time when there is one —
+  terminal output misleads, as a multiplexer redrawing touches every pane.
+- *Inbox* (`a`): agents only, ordered by urgency (blocked, then herdr
+  *done* or unread as *new*, working, idle, stale) then most recently
+  active; drawn as grouped
+  two-line cards (idle split into *recent* < 1h and *earlier*) beside the
+  selected session's detail (stacked under 120 columns). The detail — also
+  the `p` preview — is a fixed context header (state, task, repo / branch /
+  changes, shells and servers, PR, a waiting banner) over a scrollable
+  body: *you asked*, *status* (recap), *<agent> said* (reply, markdown), or
+  the live screen pinned to its bottom.
 
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with

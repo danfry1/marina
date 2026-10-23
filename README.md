@@ -83,6 +83,32 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
+- **Inbox** (`a`) — a mail-client view of every agent session. On the left,
+  cards grouped by what wants you (*needs you, new, working, recent,
+  earlier, stale*): a status dot, the project, its task, how long ago it
+  last said anything, and one line on what it's doing or last said.
+  Sessions that said something since you last looked are *new* (bold, like
+  unread mail) until you view them in the inbox or preview, or jump to them;
+  what you've read is kept in `~/.local/state/marina/seen.json`. On the
+  right, the selected session: how full its context window is, repo,
+  branch and uncommitted changes, what it's running, its PR, then *you asked*, Claude's *status* recap and its
+  full reply (`[` `]` or the wheel to scroll). `p` flips that pane to the
+  session's live screen (herdr and tmux panes).
+- **Preview** (`p`) — the same session detail under the project view.
+- **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
+  a session counts as waiting when a turn is under way in its transcript
+  (your prompt or a tool call with no end-of-turn record after it) yet
+  nothing is running — no shell, a still screen, or a Bash call whose
+  command never started: an approval prompt or a question. Notices say what it wants:
+  `claude·api needs you: wants to run Bash: cargo publish`, and finished
+  ones what it said.
+- **Answer from marina** — on a herdr or tmux session: `y` approves what
+  it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
+  dialog first). Each re-reads the session's screen at the moment of
+  sending: `y` sends Enter only if the highlighted choice is a *Yes*
+  (Claude Code's folder-trust prompt highlights *No*), and `n` sends Esc
+  only if a dialog is up, so neither can interrupt a working agent. Only on your keystroke, only to the selected session, and
+  never into a GUI terminal window — `Enter` jumps there instead.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
   and `D` opens the uncommitted diff (stat, untracked files, patch) in the
@@ -161,6 +187,9 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
 | `Enter` | fold / unfold a group · on an agent row: jump to its pane |
 | `D` | uncommitted diff of the selected agent's / server's work tree |
+| `a` | inbox: every agent session, what needs you first |
+| `p` | preview an agent: last prompt, recap and reply · again: its live screen |
+| `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -271,6 +300,10 @@ match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 [notify]
 desktop = false                # no desktop notifications at all
 agents  = false                # no "finished" / "needs you" agent notices
+
+[agents]
+transcripts = false            # don't read Claude Code transcript tails
+                               # (preview, inbox, agents --long)
 ```
 
 ## Privacy & security
@@ -309,6 +342,15 @@ marina is deliberately boring on this front:
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
+- **Agent transcripts and screens.** For the preview, the inbox and
+  `marina agents --long/--json`, marina reads the *tail* of each running
+  Claude Code session's transcript (`~/.claude/projects/*/<session>.jsonl`;
+  the last 256KB, more only if the last reply is further back): its title,
+  your last prompt, its last reply and recap, a pending tool call, and a PR
+  link. Nothing else from `~/.claude` is read — never credentials or
+  settings — and nothing is written or sent anywhere. `[agents] transcripts
+  = false` turns this off. The live screen of a herdr/tmux pane is read
+  (`herdr agent read`, `tmux capture-pane`) only while its preview is open.
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
   `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
@@ -316,7 +358,9 @@ marina is deliberately boring on this front:
   classification and captured for `restart`, and never leaves the process.
 - **Outbound actions are only the ones you trigger:** `O` opens a URL in your
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
-  `Enter` on an agent asks its multiplexer or terminal app to focus it. The one unprompted
+  `Enter` on an agent asks its multiplexer or terminal app to focus it,
+  and `y` / `n` / `r` on an agent send that keystroke or your reply to its
+  herdr/tmux pane (`herdr agent send-keys` / `prompt`, `tmux send-keys`). The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind, finishes, or needs you (`[notify] desktop = false` disables it).
 

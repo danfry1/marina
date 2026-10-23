@@ -8,7 +8,8 @@
 //!   marina free <port>… [--json] stop whatever dev target holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
 //!   marina port --list | --release [name]
-//!   marina agents [sel]… [--json] running coding-agent sessions + their shells
+//!   marina agents [sel]… [--json|--long] running coding-agent sessions, their
+//!                                  shells, and what each last said
 //!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
@@ -54,6 +55,9 @@ USAGE:
     marina port --list           show assigned ports
     marina port --release [name] give this project's port back
     marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
+                     [--long]        … and what each last said: recap, last
+                                     prompt and reply, what it's waiting on
+                                     (with --json: the `summary` field)
     marina version               print the version
 
 SELECTOR:
@@ -84,7 +88,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if let Some(bad) = flags.iter().find(|f| {
         !matches!(
             **f,
-            "--json" | "--mine" | "--orphaned" | "--list" | "--release"
+            "--json" | "--mine" | "--orphaned" | "--list" | "--release" | "--long"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -110,6 +114,10 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         return Some(2);
     }
     let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
+    if flags.contains(&"--long") && cmd != "agents" {
+        eprintln!("marina: --long only applies to `marina agents`");
+        return Some(2);
+    }
     if (list || release) && cmd != "port" {
         eprintln!("marina: --list / --release only apply to `marina port`");
         return Some(2);
@@ -122,7 +130,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
-        "agents" => agents(&selectors, json),
+        "agents" => agents(&selectors, json, flags.contains(&"--long")),
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -298,7 +306,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn agents(selectors: &[&str], json: bool) -> i32 {
+fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
     let snap = snapshot(true);
     let picked: Vec<&Agent> = snap
         .agents
@@ -308,7 +316,14 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
     if json {
         let view: Vec<AgentJson> = picked
             .iter()
-            .map(|a| AgentJson::new(a, &servers_of(&snap, a)))
+            .map(|a| {
+                let mut j = AgentJson::new(a, &servers_of(&snap, a));
+                if !long {
+                    // conversation text only when asked for
+                    j.summary = None;
+                }
+                j
+            })
             .collect();
         match serde_json::to_string_pretty(&view) {
             Ok(s) => println!("{s}"),
@@ -323,6 +338,10 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
     if picked.is_empty() {
         println!("no agent sessions running");
         return if selectors.is_empty() { 0 } else { 1 };
+    }
+    if long {
+        print_long(&snap, picked);
+        return 0;
     }
     let pw = picked
         .iter()
@@ -381,6 +400,75 @@ fn agents(selectors: &[&str], json: bool) -> i32 {
         );
     }
     0
+}
+
+/// `--long`: each session, what wants you first, with what it last said.
+fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
+    let now = now_secs();
+    picked.sort_by_key(|a| (a.urgency(now), std::cmp::Reverse(a.last_active())));
+    let field = |k: &str, v: &str, lines: usize| {
+        let mut out = v.lines().map(str::trim).filter(|l| !l.is_empty());
+        if let Some(first) = out.next() {
+            println!("  {k:<8}{first}");
+            for l in out.take(lines.saturating_sub(1)) {
+                println!("  {:<8}{l}", "");
+            }
+        }
+    };
+    for (i, a) in picked.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let state = match a.urgency(now) {
+            0 => "NEEDS YOU".to_string(),
+            1 => "done".to_string(),
+            _ => a.activity(now),
+        };
+        let place = a
+            .host
+            .as_ref()
+            .map(|h| h.short())
+            .unwrap_or_else(|| "no terminal".into());
+        let git = a.git.map(|g| format!(" {}", g.short())).unwrap_or_default();
+        println!(
+            "{}·{}  {state} · {place} · {}{git}{}",
+            a.name,
+            a.project,
+            crate::ui::tildify(&a.cwd.display().to_string()),
+            a.session
+                .as_deref()
+                .map(|s| format!(" · {}", crate::launcher::short_id(s, 8)))
+                .unwrap_or_default(),
+        );
+        if let Some(t) = a.title() {
+            println!("  {t}");
+        }
+        let servers: Vec<String> = servers_of(snap, a)
+            .iter()
+            .flat_map(|t| t.ports.iter().map(|p| format!(":{p}")))
+            .collect();
+        if !servers.is_empty() {
+            field("servers", &servers.join(" "), 1);
+        }
+        let Some(s) = &a.summary else {
+            continue;
+        };
+        if let Some(t) = a.pending_tool().filter(|_| a.is_blocked()) {
+            field("waiting", &format!("to run {t}"), 1);
+        }
+        if let Some(r) = &s.recap {
+            field("recap", r, 3);
+        }
+        if let Some(p) = &s.last_prompt {
+            field("you", p, 2);
+        }
+        if let Some(r) = &s.last_reply {
+            field("reply", r, 4);
+        }
+        if let Some(pr) = &s.pr_url {
+            field("pr", pr, 1);
+        }
+    }
 }
 
 /// `chrome-devtools-mcp ×19 785MB, mobile-mcp ×2 90MB` — the first `n`.
@@ -1108,6 +1196,22 @@ struct AgentJson {
     git: Option<GitJson>,
     /// Stale, no servers, and a clean, pushed tree.
     looks_finished: bool,
+    /// What it last said, from its transcript (Claude Code): only with
+    /// `--long`, since it carries conversation text; `null` otherwise.
+    summary: Option<SummaryJson>,
+}
+
+#[derive(Serialize)]
+struct SummaryJson {
+    last_prompt: Option<String>,
+    last_reply: Option<String>,
+    /// Claude's own recap of the session, when written after the last reply.
+    recap: Option<String>,
+    /// A tool call with no result yet: running, or awaiting approval.
+    pending_tool: Option<String>,
+    pr_url: Option<String>,
+    /// Seconds since its transcript last recorded anything.
+    updated_secs_ago: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1204,6 +1308,14 @@ impl AgentJson {
                 behind: g.behind,
             }),
             looks_finished: a.looks_finished(now, servers.len()),
+            summary: a.summary.as_ref().map(|s| SummaryJson {
+                last_prompt: s.last_prompt.clone(),
+                last_reply: s.last_reply.clone(),
+                recap: s.recap.clone(),
+                pending_tool: s.pending_tool.clone(),
+                pr_url: s.pr_url.clone(),
+                updated_secs_ago: s.updated.map(|u| now.saturating_sub(u)),
+            }),
         }
     }
 }
@@ -1414,10 +1526,11 @@ mod tests {
             "host",
             "git",
             "looks_finished",
+            "summary",
         ] {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
-        assert_eq!(obj.len(), 19);
+        assert_eq!(obj.len(), 20);
         assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
         assert_eq!(j["shells"][0]["command"], "cargo test");
         assert_eq!(j["servers"][0]["ports"][0], 3000);

@@ -1,7 +1,7 @@
 [package]
 # crates.io package id (the name `marina` is taken); the binary stays `marina`.
 name = "marina-tui"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
 license = "Apache-2.0"

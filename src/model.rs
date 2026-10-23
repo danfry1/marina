@@ -93,6 +93,14 @@ pub struct Agent {
     /// The session's task title from the agent itself (opencode), when no
     /// host reports one.
     pub title: Option<String>,
+    /// What the session last said, from its transcript (Claude Code).
+    pub summary: Option<crate::transcript::Summary>,
+    /// Inferred, for sessions no host reports on: a turn is under way (its
+    /// transcript ends in your prompt, or a tool call or result, not the
+    /// record a turn ends with), yet nothing runs — no shell, a still screen.
+    /// A thinking agent animates its screen and a running tool has a child
+    /// or a spinner; this is an approval prompt or a question to the human.
+    pub waiting: bool,
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -156,12 +164,43 @@ impl Agent {
         }
     }
 
-    /// The session's task title: the host's (herdr), else the agent's own.
+    /// How much it wants you, for the inbox: 0 waiting on you, 1 finished
+    /// (herdr's *done*), 2 working, 3 idle, 4 stale.
+    pub fn urgency(&self, now: u64) -> u8 {
+        if self.is_blocked() {
+            0
+        } else if self.host_status() == Some(HostStatus::Done) {
+            1
+        } else if self.is_working(now) {
+            2
+        } else if self.is_stale(now) {
+            4
+        } else {
+            3
+        }
+    }
+
+    /// Unix seconds it last did anything: when its transcript last
+    /// recorded something, else its terminal's last output. (Terminal
+    /// output alone misleads: a multiplexer redrawing every pane touches
+    /// them all at once.) While working, now-ish either way.
+    pub fn last_active(&self) -> u64 {
+        let tty = self.tty.map(|t| t.output).unwrap_or(0);
+        match self.summary.as_ref().and_then(|s| s.updated) {
+            Some(said) if self.shells().next().is_none() => said,
+            Some(said) => said.max(tty),
+            None => tty,
+        }
+    }
+
+    /// The session's task title: the host's (herdr), else the agent's own,
+    /// else its transcript's.
     pub fn title(&self) -> Option<&str> {
         self.host
             .as_ref()
             .and_then(|h| h.title.as_deref())
             .or(self.title.as_deref())
+            .or(self.summary.as_ref().and_then(|s| s.title.as_deref()))
     }
 
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
@@ -193,13 +232,50 @@ impl Agent {
         self.tty.map(|t| t.input).unwrap_or(self.start_time)
     }
 
-    fn host_status(&self) -> Option<HostStatus> {
+    pub fn host_status(&self) -> Option<HostStatus> {
         self.host.as_ref().and_then(|h| h.status)
     }
 
     /// Waiting on a human: an approval prompt or a question (host-reported).
     pub fn is_blocked(&self) -> bool {
-        self.host_status() == Some(HostStatus::Blocked)
+        match self.host_status() {
+            Some(st) => st == HostStatus::Blocked,
+            None => self.waiting,
+        }
+    }
+
+    /// The pending tool call, with paths inside its directory made relative:
+    /// `Write: hello.txt` rather than the whole absolute path.
+    pub fn pending_tool(&self) -> Option<String> {
+        let t = self.summary.as_ref()?.pending_tool.as_deref()?;
+        let dir = format!("{}/", self.cwd.display());
+        Some(t.replace(&dir, ""))
+    }
+
+    /// Set `waiting` (see there) as of `now`.
+    pub fn infer_waiting(&mut self, now: u64) {
+        let Some(s) = self
+            .summary
+            .as_ref()
+            .filter(|s| s.pending_tool.is_some() || s.in_turn)
+        else {
+            self.waiting = false;
+            return;
+        };
+        let idle = self.host_status().is_none() && self.shells().next().is_none();
+        let still = self
+            .tty
+            .is_some_and(|t| now.saturating_sub(t.output) > WORKING_OUTPUT_SECS);
+        // An approved Bash call starts its shell at once, so one pending for
+        // a few seconds with no shell is at its prompt — whose screen
+        // Claude Code keeps redrawing, so "still" can't tell.
+        let bash_unstarted = s
+            .pending_tool
+            .as_deref()
+            .is_some_and(|t| t.starts_with("Bash:"))
+            && s.pending_since
+                .is_some_and(|at| now.saturating_sub(at) > WORKING_OUTPUT_SECS);
+        self.waiting = idle && self.tty.is_some() && (still || bash_unstarted);
     }
 
     /// Not working, and its terminal has had no input for over a day —
@@ -269,6 +345,8 @@ impl Agent {
             host: None,
             git: None,
             title: None,
+            summary: None,
+            waiting: false,
         }
     }
 }
@@ -427,6 +505,45 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pending_tool_with_nothing_running_is_waiting() {
+        use crate::sources::TtyActivity;
+        let mut a = Agent::sample(1, "aaaa", "x");
+        a.children.retain(|c| !c.shell); // no shell running
+        a.summary = Some(crate::transcript::Summary {
+            pending_tool: Some("Bash: cargo publish".into()),
+            ..Default::default()
+        });
+        a.tty = Some(TtyActivity {
+            output: 100,
+            input: 100,
+        });
+        a.infer_waiting(103);
+        assert!(!a.waiting, "the screen moved 3s ago: still running");
+        // a Bash prompt keeps redrawing, but its command never started
+        a.summary.as_mut().unwrap().pending_since = Some(90);
+        a.tty = Some(TtyActivity {
+            output: 119,
+            input: 100,
+        });
+        a.infer_waiting(120);
+        assert!(a.waiting, "Bash pending 30s with no shell");
+        a.summary.as_mut().unwrap().pending_since = None;
+        a.tty = Some(TtyActivity {
+            output: 100,
+            input: 100,
+        });
+        a.infer_waiting(120);
+        assert!(a.waiting && a.is_blocked() && a.urgency(120) == 0);
+        a.summary.as_mut().unwrap().pending_tool = None;
+        a.infer_waiting(120);
+        assert!(!a.waiting, "nothing pending");
+        a.summary.as_mut().unwrap().pending_tool = Some("Bash: sleep 60".into());
+        a.children = Agent::sample(1, "aaaa", "x").children; // its shell runs
+        a.infer_waiting(120);
+        assert!(!a.waiting, "a running command isn't a question");
+    }
+
     #[test]
     fn repeated_helpers_total_copies_across_sessions() {
         let mut a = Agent::sample(1, "aaaa", "x");

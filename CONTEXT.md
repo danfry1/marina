@@ -112,6 +112,16 @@
   WezTerm). Jump target, and for herdr a source of the session's status
   (including *blocked*) and task title.
 
+- **Summary** — what a Claude Code session last said, from the tail of its
+  transcript: title, last prompt, last reply, recap, pending tool, PR link.
+  Shown in the preview, the inbox and `marina agents --long/--json`.
+
+- **Inbox** — the view of all agent sessions ordered by *urgency*: waiting
+  on you, new (said something you haven't seen), working, idle, stale.
+
+- **Unread** — a session whose transcript has news since you last viewed
+  it in marina.
+
 - **Looks finished** — an agent session that is stale, has no live servers,
   and whose work tree is clean and pushed: the safest one to close.
 

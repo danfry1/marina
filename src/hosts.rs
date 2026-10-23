@@ -577,6 +577,190 @@ pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
     }
 }
 
+/// Something to send to a session from marina — only ever on an explicit
+/// keystroke on that session's row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Send {
+    /// Accept the highlighted option of the dialog it's waiting on.
+    Approve,
+    /// Dismiss the dialog (Claude Code: "No, and tell Claude what to do").
+    Reject,
+    /// Submit a prompt; dismisses a waiting dialog first.
+    Reply(String),
+}
+
+impl HostKind {
+    /// Hosts marina can read a session's screen from and type into.
+    pub fn interactive(self) -> bool {
+        matches!(self, HostKind::Herdr | HostKind::Tmux)
+    }
+}
+
+/// The last `lines` rows of the session's screen, from its multiplexer.
+pub fn read_screen(host: &HostInfo, lines: usize) -> Option<Vec<String>> {
+    let n = lines.to_string();
+    let text = match host.kind {
+        HostKind::Herdr => run(
+            "herdr",
+            &[
+                "agent",
+                "read",
+                &host.target,
+                "--source",
+                "visible",
+                "--lines",
+                &n,
+            ],
+        )?,
+        HostKind::Tmux => run("tmux", &["capture-pane", "-p", "-t", &host.target])?,
+        _ => return None,
+    };
+    let mut rows: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    while rows.last().is_some_and(|l| l.is_empty()) {
+        rows.pop();
+    }
+    let skip = rows.len().saturating_sub(lines);
+    Some(rows.split_off(skip))
+}
+
+/// Does the screen show an approval or question dialog *now*? Only the
+/// bottom rows count (a dialog sits at the bottom; the same words higher up
+/// are old output), and it needs a choice row: a numbered option under the
+/// cursor (`❯ 1.`), or a picker's "Enter to confirm".
+pub fn shows_dialog(screen: &[String]) -> bool {
+    let bottom: Vec<&str> = screen
+        .iter()
+        .map(|l| l.trim_start())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(14)
+        .collect();
+    bottom.iter().any(|t| t.contains("Enter to confirm"))
+        || bottom.iter().any(|t| {
+            t.strip_prefix('❯')
+                .map(str::trim_start)
+                .is_some_and(|c| c.starts_with("1."))
+        })
+}
+
+/// The dialog choice under the cursor, without its number: `Yes`,
+/// `No, exit`. The cursor line is `❯ <choice>` followed by more indented
+/// choices or numbered — unlike the input prompt's `❯ `.
+pub fn highlighted_choice(screen: &[String]) -> Option<String> {
+    let numbered = |t: &str| {
+        let d = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        d.len() < t.len() && d.starts_with(". ")
+    };
+    screen.iter().enumerate().rev().find_map(|(i, l)| {
+        let t = l.trim_start().strip_prefix('❯')?.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let next_is_choice = screen[i + 1..]
+            .iter()
+            .find(|n| !n.trim().is_empty())
+            .is_some_and(|n| n.starts_with("  ") && !n.trim_start().starts_with('─'));
+        if !(numbered(t) || next_is_choice) {
+            return None;
+        }
+        let choice = if numbered(t) {
+            t.split_once(". ").map(|x| x.1).unwrap_or(t)
+        } else {
+            t
+        };
+        Some(choice.trim().to_string())
+    })
+}
+
+/// Approving sends Enter, which picks the highlighted choice: only do it
+/// when that choice is a yes. (Claude Code's folder-trust prompt, for one,
+/// highlights "No, exit".)
+fn approvable(screen: &[String]) -> Result<(), String> {
+    match highlighted_choice(screen) {
+        Some(c) if c.to_lowercase().starts_with("yes") => Ok(()),
+        Some(c) => Err(format!(
+            "not approving: the highlighted choice is \"{c}\" — answer it there (Enter jumps) or with r"
+        )),
+        None => Err("no choice is highlighted on its screen — nothing to approve".into()),
+    }
+}
+
+/// Send `what` to the session. Its screen is read again first, so nothing
+/// acts on a stale view: approve only when the highlighted choice is a yes,
+/// reject only when a dialog is up (or herdr says it's blocked), and a
+/// reply dismisses a dialog first only when one is up.
+pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
+    let t = host.target.as_str();
+    let ok = |o: Option<String>, what: &str| {
+        o.map(|_| format!("{what} → {}", host.describe()))
+            .ok_or_else(|| format!("{} didn't take it", host.kind.name()))
+    };
+    let screen = read_screen(host, 40).ok_or("couldn't read its screen")?;
+    let dialog = shows_dialog(&screen) || host.status == Some(HostStatus::Blocked);
+    match what {
+        Send::Approve => approvable(&screen)?,
+        Send::Reject if !dialog => {
+            return Err(
+                "no dialog on its screen now — not sending Esc (it would interrupt the agent)"
+                    .into(),
+            )
+        }
+        _ => {}
+    }
+    match (host.kind, what) {
+        (HostKind::Herdr, Send::Approve) => ok(
+            run("herdr", &["agent", "send-keys", t, "enter"]),
+            "approved",
+        ),
+        (HostKind::Herdr, Send::Reject) => {
+            ok(run("herdr", &["agent", "send-keys", t, "esc"]), "rejected")
+        }
+        (HostKind::Herdr, Send::Reply(text)) => {
+            // herdr's parser has no `--`: keep a leading dash from reading
+            // as a flag
+            let text = if text.starts_with('-') {
+                format!(" {text}")
+            } else {
+                text.clone()
+            };
+            if dialog {
+                run("herdr", &["agent", "send-keys", t, "esc"])
+                    .ok_or("herdr couldn't dismiss the dialog")?;
+            }
+            // herdr refuses a prompt while it still sees the dialog; give
+            // the agent a moment to leave it
+            for _ in 0..6 {
+                if let Some(o) = run("herdr", &["agent", "prompt", t, &text]) {
+                    return ok(Some(o), "sent");
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Err("herdr didn't accept the prompt (is the agent still at a dialog?)".into())
+        }
+        (HostKind::Tmux, Send::Approve) => {
+            ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "approved")
+        }
+        (HostKind::Tmux, Send::Reject) => {
+            ok(run("tmux", &["send-keys", "-t", t, "Escape"]), "rejected")
+        }
+        (HostKind::Tmux, Send::Reply(text)) => {
+            if dialog {
+                run("tmux", &["send-keys", "-t", t, "Escape"])
+                    .ok_or("tmux couldn't dismiss the dialog")?;
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            // literal text, then Enter as a key
+            run("tmux", &["send-keys", "-t", t, "-l", "--", text])
+                .ok_or("tmux didn't take the text")?;
+            ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "sent")
+        }
+        _ => Err(format!(
+            "marina can't type into {} — only herdr and tmux panes",
+            host.describe()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +892,48 @@ mod tests {
             None,
             "no tty, nothing to match"
         );
+    }
+
+    #[test]
+    fn recognises_dialogs_on_screen() {
+        let screen = |t: &str| t.lines().map(String::from).collect::<Vec<_>>();
+        assert!(shows_dialog(&screen(
+            " Bash command\n   cargo publish\n Do you want to proceed?\n ❯ 1. Yes\n   2. No"
+        )));
+        assert!(shows_dialog(&screen(
+            "Which one?\n❯ 1. Commit it\n  2. Pause"
+        )));
+        assert!(!shows_dialog(&screen("⏺ Done.\n❯ \n  auto mode on")));
+        let trust = screen(
+            " Quick safety check: Is this a project you trust?\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel",
+        );
+        assert!(shows_dialog(&trust));
+        assert_eq!(highlighted_choice(&trust).as_deref(), Some("No, exit"));
+        assert!(approvable(&trust).is_err(), "Enter would pick No");
+        let perm =
+            screen(" Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No");
+        assert_eq!(highlighted_choice(&perm).as_deref(), Some("Yes"));
+        assert!(approvable(&perm).is_ok());
+        let prompt = screen("⏺ Done.\n──────\n❯ Try \"how does x work?\"\n──────\n  repo on main");
+        assert_eq!(
+            highlighted_choice(&prompt),
+            None,
+            "the input box isn't a choice"
+        );
+        let ghostty = HostInfo {
+            kind: HostKind::Ghostty,
+            target: "/x".into(),
+            status: None,
+            title: None,
+            session: None,
+            app_pid: None,
+            outer: None,
+        };
+        assert!(
+            send(&ghostty, &Send::Approve).is_err(),
+            "never types into a GUI terminal"
+        );
+        assert!(read_screen(&ghostty, 10).is_none());
     }
 
     #[test]

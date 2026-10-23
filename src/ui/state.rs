@@ -144,7 +144,9 @@ pub struct App {
     /// Per agent pid: (started, last seen) working, unix seconds.
     agent_streaks: HashMap<u32, (u64, u64)>,
     /// Agents already reported as waiting on a question.
-    agent_blocked: HashSet<u32>,
+    /// Agents already reported as waiting, and on what (the pending tool
+    /// call): a flicker in the waiting signal doesn't repeat the notice.
+    agent_blocked: HashMap<u32, String>,
     /// Messages for a desktop notification, drained by the main loop.
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
@@ -170,6 +172,8 @@ pub struct App {
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
+    /// Preview, reply box and inbox (`ui::control`).
+    pub(crate) ctl: super::control::Control,
     /// PROJECT column width at the last render (it grows with the pane).
     pub(crate) project_w: u16,
     /// Recent cpu/mem per target and per agent session, for the inspect
@@ -197,7 +201,7 @@ impl App {
             agents_open: false,
             notify_agents: true,
             agent_streaks: HashMap::new(),
-            agent_blocked: HashSet::new(),
+            agent_blocked: HashMap::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -215,6 +219,7 @@ impl App {
             log_rect: None,
             header_hits: Vec::new(),
             project_w: 22,
+            ctl: Default::default(),
             history: HashMap::new(),
         }
     }
@@ -226,6 +231,8 @@ impl App {
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
         self.record_history();
+        self.update_seen();
+        self.drop_orphan_reply();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -293,7 +300,7 @@ impl App {
         let mut out = Vec::new();
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
         self.agent_streaks.retain(|pid, _| live.contains(pid));
-        self.agent_blocked.retain(|pid| live.contains(pid));
+        self.agent_blocked.retain(|pid, _| live.contains(pid));
         for a in &self.snapshot.agents {
             let label = self
                 .agent_session_of
@@ -301,13 +308,25 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| a.name.clone());
             if a.is_blocked() {
-                if self.agent_blocked.insert(a.pid) {
-                    out.push(format!("{label} needs you"));
+                let what = a
+                    .summary
+                    .as_ref()
+                    .map(|s| format!("{:?}@{:?}", s.pending_tool, s.pending_since))
+                    .unwrap_or_default();
+                if self.agent_blocked.get(&a.pid) != Some(&what) {
+                    self.agent_blocked.insert(a.pid, what);
+                    // say what it wants, so the notification is actionable
+                    match a.pending_tool() {
+                        Some(t) => {
+                            out.push(format!("{label} needs you: wants to run {}", clip(&t, 90)))
+                        }
+                        None => out.push(format!("{label} needs you")),
+                    }
                 }
                 self.agent_streaks.remove(&a.pid); // the question says it all
                 continue;
             }
-            self.agent_blocked.remove(&a.pid);
+            // kept until a different question comes: waiting can flicker
             if a.is_working(now) {
                 self.agent_streaks
                     .entry(a.pid)
@@ -317,8 +336,16 @@ impl App {
                 if now.saturating_sub(last) >= AGENT_QUIET {
                     self.agent_streaks.remove(&a.pid);
                     if last.saturating_sub(start) >= AGENT_WORK_MIN {
+                        let said = a
+                            .summary
+                            .as_ref()
+                            .and_then(|s| s.last_reply.as_deref())
+                            .map(|r| {
+                                format!(": {}", clip(&super::agent_view::first_sentence(r), 110))
+                            })
+                            .unwrap_or_default();
                         out.push(format!(
-                            "{label} finished after {}",
+                            "{label} finished after {}{said}",
                             super::format::fmt_age(last - start)
                         ));
                     }
@@ -725,7 +752,7 @@ impl App {
             })
     }
 
-    fn matches_agent(&self, a: &Agent) -> bool {
+    pub(crate) fn matches_agent(&self, a: &Agent) -> bool {
         if self.filter.is_empty() {
             return true;
         }
@@ -749,6 +776,10 @@ impl App {
     pub fn escape(&mut self) {
         if self.log.is_some() {
             self.close_log();
+        } else if self.ctl.preview.is_some() {
+            self.ctl.preview = None;
+            self.drop_screen();
+            self.dirty = true;
         } else if self.inspect {
             self.inspect = false;
             self.dirty = true;
@@ -865,6 +896,15 @@ impl App {
                     self.close_help();
                     return;
                 }
+                if self.ctl.inbox {
+                    // a card selects; the table geometry below doesn't apply
+                    if let Some(pid) = self.card_at(x, y) {
+                        self.selected = Some(Entry::Agent(pid));
+                        self.last_input = Instant::now();
+                        self.dirty = true;
+                    }
+                    return;
+                }
                 let t = self.table_rect;
                 if !rect_contains(t, x, y) {
                     return;
@@ -900,6 +940,8 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_up(3);
+                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
+                    self.detail_scroll_by(-3);
                 } else {
                     self.select_prev();
                 }
@@ -907,6 +949,8 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_down(3);
+                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
+                    self.detail_scroll_by(3);
                 } else {
                     self.select_next();
                 }
@@ -948,6 +992,9 @@ impl App {
     /// flatten to visible entries (collapsing folded groups). Volatile sorts
     /// freeze for `FREEZE` after a keystroke.
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
+        if self.ctl.inbox {
+            return self.inbox_entries(unix_now());
+        }
         let targets = &self.snapshot.targets;
         let agents = &self.snapshot.agents;
         let mut visible: Vec<usize> = (0..targets.len())
@@ -1273,6 +1320,15 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
+    }
+}
+
+/// `s` cut to `n` chars with `…`.
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
 }
 

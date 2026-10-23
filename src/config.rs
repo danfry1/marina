@@ -32,6 +32,10 @@
 //!
 //! [ports]
 //! range = [4100, 4999]  # where `marina port` assigns from (default 3100-3999)
+//!
+//! [agents]
+//! transcripts = false   # don't read the tail of Claude Code transcripts for
+//!                       # session previews and the inbox (default: true)
 //! ```
 
 use std::path::PathBuf;
@@ -54,6 +58,22 @@ pub struct ConfigFile {
     pub notify: NotifyCfg,
     #[serde(default)]
     pub ports: PortsCfg,
+    #[serde(default)]
+    pub agents: AgentsCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentsCfg {
+    /// Read the tail of Claude Code transcripts (`~/.claude/projects`) for
+    /// a session's last prompt, reply and recap.
+    #[serde(default = "yes")]
+    pub transcripts: bool,
+}
+
+impl Default for AgentsCfg {
+    fn default() -> Self {
+        AgentsCfg { transcripts: true }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -228,6 +248,10 @@ mod tests {
         assert!(!cfg.notify.desktop);
         let cfg: ConfigFile = toml::from_str("[notify]").unwrap();
         assert!(cfg.notify.desktop && cfg.notify.agents);
+        let cfg: ConfigFile = toml::from_str("").unwrap();
+        assert!(cfg.agents.transcripts, "on by default");
+        let cfg: ConfigFile = toml::from_str("[agents]\ntranscripts = false").unwrap();
+        assert!(!cfg.agents.transcripts);
         let cfg: ConfigFile = toml::from_str("[notify]\nagents = false").unwrap();
         assert!(cfg.notify.desktop && !cfg.notify.agents);
     }
