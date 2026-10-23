@@ -24,6 +24,8 @@ const TAIL: u64 = 256 * 1024;
 const TAIL_MAX: u64 = 4 * 1024 * 1024;
 /// A changed transcript is re-read at most this often.
 const MIN_REREAD: Duration = Duration::from_secs(2);
+/// opencode summaries come from a subprocess: this often at most.
+const OPENCODE_EVERY: Duration = Duration::from_secs(5);
 /// Kept per field: enough for a preview pane, bounded for `--json`.
 const MAX_TEXT: usize = 8_000;
 
@@ -87,7 +89,10 @@ pub fn parse_tail(text: &str) -> Summary {
         // metadata records lead with their type; skip the bulky ones
         // (request blobs run to hundreds of kilobytes) unparsed
         if let Some(t) = leading_type(line) {
-            if !matches!(t, "ai-title" | "last-prompt" | "pr-link" | "system") {
+            if !matches!(
+                t,
+                "ai-title" | "last-prompt" | "pr-link" | "system" | "user" | "assistant"
+            ) {
                 continue;
             }
         }
@@ -230,7 +235,7 @@ fn describe_tool(b: &Value) -> String {
 }
 
 /// `2026-10-20T21:48:59.114Z` -> unix seconds (UTC).
-fn parse_ts(ts: &str) -> Option<u64> {
+pub(crate) fn parse_ts(ts: &str) -> Option<u64> {
     let num = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
@@ -244,7 +249,7 @@ fn parse_ts(ts: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + mi * 60 + se).ok()
 }
 
-fn read_tail(path: &Path, bytes: u64) -> Option<String> {
+pub(crate) fn read_tail(path: &Path, bytes: u64) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(bytes);
@@ -291,6 +296,38 @@ fn summarize(path: &Path, prev: Option<&Summary>) -> Option<Summary> {
     })
 }
 
+/// Claude Code transcripts (top-level sessions, not subagents') written
+/// at or after `start` (unix seconds).
+pub fn written_since(start: u64) -> Vec<PathBuf> {
+    let Some(projects) = claude_dir().map(|d| d.join("projects")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for dir in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = f.path();
+            let fresh = f
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|d| d.as_secs() >= start);
+            let ok_name = p.extension().is_some_and(|x| x == "jsonl")
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(crate::launcher::is_session_id);
+            if fresh && ok_name {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// The first `cwd` a transcript records: where its session started.
 fn first_cwd(path: &Path) -> Option<PathBuf> {
     let f = std::fs::File::open(path).ok()?;
@@ -300,6 +337,162 @@ fn first_cwd(path: &Path) -> Option<PathBuf> {
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find_map(|v| v["cwd"].as_str().map(PathBuf::from))
+}
+
+/// Codex: the tail of its rollout (`~/.codex/sessions/…/rollout-…-<id>.jsonl`)
+/// and the `session_meta` line it starts with (for the working directory).
+pub fn parse_codex(meta: &str, tail: &str) -> Summary {
+    let mut s = Summary::default();
+    let mut turn_known = false;
+    for line in tail.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if s.updated.is_none() {
+            s.updated = v["timestamp"].as_str().and_then(parse_ts);
+        }
+        let p = &v["payload"];
+        match (v["type"].as_str(), p["type"].as_str()) {
+            (Some("event_msg"), Some("task_complete")) => {
+                if !turn_known {
+                    turn_known = true;
+                    s.in_turn = false;
+                }
+                if s.last_reply.is_none() {
+                    s.last_reply = text_of(&p["last_agent_message"]);
+                }
+            }
+            (Some("event_msg"), Some("task_started")) if !turn_known => {
+                turn_known = true;
+                s.in_turn = true;
+            }
+            (Some("event_msg"), Some("user_message")) => {
+                if !turn_known {
+                    turn_known = true;
+                    s.in_turn = true;
+                }
+                if s.last_prompt.is_none() {
+                    s.last_prompt = text_of(&p["message"]);
+                }
+            }
+            (Some("event_msg"), Some("token_count")) if s.context_tokens.is_none() => {
+                s.context_tokens = p["info"]["last_token_usage"]["input_tokens"].as_u64();
+            }
+            (Some("response_item"), Some("message"))
+                if p["role"] == "assistant" && s.last_reply.is_none() =>
+            {
+                let text: Vec<&str> = p["content"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect();
+                if !text.is_empty() {
+                    s.last_reply = Some(clip(text.join("\n\n").trim()));
+                }
+            }
+            _ => {}
+        }
+        if turn_known
+            && s.last_reply.is_some()
+            && s.last_prompt.is_some()
+            && s.context_tokens.is_some()
+        {
+            break;
+        }
+    }
+    if let Some(m) = meta
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str::<Value>(l).ok())
+    {
+        s.cwd = m["payload"]["cwd"].as_str().map(PathBuf::from);
+        s.model = text_of(&m["payload"]["model_provider"]);
+    }
+    s
+}
+
+/// opencode: `opencode session export <id>` JSON.
+pub fn parse_opencode(json: &str) -> Option<Summary> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let info = &v["info"];
+    let mut s = Summary {
+        title: text_of(&info["title"]),
+        updated: info["time"]["updated"].as_u64().map(|ms| ms / 1000),
+        ..Default::default()
+    };
+    let t = &info["tokens"];
+    let n = ["input"].iter().filter_map(|k| t[*k].as_u64()).sum::<u64>()
+        + t["cache"]["read"].as_u64().unwrap_or(0)
+        + t["cache"]["write"].as_u64().unwrap_or(0);
+    s.context_tokens = (n > 0).then_some(n);
+    let mut turn_known = false;
+    for m in v["messages"].as_array()?.iter().rev() {
+        match m["type"].as_str() {
+            Some("idle") if !turn_known => {
+                turn_known = true;
+                s.in_turn = false;
+            }
+            Some("user") => {
+                if !turn_known {
+                    turn_known = true;
+                    s.in_turn = true;
+                }
+                if s.last_prompt.is_none() {
+                    s.last_prompt = text_of(&m["text"]);
+                }
+            }
+            Some("assistant") if s.last_reply.is_none() => {
+                let text: Vec<&str> = m["content"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|c| c["type"] == "text")
+                    .filter_map(|c| c["text"].as_str())
+                    .collect();
+                if !text.is_empty() {
+                    s.last_reply = Some(clip(text.join("\n\n").trim()));
+                }
+            }
+            _ => {}
+        }
+        if turn_known && s.last_reply.is_some() && s.last_prompt.is_some() {
+            break;
+        }
+    }
+    Some(s)
+}
+
+fn read_head(path: &Path, bytes: u64) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`): the rollout whose
+/// name ends in `-<id>.jsonl`.
+fn find_codex(id: &str) -> Option<PathBuf> {
+    let root = match std::env::var_os("CODEX_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".codex"),
+    }
+    .join("sessions");
+    let suffix = format!("-{id}.jsonl");
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.to_string_lossy().ends_with(&suffix) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn claude_dir() -> Option<PathBuf> {
@@ -348,6 +541,66 @@ impl Cache {
             Entry {
                 path,
                 stamp,
+                read_at: Instant::now(),
+                summary: summary.clone(),
+            },
+        );
+        Some(summary)
+    }
+
+    /// The summary of Codex thread `id`, from its rollout file.
+    pub fn get_codex(&mut self, id: &str) -> Option<Summary> {
+        if !crate::launcher::is_session_id(id) {
+            return None;
+        }
+        let path = match self.entries.get(id) {
+            Some(e) => e.path.clone(),
+            None => find_codex(id)?,
+        };
+        let meta = std::fs::metadata(&path).ok()?;
+        let stamp = (meta.modified().ok()?, meta.len());
+        if let Some(e) = self.entries.get(id) {
+            if e.stamp == stamp || e.read_at.elapsed() < MIN_REREAD {
+                return Some(e.summary.clone());
+            }
+        }
+        let summary = parse_codex(&read_head(&path, 256 * 1024)?, &read_tail(&path, TAIL)?);
+        self.entries.insert(
+            id.to_string(),
+            Entry {
+                path,
+                stamp,
+                read_at: Instant::now(),
+                summary: summary.clone(),
+            },
+        );
+        Some(summary)
+    }
+
+    /// The summary of opencode session `id`, from `opencode session export`
+    /// (only while its background service runs — it would start one
+    /// otherwise). At most every few seconds per session.
+    pub fn get_opencode(&mut self, id: &str, service_running: bool) -> Option<Summary> {
+        if !crate::launcher::is_session_id(id) {
+            return None;
+        }
+        if let Some(e) = self.entries.get(id) {
+            if !service_running || e.read_at.elapsed() < OPENCODE_EVERY {
+                return Some(e.summary.clone());
+            }
+        }
+        if !service_running {
+            return None;
+        }
+        let mut cmd = std::process::Command::new("opencode");
+        cmd.args(["session", "export", id]);
+        let json = crate::exec::output(cmd, Duration::from_secs(3))?;
+        let summary = parse_opencode(&json)?;
+        self.entries.insert(
+            id.to_string(),
+            Entry {
+                path: PathBuf::new(),
+                stamp: (SystemTime::UNIX_EPOCH, 0),
                 read_at: Instant::now(),
                 summary: summary.clone(),
             },
@@ -571,6 +824,38 @@ mod tests {
             s.in_turn && s.pending_tool.is_none(),
             "asked, nothing flushed since"
         );
+    }
+
+    #[test]
+    fn codex_rollouts_and_opencode_exports_summarise_too() {
+        let meta = r#"{"timestamp":"2026-10-18T10:53:10.697Z","type":"session_meta","payload":{"id":"t1","cwd":"/Users/me/dev/app","model_provider":"openai"}}"#;
+        let tail = [
+            r#"{"timestamp":"2026-10-18T11:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"make it rain"}}"#,
+            r#"{"timestamp":"2026-10-18T11:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done — it rains."}]}}"#,
+            r#"{"timestamp":"2026-10-18T11:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":130773}}}}"#,
+            r#"{"timestamp":"2026-10-18T11:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done — it rains."}}"#,
+        ]
+        .join("\n");
+        let s = parse_codex(meta, &tail);
+        assert_eq!(s.last_prompt.as_deref(), Some("make it rain"));
+        assert_eq!(s.last_reply.as_deref(), Some("Done — it rains."));
+        assert_eq!(s.context_tokens, Some(130_773));
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/me/dev/app")));
+        assert!(!s.in_turn, "task complete");
+
+        let oc = r#"{"info":{"title":"Test run","time":{"updated":1792747187517},
+            "tokens":{"input":9374,"cache":{"read":896,"write":0}}},
+          "messages":[
+            {"type":"user","text":"test"},
+            {"type":"assistant","content":[{"type":"reasoning","text":"hmm"},{"type":"text","text":"Hi! What should I test?"}]},
+            {"type":"idle","outcome":"succeeded"}]}"#;
+        let s = parse_opencode(oc).unwrap();
+        assert_eq!(s.title.as_deref(), Some("Test run"));
+        assert_eq!(s.last_reply.as_deref(), Some("Hi! What should I test?"));
+        assert_eq!(s.last_prompt.as_deref(), Some("test"));
+        assert_eq!(s.context_tokens, Some(10_270));
+        assert!(!s.in_turn);
+        assert!(parse_opencode("nope").is_none());
     }
 
     #[test]

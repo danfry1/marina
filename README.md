@@ -122,6 +122,15 @@ developer-process-centric.
   uncommitted work or servers it leaves running. The inbox lists sessions
   that exited in the last two days under *ended*; `Enter` resumes one
   (`claude --resume <id>`) the same way `N` starts one.
+- **Daily digest** — `marina digest [today|24h|3d]` summarises your agents'
+  work per project: sessions, time spent in turns, tokens used, commits
+  made in the repo, PRs opened, and each session's latest recap — a
+  standup in one command (`--json` for scripts).
+- **Every agent's conversation** — Claude Code sessions are summarised
+  from their transcripts, Codex sessions from their rollout files
+  (`~/.codex/sessions`), and opencode sessions from its background service
+  (`opencode session export`), so the inbox and preview work the same for
+  each.
 - **Quick replies** — `1`–`9` on a session open the reply box with a canned
   reply (`commit it`, `push it`, `run the tests`, `continue` — set your own
   with `[agents] quick`); Enter sends it.
@@ -245,6 +254,8 @@ marina port --list            # every assigned port · --release [name] gives on
 marina agents [sel…] [--json] # agent sessions: shells, helpers, servers, resume command
 marina agents --long          # …and what each last said, what needs you first
 marina jump <session>         # focus a session's terminal (id, pid or project)
+marina digest today           # what your agents did: per project, time working,
+                              # tokens, commits, PRs, latest recaps (or 24h, 3d)
 marina watch --install        # background notices at login (--status, --uninstall)
 marina version
 ```
@@ -372,12 +383,15 @@ marina is deliberately boring on this front:
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
-- **Agent transcripts and screens.** For the preview, the inbox and
-  `marina agents --long/--json`, marina reads the *tail* of each running
-  Claude Code session's transcript (`~/.claude/projects/*/<session>.jsonl`;
+- **Agent transcripts and screens.** For the preview, the inbox,
+  `marina digest` and `marina agents --long/--json`, marina reads the
+  *tail* of each Claude Code session's transcript (`~/.claude/projects/*/<session>.jsonl`;
   the last 256KB, more only if the last reply is further back): its title,
   your last prompt, its last reply and recap, a pending tool call, and a PR
-  link. Nothing else from `~/.claude` is read — never credentials or
+  link (the digest also reads turn durations and token counts). Codex
+  rollouts under `~/.codex/sessions` are read the same way, and opencode
+  summaries come from `opencode session export` while its service runs.
+  Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts
   = false` turns this off. The live screen of a herdr/tmux pane is read
   (`herdr agent read`, `tmux capture-pane`) only while its preview is open.

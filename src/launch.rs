@@ -16,6 +16,17 @@ use serde::Deserialize;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// herdr's per-pane variables, which must not leak into sessions started
+/// outside herdr.
+const HERDR_VARS: [&str; 6] = [
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_SOCKET_PATH",
+    "HERDR_ENV",
+    "HERDR_BIN_PATH",
+];
+
 /// What to start.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Launch {
@@ -311,21 +322,18 @@ fn open(dir: &Path, agent: &str, args: &[String], place: Place) -> Result<(), St
                 cmd.push(' ');
                 cmd.push_str(&sh_quote_for(a, fish));
             }
-            run(
-                "tmux",
-                &[
-                    "new-window",
-                    "-c",
-                    &d,
-                    "-n",
-                    &label,
-                    "--",
-                    &shell,
-                    "-lc",
-                    &cmd,
-                ],
-                TIMEOUT,
-            )?;
+            // without herdr's variables: a tmux server started inside a herdr
+            // pane hands them down, and the agent's hooks would then report
+            // to that pane as if it were the session there
+            let mut argv: Vec<String> = ["new-window", "-c", &d, "-n", &label, "--", "env"]
+                .map(String::from)
+                .to_vec();
+            for k in HERDR_VARS {
+                argv.extend(["-u".to_string(), k.to_string()]);
+            }
+            argv.extend([shell, "-lc".into(), cmd]);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            run("tmux", &argv, TIMEOUT)?;
         }
         Place::Ghostty | Place::Terminal | Place::ITerm => {
             let line = shell_line(dir, agent, args, user_shell_is_fish());

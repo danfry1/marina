@@ -344,8 +344,20 @@ impl Sampler {
                     .clone();
             }
             if let Some(tc) = self.transcripts.as_mut() {
-                for a in agents.iter_mut().filter(|a| a.name == "claude") {
-                    a.summary = a.session.as_deref().and_then(|id| tc.get(id));
+                let oc_service = procs.values().any(|p| {
+                    crate::launcher::agent_service(&p.argv) == Some("opencode")
+                        && p.argv.iter().any(|a| a == "--service")
+                });
+                for a in agents.iter_mut() {
+                    let Some(id) = a.session.clone() else {
+                        continue;
+                    };
+                    a.summary = match a.name.as_str() {
+                        "claude" => tc.get(&id),
+                        "codex" => tc.get_codex(&id),
+                        "opencode" => tc.get_opencode(&id, oc_service),
+                        _ => None,
+                    };
                 }
                 let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
                 tc.retain(&live);
