@@ -178,6 +178,8 @@ fn run(
                             KeyCode::Enter if app.selected_agent().is_some() => {
                                 verb_jump(app, &ev_tx)
                             }
+                            // a fold row (inbox): show / hide what's behind it
+                            KeyCode::Enter if app.toggle_fold() => {}
                             // an ended session (inbox): resume it
                             KeyCode::Enter if app.is_ended_selected() => {
                                 if let Some((req, place)) = app.resume_selected() {

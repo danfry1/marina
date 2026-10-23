@@ -94,6 +94,8 @@ pub(crate) enum Entry {
     Agents,
     /// Inbox: a session that has exited, by session id (Enter resumes it).
     Ended(String),
+    /// Inbox: the folded header of the parked (0) or ended (1) sessions.
+    Fold(u8),
 }
 
 pub(crate) struct LogView {
@@ -658,9 +660,11 @@ impl App {
                 .iter()
                 .filter(|t| &t.key == k)
                 .collect(),
-            Some(Entry::Agent(_)) | Some(Entry::Agents) | Some(Entry::Ended(_)) | None => {
-                Vec::new()
-            }
+            Some(Entry::Agent(_))
+            | Some(Entry::Agents)
+            | Some(Entry::Ended(_))
+            | Some(Entry::Fold(_))
+            | None => Vec::new(),
         }
     }
 
@@ -680,6 +684,7 @@ impl App {
                 .unwrap_or_default(),
             Some(Entry::Agents) => "agent sessions".into(),
             Some(Entry::Ended(_)) => "ended session".into(),
+            Some(Entry::Fold(_)) => String::new(),
             None => String::new(),
         }
     }
@@ -1245,7 +1250,9 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
         Entry::Member(k) | Entry::Target(k) => Some(k),
-        Entry::Group(_) | Entry::Agent(_) | Entry::Agents | Entry::Ended(_) => None,
+        Entry::Group(_) | Entry::Agent(_) | Entry::Agents | Entry::Ended(_) | Entry::Fold(_) => {
+            None
+        }
     }
 }
 
@@ -1783,7 +1790,7 @@ mod tests {
         snap.targets.retain(|t| match &victim {
             Entry::Target(k) | Entry::Member(k) => &t.key != k,
             Entry::Group(p) => &t.project != p,
-            Entry::Agent(_) | Entry::Agents | Entry::Ended(_) => true,
+            Entry::Agent(_) | Entry::Agents | Entry::Ended(_) | Entry::Fold(_) => true,
         });
         app.apply(Arc::new(snap));
         app.reconcile();

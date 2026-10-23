@@ -83,19 +83,19 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
-- **Inbox** — a mail-client view of every agent session, where marina
-  opens when agents are running (`a` switches to the servers view). On the left,
-  cards grouped by what wants you (*needs you, new, recent, earlier,
-  stale*), ordered by when each last finished a turn so cards don't move
-  while you read: a status dot (◐ working), the project, its task, how long
-  ago it finished, and one line on what it's doing or last said.
-  Sessions that said something since you last looked are *new* (bold, like
-  unread mail) until you view them in the inbox or preview, or jump to them;
-  what you've read is kept in `~/.local/state/marina/seen.json`. On the
-  right, the selected session: how full its context window is, repo,
-  branch and uncommitted changes, what it's running, its PR, then *you asked*, Claude's *status* recap and its
-  full reply (`[` `]` or the wheel to scroll). `p` flips that pane to the
-  session's live screen (herdr and tmux panes).
+- **Inbox** — where marina opens when agents are running (`a` switches to
+  the servers view), organised by what each session needs from you:
+  *needs you* (an approval or a question is up), *your turn* (it finished
+  and asks you something — "Want me to commit it all now?"), *working*,
+  and, folded away, *parked* (finished, nothing asked) and *ended*
+  (exited lately; Enter resumes one). One line per session says what it
+  wants, from Claude's own "Next…" recap or the question its reply ends
+  with. Sessions with something new are bold until you look; the order
+  only changes when a session finishes, and holds still while you browse.
+  The detail beside it leads with *your turn* and *what it did*, then one
+  line of context (directory, branch and changes, PR, servers, shared
+  tree, context size) and the full conversation (`[` `]` to scroll); `p`
+  switches it to the session's live screen (herdr and tmux panes).
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
   a session counts as waiting when a turn is under way in its transcript

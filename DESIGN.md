@@ -597,18 +597,16 @@ window.
   it, so a first run starts with everything read.
 - *Last active* is the transcript's newest record time when there is one —
   terminal output misleads, as a multiplexer redrawing touches every pane.
-- *Inbox* (`a`): agents only, ordered by urgency (needs you, then herdr
-  *done* or unread as *new*, the rest, stale) then by when each last
-  finished a turn (`Agent::settled_at`, from `turn_duration` /
-  `task_complete`), so a session doesn't move while it works — its ◐ dot
-  and *now* say it's working. The order holds for 8s after a keypress
-  (`INBOX_HOLD`) so rows don't move under the cursor; drawn as grouped
-  two-line cards (idle split into *recent* < 1h and *earlier*) beside the
-  selected session's detail (stacked under 120 columns). The detail — also
-  the `p` preview — is a fixed context header (state, task, repo / branch /
-  changes, shells and servers, PR, a waiting banner) over a scrollable
-  body: *you asked*, *status* (recap), *<agent> said* (reply, markdown), or
-  the live screen pinned to its bottom.
+- *Inbox* (`a`): groups by `App::inbox_urgency` — needs you (waiting),
+  your turn (not working, and `Summary::ask` within 3 days, herdr *done*,
+  or unread), working, parked (folded, `Entry::Fold(0)`), then ended
+  (folded, `Entry::Fold(1)`); a filter unfolds both. Within a group,
+  newest finished turn first (`Agent::settled_at`); the order holds for 8s
+  after a keypress. `Summary::ask` is the recap's "Next…" sentence, else
+  the question (with the sentence before it when short) or instruction to
+  you that the reply ends with; `Summary::did` is the recap before that,
+  else the reply's first sentence. Rows are one line: what's asked,
+  running, or (parked) the title.
 
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
 every 2s and sends the same notices (`App::take_notifications`) as desktop

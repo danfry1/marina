@@ -137,7 +137,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // a mail client: cards on the left, the selected session on the
         // right; stacked when the terminal is narrow
         let (list, detail) = if table_area.width >= 120 {
-            let w = (table_area.width * 2 / 5).clamp(56, 80);
+            // the list carries the asks now: give it half
+            let w = (table_area.width / 2).clamp(60, 110);
             let c =
                 Layout::horizontal([Constraint::Length(w), Constraint::Min(40)]).split(table_area);
             (c[0], c[1])
@@ -694,7 +695,7 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
         },
         Entry::Agents => agents_section_row(app),
         // only the inbox lists these, and draws its own rows
-        Entry::Ended(_) => Row::new(Vec::<Cell>::new()),
+        Entry::Ended(_) | Entry::Fold(_) => Row::new(Vec::<Cell>::new()),
     }
 }
 

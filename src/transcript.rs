@@ -63,6 +63,121 @@ pub struct Summary {
     pub turn_ended: Option<u64>,
 }
 
+/// Sentences of `text`, markdown marks dropped: split at `.`/`?`/`!`
+/// followed by a space or line end, and at paragraph breaks.
+fn sentences(text: &str) -> Vec<String> {
+    let plain = text.replace("**", "").replace(['*', '`'], "");
+    let mut out = Vec::new();
+    for para in plain.split("\n\n") {
+        let para = para.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut cur = String::new();
+        let chars: Vec<char> = para.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            cur.push(c);
+            let end =
+                matches!(c, '.' | '?' | '!') && chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+            if end {
+                let t = cur.trim().to_string();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+                cur.clear();
+            }
+        }
+        let t = cur.trim().trim_end_matches(':').to_string();
+        if !t.is_empty() {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Imperatives addressed to the human that end a reply: "Say push when…".
+const ASKING: [&str; 14] = [
+    "Say ",
+    "Just say",
+    "Tell me",
+    "Send ",
+    "Let me know",
+    "Reply ",
+    "Pick ",
+    "Choose ",
+    "Confirm ",
+    "Approve ",
+    "Decide ",
+    "Open ",
+    "Run ",
+    "Try ",
+];
+
+impl Summary {
+    /// What the session wants from you, in a line: the "Next…" of Claude's
+    /// recap, else the question (or instruction to you) its reply ends with.
+    /// `None` when it's just reporting.
+    pub fn ask(&self) -> Option<String> {
+        if let Some(r) = &self.recap {
+            let lower = r.to_lowercase();
+            if lower.contains("nothing is pending") || lower.contains("nothing needed") {
+                return None;
+            }
+            for s in sentences(r) {
+                for p in ["Next step:", "Next up:", "Next is ", "Next:", "Next,"] {
+                    if let Some(rest) = s.strip_prefix(p) {
+                        let rest = rest
+                            .trim()
+                            .trim_end_matches("(disable recaps in /config)")
+                            .trim();
+                        if !rest.is_empty() {
+                            return Some(capitalize(rest));
+                        }
+                    }
+                }
+            }
+        }
+        let reply = self.last_reply.as_deref()?;
+        let last_para = reply.trim_end().rsplit("\n\n").next().unwrap_or(reply);
+        let ss = sentences(last_para);
+        let last = ss.last()?;
+        if last.ends_with('?') {
+            // "Shall I begin?" alone says little: add what it's about,
+            // question first so it scans
+            if last.chars().count() < 45 && ss.len() > 1 {
+                return Some(format!("{last} — {}", ss[ss.len() - 2]));
+            }
+            return Some(last.clone());
+        }
+        ss.iter()
+            .rev()
+            .take(2)
+            .find(|s| ASKING.iter().any(|p| s.starts_with(p)))
+            .cloned()
+    }
+
+    /// What it did, in a line or two: the recap before its "Next…", else
+    /// the reply's opening sentence.
+    pub fn did(&self) -> Option<String> {
+        if let Some(r) = &self.recap {
+            let before: Vec<String> = sentences(r)
+                .into_iter()
+                .take_while(|s| !s.starts_with("Next"))
+                .take(2)
+                .collect();
+            if !before.is_empty() {
+                return Some(before.join(" "));
+            }
+        }
+        sentences(self.last_reply.as_deref()?).into_iter().next()
+    }
+}
+
 /// A Claude Code session that has exited but could be resumed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ended {
@@ -909,6 +1024,71 @@ mod tests {
         );
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_ask_and_what_it_did_come_from_recaps_and_replies() {
+        let recap = |r: &str| Summary {
+            recap: Some(r.into()),
+            ..Default::default()
+        };
+        let reply = |r: &str| Summary {
+            last_reply: Some(r.into()),
+            ..Default::default()
+        };
+        let s = recap("Releasing astrotime 0.13.0; it's unpublished. Next: say whether I should retry now, or raise the limit.");
+        assert_eq!(
+            s.ask().as_deref(),
+            Some("Say whether I should retry now, or raise the limit.")
+        );
+        assert_eq!(
+            s.did().as_deref(),
+            Some("Releasing astrotime 0.13.0; it's unpublished.")
+        );
+        let s =
+            recap("The polish is in PR #26. Next is your call on merging #26 or trying it first.");
+        assert_eq!(
+            s.ask().as_deref(),
+            Some("Your call on merging #26 or trying it first.")
+        );
+        let s = recap("Four tricks are live. Next step: tell me whether to draft the post.");
+        assert_eq!(
+            s.ask().as_deref(),
+            Some("Tell me whether to draft the post.")
+        );
+        let s = recap("No task yet. Next, send the task you want. (disable recaps in /config)");
+        assert_eq!(s.ask().as_deref(), Some("Send the task you want."));
+        assert_eq!(
+            recap("All merged. Nothing is pending, so the next session can start fresh.").ask(),
+            None
+        );
+
+        let s =
+            reply("Build 7 is live.\n\nNothing is committed yet. Want me to commit it all now?");
+        assert_eq!(
+            s.ask().as_deref(),
+            Some("Want me to commit it all now? — Nothing is committed yet.")
+        );
+        let s = reply("Plan below.\n\nI'd start with a **design doc**. Shall I begin?");
+        assert_eq!(
+            s.ask().as_deref(),
+            Some("Shall I begin? — I'd start with a design doc.")
+        );
+        let s = reply(
+            "The grid is done. Say \"push\" when you want them shipped, or tell me what to change.",
+        );
+        assert!(s.ask().unwrap().starts_with("Say \"push\""));
+        assert_eq!(
+            reply("I stopped the dev server and deleted the branch.").ask(),
+            None,
+            "just reporting"
+        );
+        assert_eq!(
+            reply("I stopped the dev server.\n\nMore below.")
+                .did()
+                .as_deref(),
+            Some("I stopped the dev server.")
+        );
     }
 
     #[test]

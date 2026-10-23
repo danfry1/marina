@@ -21,27 +21,23 @@ use crate::model::Agent;
 const KEY: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
-/// The inbox's groups, by urgency (unread replies count as new) and how
-/// recently it was active.
+/// The inbox's groups (see `App::inbox_urgency`).
 fn group_of(app: &App, a: &Agent, now: u64) -> &'static str {
     match app.inbox_urgency(a, now) {
         0 => "NEEDS YOU",
-        1 => "NEW",
-        4 => "STALE",
-        _ if now.saturating_sub(a.settled_at()) < 3600 => "RECENT",
-        _ => "EARLIER",
+        1 => "YOUR TURN",
+        2 => "WORKING",
+        _ => "PARKED",
     }
 }
 
-/// `●` coloured by state: red needs you, cyan new, yellow working.
+/// The state dot: red needs you, cyan your turn, yellow working, grey parked.
 fn dot(app: &App, a: &Agent, now: u64) -> Span<'static> {
     let (c, color) = match app.inbox_urgency(a, now) {
         0 => ("●", Color::Red),
-        _ if a.is_working(now) => ("◐", Color::Yellow),
         1 => ("●", Color::Cyan),
         2 => ("◐", Color::Yellow),
-        4 => ("·", Color::DarkGray),
-        _ => ("○", Color::Gray),
+        _ => ("○", Color::DarkGray),
     };
     Span::styled(c, Style::new().fg(color).add_modifier(Modifier::BOLD))
 }
@@ -60,28 +56,41 @@ fn short_label(app: &App, a: &Agent) -> String {
     }
 }
 
-/// One line on what it's doing or last said.
-fn gist(app: &App, a: &Agent, now: u64) -> String {
+/// The one line a card says: what it wants from you, what it's running,
+/// or (parked) what it's about.
+fn row_text(app: &App, a: &Agent, now: u64) -> String {
     let s = a.summary.as_ref();
-    if app.waiting_on_you(a) {
-        return match a.pending_tool() {
-            Some(t) => format!("wants to run {t}"),
-            None => "is asking you something".into(),
-        };
-    }
-    if a.is_working(now) {
-        let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
-        if !shells.is_empty() {
-            return format!("running {}", shells.join(", "));
+    match app.inbox_urgency(a, now) {
+        0 => match a.pending_tool() {
+            Some(t) => format!("approve: {t}"),
+            None => match s.and_then(|s| s.ask()) {
+                Some(q) => format!("answer: {q}"),
+                None => "is asking you something — p to see it".into(),
+            },
+        },
+        2 => {
+            let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+            if !shells.is_empty() {
+                format!("$ {}", shells.join(", "))
+            } else if let Some(t) = a.pending_tool() {
+                t
+            } else {
+                a.title()
+                    .map(String::from)
+                    .unwrap_or_else(|| "working".into())
+            }
         }
-        if let Some(t) = a.pending_tool() {
-            return format!("running {t}");
-        }
+        1 => s
+            .and_then(|s| s.ask())
+            .or_else(|| s.and_then(|s| s.did()))
+            .or_else(|| a.title().map(String::from))
+            .unwrap_or_default(),
+        _ => a
+            .title()
+            .map(String::from)
+            .or_else(|| s.and_then(|s| s.did()))
+            .unwrap_or_default(),
     }
-    s.and_then(|s| s.recap.as_deref())
-        .map(first_sentence)
-        .or_else(|| s.and_then(|s| s.last_reply.as_deref()).map(first_sentence))
-        .unwrap_or_default()
 }
 
 pub(crate) fn first_sentence(s: &str) -> String {
@@ -103,189 +112,193 @@ fn clip(s: &str, w: usize) -> String {
     }
 }
 
-/// The inbox list: grouped two-line cards. Records each card's rows for
-/// mouse hits, and keeps the selection in view.
+/// The inbox list: one line per session under what-to-do headings, parked
+/// and ended sessions folded behind a row each. Records each row for mouse
+/// hits, and keeps the selection in view.
 pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.ctl.list_rect = area;
     let now = unix_now();
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     let selected = app.selected.clone();
-    // (line, entry) per row; headings and gaps have none
+    let hi = Style::new().bg(Color::Indexed(236));
     let mut rows: Vec<(Line<'static>, Option<Entry>)> = Vec::new();
     let mut group = "";
-    let pids: Vec<u32> = app
-        .display
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Agent(p) => Some(*p),
-            _ => None,
-        })
-        .collect();
-    for pid in pids {
-        let Some(a) = app.snapshot.agents.iter().find(|a| a.pid == pid) else {
-            continue;
-        };
-        let g = group_of(app, a, now);
-        if g != group {
-            if !group.is_empty() {
-                rows.push((Line::raw(""), None));
-            }
-            let n = app
-                .snapshot
-                .agents
-                .iter()
-                .filter(|x| {
-                    app.display.contains(&Entry::Agent(x.pid)) && group_of(app, x, now) == g
-                })
-                .count();
-            let style = if g == "NEEDS YOU" {
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                KEY
-            };
-            rows.push((Line::styled(format!(" {g} · {n}"), style), None));
-            group = g;
-        }
-        let sel = selected == Some(Entry::Agent(pid));
-        let label = short_label(app, a);
-        // a working session is active now; otherwise when it last finished
-        let ago = match a.settled_at() {
-            _ if a.is_working(now) => "now".to_string(),
-            0 => String::new(),
-            t => fmt_age(now.saturating_sub(t)),
-        };
-        let title = a.title().unwrap_or("").to_string();
-        // line 1: ● label  title ……… ago
-        // ⇄N: N other sessions share its work tree
-        let mates = app.tree_mates(a);
-        let share = if mates.is_empty() {
-            String::new()
-        } else {
-            format!(" ⇄{}", mates.len())
-        };
-        let clash = a.is_working(now) && mates.iter().any(|m| m.is_working(now));
-        let share_style = Style::new().fg(if clash { Color::Red } else { Color::Yellow });
-        let fixed = 4 + label.chars().count() + share.chars().count() + 2 + ago.chars().count() + 1;
-        let title = clip(&title, inner_w.saturating_sub(fixed));
-        let pad = inner_w.saturating_sub(fixed + title.chars().count());
-        let bar = if sel { "▌" } else { " " };
-        let label_style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
-        // unread: the title stands out, like an unread email's subject
-        let title_style = if app.is_unread(a, now) {
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Gray)
-        };
-        let l1 = Line::from(vec![
-            Span::styled(bar, Style::new().fg(Color::Magenta)),
+    // one session per line: ▌ ● label  text ……… age
+    let line = |sel: bool,
+                dot: Span<'static>,
+                label: String,
+                label_style: Style,
+                text: String,
+                text_style: Style,
+                age: String| {
+        let fixed = 4 + label.chars().count() + 2 + age.chars().count() + 1;
+        // a space before the age, always
+        let text = clip(&text, inner_w.saturating_sub(fixed + 1));
+        let pad = inner_w.saturating_sub(fixed + text.chars().count());
+        let l = Line::from(vec![
+            Span::styled(if sel { "▌" } else { " " }, Style::new().fg(Color::Magenta)),
             Span::raw(" "),
-            dot(app, a, now),
+            dot,
             Span::raw(" "),
             Span::styled(label, label_style),
-            Span::styled(share, share_style),
             Span::raw("  "),
-            Span::styled(title, title_style),
+            Span::styled(text, text_style),
             Span::raw(" ".repeat(pad)),
-            Span::styled(ago, DIM),
+            Span::styled(age, DIM),
             Span::raw(" "),
         ]);
-        let g2 = clip(&gist(app, a, now), inner_w.saturating_sub(5));
-        let gist_style = if app.waiting_on_you(a) {
-            Style::new().fg(Color::Red)
+        if sel {
+            l.patch_style(hi)
         } else {
-            Style::new().fg(Color::Gray)
-        };
-        let l2 = Line::from(vec![
-            Span::styled(bar, Style::new().fg(Color::Magenta)),
-            Span::raw("   "),
-            Span::styled(g2, gist_style),
-        ]);
-        let (l1, l2) = if sel {
-            let hi = Style::new().bg(Color::Indexed(236));
-            (l1.patch_style(hi), l2.patch_style(hi))
-        } else {
-            (l1, l2)
-        };
-        rows.push((l1, Some(Entry::Agent(pid))));
-        rows.push((l2, Some(Entry::Agent(pid))));
-    }
-
-    // sessions that exited lately: dim cards, Enter resumes
-    let ended: Vec<&crate::transcript::Ended> = app
-        .display
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Ended(id) => app.snapshot.ended.iter().find(|x| &x.id == id),
-            _ => None,
-        })
-        .collect();
-    if !ended.is_empty() {
-        if !rows.is_empty() {
-            rows.push((Line::raw(""), None));
+            l
         }
-        rows.push((
-            Line::styled(format!(" ENDED · {} · Enter resumes", ended.len()), DIM),
-            None,
-        ));
-    }
-    for e in ended {
-        let entry = Entry::Ended(e.id.clone());
-        let sel = selected.as_ref() == Some(&entry);
-        let bar = if sel { "▌" } else { " " };
-        let label = e
-            .cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let ago = fmt_age(now.saturating_sub(e.at));
-        let title = e.summary.title.clone().unwrap_or_default();
-        let fixed = 4 + label.chars().count() + 2 + ago.chars().count() + 1;
-        let title = clip(&title, inner_w.saturating_sub(fixed));
-        let pad = inner_w.saturating_sub(fixed + title.chars().count());
-        let l1 = Line::from(vec![
-            Span::styled(bar, Style::new().fg(Color::Magenta)),
-            Span::styled(" ◌ ", DIM),
-            Span::styled(label, Style::new().fg(Color::Gray)),
-            Span::raw("  "),
-            Span::styled(title, DIM),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(ago, DIM),
-            Span::raw(" "),
-        ]);
-        let said = e
-            .summary
-            .recap
-            .as_deref()
-            .or(e.summary.last_reply.as_deref())
-            .map(first_sentence)
-            .unwrap_or_default();
-        let l2 = Line::from(vec![
-            Span::styled(bar, Style::new().fg(Color::Magenta)),
-            Span::raw("   "),
-            Span::styled(clip(&said, inner_w.saturating_sub(5)), DIM),
-        ]);
-        let (l1, l2) = if sel {
-            let hi = Style::new().bg(Color::Indexed(236));
-            (l1.patch_style(hi), l2.patch_style(hi))
-        } else {
-            (l1, l2)
-        };
-        rows.push((l1, Some(entry.clone())));
-        rows.push((l2, Some(entry)));
+    };
+    let entries = app.display.clone();
+    for e in &entries {
+        match e {
+            Entry::Agent(pid) => {
+                let Some(a) = app.snapshot.agents.iter().find(|a| a.pid == *pid) else {
+                    continue;
+                };
+                let g = group_of(app, a, now);
+                if g != group && g != "PARKED" {
+                    if !group.is_empty() {
+                        rows.push((Line::raw(""), None));
+                    }
+                    let n = entries
+                        .iter()
+                        .filter_map(|x| match x {
+                            Entry::Agent(p) => app.snapshot.agents.iter().find(|a| a.pid == *p),
+                            _ => None,
+                        })
+                        .filter(|x| group_of(app, x, now) == g)
+                        .count();
+                    let style = if g == "NEEDS YOU" {
+                        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else {
+                        KEY
+                    };
+                    rows.push((Line::styled(format!(" {g} · {n}"), style), None));
+                    group = g;
+                }
+                let urgency = app.inbox_urgency(a, now);
+                let age = if a.is_working(now) {
+                    "now".to_string()
+                } else {
+                    match a.settled_at() {
+                        0 => String::new(),
+                        t => fmt_age(now.saturating_sub(t)),
+                    }
+                };
+                let mates = app.tree_mates(a);
+                let mut label = short_label(app, a);
+                if !mates.is_empty() {
+                    label.push_str(&format!(" ⇄{}", mates.len()));
+                }
+                let label_style = if urgency == 3 {
+                    Style::new().fg(Color::Gray)
+                } else {
+                    Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                };
+                let text_style = match urgency {
+                    0 => Style::new().fg(Color::Red),
+                    1 if app.is_unread(a, now) => {
+                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                    }
+                    1 => Style::new().fg(Color::White),
+                    2 => Style::new().fg(Color::Yellow),
+                    _ => DIM,
+                };
+                let sel = selected.as_ref() == Some(e);
+                rows.push((
+                    line(
+                        sel,
+                        dot(app, a, now),
+                        label,
+                        label_style,
+                        row_text(app, a, now),
+                        text_style,
+                        age,
+                    ),
+                    Some(e.clone()),
+                ));
+            }
+            Entry::Fold(which) => {
+                let (name, n, open) = if *which == 0 {
+                    let n = app
+                        .snapshot
+                        .agents
+                        .iter()
+                        .filter(|a| app.matches_agent(a) && app.inbox_urgency(a, now) == 3)
+                        .count();
+                    ("PARKED", n, app.ctl.parked_open)
+                } else {
+                    ("ENDED", app.snapshot.ended.len(), app.ctl.ended_open)
+                };
+                if !rows.is_empty() {
+                    rows.push((Line::raw(""), None));
+                }
+                let what = match (*which, open) {
+                    (_, true) => "Enter hides".to_string(),
+                    (0, false) => "finished, nothing asked · Enter shows".to_string(),
+                    _ => "Enter shows · Enter on one resumes it".to_string(),
+                };
+                let sel = selected.as_ref() == Some(e);
+                let l = Line::from(vec![
+                    Span::styled(if sel { "▌" } else { " " }, Style::new().fg(Color::Magenta)),
+                    Span::styled(
+                        format!("{} {name} · {n}", if open { "▾" } else { "▸" }),
+                        DIM.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {what}"), DIM),
+                ]);
+                rows.push((if sel { l.patch_style(hi) } else { l }, Some(e.clone())));
+                group = "PARKED";
+            }
+            Entry::Ended(id) => {
+                let Some(x) = app.snapshot.ended.iter().find(|x| &x.id == id) else {
+                    continue;
+                };
+                let label = x
+                    .cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let text = x
+                    .summary
+                    .title
+                    .clone()
+                    .or_else(|| x.summary.did())
+                    .unwrap_or_default();
+                let sel = selected.as_ref() == Some(e);
+                rows.push((
+                    line(
+                        sel,
+                        Span::styled("◌", DIM),
+                        label,
+                        Style::new().fg(Color::Gray),
+                        text,
+                        DIM,
+                        fmt_age(now.saturating_sub(x.at)),
+                    ),
+                    Some(e.clone()),
+                ));
+            }
+            _ => {}
+        }
     }
 
-    // scroll so the selected card is visible
+    // scroll so the selected row is visible
     let sel_row = rows
         .iter()
         .position(|(_, e)| e.is_some() && *e == selected)
         .unwrap_or(0);
     let mut top = app.ctl.list_top.min(rows.len().saturating_sub(1));
     if sel_row < top {
-        // include the heading above a group's first card
-        top = sel_row.saturating_sub(1);
-    } else if sel_row + 2 > top + inner_h {
-        top = (sel_row + 2).saturating_sub(inner_h);
+        top = sel_row.saturating_sub(1); // with its heading
+    } else if sel_row + 1 > top + inner_h {
+        top = (sel_row + 1).saturating_sub(inner_h);
     }
     app.ctl.list_top = top;
     app.ctl.hits = rows
@@ -309,24 +322,19 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .filter(|a| app.inbox_urgency(a, now) == r)
                 .count()
         };
-        let working = app
-            .snapshot
-            .agents
-            .iter()
-            .filter(|a| a.is_working(now))
-            .count();
-        // only what's there, so it fits the column
         let mut parts: Vec<String> = Vec::new();
         for (n, what) in [
             (count(0), "need you"),
-            (count(1), "new"),
-            (working, "working"),
+            (count(1), "your turn"),
+            (count(2), "working"),
         ] {
             if n > 0 {
                 parts.push(format!("{n} {what}"));
             }
         }
-        parts.push(format!("{} sessions", app.snapshot.agents.len()));
+        if parts.is_empty() {
+            parts.push("nothing needs you".into());
+        }
         clip(
             &format!(" ▸ INBOX · servers (a) │ {} ", parts.join(" · ")),
             inner_w,
@@ -449,7 +457,7 @@ fn render_ended(frame: &mut Frame, app: &mut App, area: Rect, e: &crate::transcr
         format!(" {}", "─".repeat(w.saturating_sub(2))),
         DIM,
     ));
-    let body = summary_lines(&e.summary, "claude", w);
+    let body = summary_lines(&e.summary, "claude", w, true);
     let room = inner_h.saturating_sub(head.len());
     let max = body.len().saturating_sub(room);
     let offset = app.ctl.detail_scroll.min(max);
@@ -465,35 +473,30 @@ fn render_ended(frame: &mut Frame, app: &mut App, area: Rect, e: &crate::transcr
     app.ctl.detail_scroll = offset;
 }
 
-/// Who, what, where: always visible above the conversation.
+/// Who and where, then what's needed of you, what it did, and one line of
+/// context — always visible above the full conversation.
 fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
     let now = unix_now();
     let mut out = Vec::new();
-    let state = if app.waiting_on_you(a) {
-        Span::styled(
+    let urgency = app.inbox_urgency(a, now);
+    let state = match urgency {
+        0 => Span::styled(
             "needs you",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    } else if a.is_working(now) {
-        Span::styled(a.activity(now), Style::new().fg(Color::Yellow))
-    } else if a.summary.is_some() && a.last_active() > 0 {
-        // the same clock as its card: when it last said something
-        Span::styled(
-            format!("idle {}", fmt_age(now.saturating_sub(a.last_active()))),
+        ),
+        2 => Span::styled(a.activity(now), Style::new().fg(Color::Yellow)),
+        _ => Span::styled(
+            format!("idle {}", fmt_age(now.saturating_sub(a.settled_at()))),
             DIM,
-        )
-    } else {
-        Span::styled(a.activity(now), DIM)
+        ),
     };
-    let label = short_label(app, a);
     let place = a
         .host
         .as_ref()
         .map(|h| h.short())
         .unwrap_or_else(|| "no terminal".into());
     // a full context window degrades answers: nudge toward /clear
-    let tokens = a.summary.as_ref().and_then(|s| s.context_tokens);
-    let context = match tokens {
+    let context = match a.summary.as_ref().and_then(|s| s.context_tokens) {
         Some(n) if n >= 700_000 => Span::styled(
             format!(" · {}k context — time to /clear", n / 1000),
             Style::new().fg(Color::Red),
@@ -510,7 +513,7 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         dot(app, a, now),
         Span::raw(" "),
         Span::styled(
-            label,
+            short_label(app, a),
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", DIM),
@@ -524,85 +527,119 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
             Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         ));
     }
-    // repo, branch and what's changed
-    let branch = a.git_branch.clone().unwrap_or_else(|| "—".into());
-    let mut repo = vec![
-        Span::styled(" repo   ", KEY),
-        Span::raw(tildify(&a.cwd.display().to_string())),
-        Span::styled(format!(" · {branch}"), Style::new().fg(Color::Gray)),
-    ];
+    let s = a.summary.as_ref();
+    let section =
+        |out: &mut Vec<Line<'static>>, title: &str, color: Color, text: &str, style: Style| {
+            out.push(Line::raw(""));
+            out.push(Line::styled(
+                format!(" {title}"),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            for l in wrap(text, w.saturating_sub(3)).into_iter().take(5) {
+                out.push(Line::styled(format!("   {l}"), style));
+            }
+        };
+    let white = Style::new().fg(Color::White);
+    match urgency {
+        0 => {
+            let what = match a.pending_tool() {
+                Some(t) => format!("It wants to run {t}"),
+                None => s
+                    .and_then(|s| s.ask())
+                    .unwrap_or_else(|| "It's asking you something — p shows its screen".into()),
+            };
+            let keys = if a.host.as_ref().is_some_and(|h| h.kind.interactive()) {
+                "  —  y approve · n reject · r reply"
+            } else {
+                "  —  Enter to answer it there"
+            };
+            section(
+                &mut out,
+                "NEEDS YOU",
+                Color::Red,
+                &format!("{what}{keys}"),
+                white,
+            );
+        }
+        2 => {
+            let shells: Vec<String> = a.shells().map(|c| format!("$ {}", c.label)).collect();
+            let doing = if shells.is_empty() {
+                a.pending_tool().unwrap_or_else(|| "thinking".into())
+            } else {
+                shells.join(" · ")
+            };
+            section(&mut out, "WORKING", Color::Yellow, &doing, white);
+        }
+        _ => {
+            if let Some(ask) = s.and_then(|s| s.ask()) {
+                section(&mut out, "YOUR TURN", Color::Cyan, &ask, white);
+            }
+        }
+    }
+    if let Some(did) = s.and_then(|s| s.did()) {
+        if Some(&did) != s.and_then(|s| s.ask()).as_ref() {
+            section(
+                &mut out,
+                "WHAT IT DID",
+                Color::DarkGray,
+                &did,
+                Style::new().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+            );
+        }
+    }
+    // context, in one line: where, branch and changes, PR, servers, mates
+    out.push(Line::raw(""));
+    let mut meta: Vec<Span<'static>> = vec![Span::styled(
+        format!(" {}", tildify(&a.cwd.display().to_string())),
+        DIM,
+    )];
+    if let Some(b) = &a.git_branch {
+        meta.push(Span::styled(format!(" · {b}"), DIM));
+    }
     if let Some(g) = a.git {
         let style = if g.is_clean() {
             Style::new().fg(Color::Green)
         } else {
             Style::new().fg(Color::Yellow)
         };
-        repo.push(Span::styled(format!(" · {}", g.describe()), style));
+        meta.push(Span::styled(format!(" · {}", g.describe()), style));
     }
-    out.push(Line::from(repo));
-    // other sessions in the same work tree can overwrite its edits
-    let mates = app.tree_mates(a);
-    if !mates.is_empty() {
-        let names: Vec<String> = mates.iter().map(|m| short_label(app, m)).collect();
-        let clash = a.is_working(now) && mates.iter().any(|m| m.is_working(now));
-        let (lead, color) = if clash {
-            ("⚠ working alongside", Color::Red)
-        } else {
-            ("⇄ shares this tree with", Color::Yellow)
-        };
-        out.push(Line::styled(
-            clip(
-                &format!(
-                    " {lead} {} — a git worktree each keeps their edits apart",
-                    names.join(", ")
-                ),
-                w,
-            ),
-            Style::new().fg(color),
-        ));
+    if let Some(pr) = s.and_then(|s| s.pr_url.as_deref()) {
+        let short = pr
+            .rsplit_once("/pull/")
+            .map(|(_, n)| format!("PR #{n}"))
+            .unwrap_or_else(|| pr.to_string());
+        meta.push(Span::styled(format!(" · {short}"), DIM));
     }
-    // what it's running and where you can see it
     let servers: Vec<String> = app
         .agent_servers(a)
         .iter()
-        .map(|t| match t.ports.first() {
-            Some(p) => format!(":{p} {}", t.command_label),
-            None => t.command_label.clone(),
-        })
+        .filter_map(|t| t.ports.first().map(|p| format!(":{p}")))
         .collect();
-    let mut running: Vec<String> = a.shells().map(|c| format!("$ {}", c.label)).collect();
-    running.extend(servers);
-    if !running.is_empty() {
-        out.push(Line::from(vec![
-            Span::styled(" runs   ", KEY),
-            Span::raw(clip(&running.join(" · "), w.saturating_sub(8))),
-        ]));
-    }
-    if let Some(pr) = a.summary.as_ref().and_then(|s| s.pr_url.as_deref()) {
-        out.push(Line::from(vec![
-            Span::styled(" pr     ", KEY),
-            Span::raw(pr.to_string()),
-        ]));
-    }
-    if app.waiting_on_you(a) {
-        let what = a
-            .pending_tool()
-            .map(|t| format!(" to run {t}"))
-            .unwrap_or_default();
-        out.push(Line::styled(
-            format!(" ⚠ waiting on you{what} — y approve · n reject · r reply"),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+    if !servers.is_empty() {
+        meta.push(Span::styled(
+            format!(" · serving {}", servers.join(" ")),
+            DIM,
         ));
     }
-    // the canned replies on 1-9, where you'd reach for them
+    let mates = app.tree_mates(a);
+    if !mates.is_empty() {
+        let clash = a.is_working(now) && mates.iter().any(|m| m.is_working(now));
+        let names: Vec<String> = mates.iter().map(|m| short_label(app, m)).collect();
+        meta.push(Span::styled(
+            format!(" · ⇄ same tree as {}", names.join(", ")),
+            Style::new().fg(if clash { Color::Red } else { Color::Yellow }),
+        ));
+    }
+    out.push(Line::from(meta));
     if a.host.as_ref().is_some_and(|h| h.kind.interactive()) && !app.ctl.quick.is_empty() {
-        out.push(Line::from(vec![
-            Span::styled(" quick  ", KEY),
-            Span::styled(clip(&app.quick_hint(), w.saturating_sub(8)), DIM),
-        ]));
+        out.push(Line::styled(
+            format!(" quick: {}", clip(&app.quick_hint(), w.saturating_sub(8))),
+            DIM,
+        ));
     }
     out.push(Line::styled(
-        format!(" {}", "─".repeat(w.saturating_sub(2))),
+        format!(" ─ full conversation {}", "─".repeat(w.saturating_sub(22))),
         DIM,
     ));
     out
@@ -621,11 +658,17 @@ fn conversation_lines(a: &Agent, w: usize) -> Vec<Line<'static>> {
             DIM,
         )];
     };
-    summary_lines(s, &a.name, w)
+    // the recap is in the header ("what it did")
+    summary_lines(s, &a.name, w, false)
 }
 
 /// You asked / Status / <agent> said, from a transcript summary.
-fn summary_lines(s: &crate::transcript::Summary, agent: &str, w: usize) -> Vec<Line<'static>> {
+fn summary_lines(
+    s: &crate::transcript::Summary,
+    agent: &str,
+    w: usize,
+    with_recap: bool,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let section = |out: &mut Vec<Line<'static>>, title: &str| {
         if !out.is_empty() {
@@ -642,7 +685,7 @@ fn summary_lines(s: &crate::transcript::Summary, agent: &str, w: usize) -> Vec<L
             ));
         }
     }
-    if let Some(r) = &s.recap {
+    if let Some(r) = s.recap.as_ref().filter(|_| with_recap) {
         section(&mut out, "STATUS");
         for l in wrap(&plain(r), w.saturating_sub(3)) {
             out.push(Line::styled(

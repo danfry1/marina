@@ -530,7 +530,11 @@ fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
         let state = match a.urgency(now) {
             0 => "NEEDS YOU".to_string(),
             1 => "done".to_string(),
-            _ => a.activity(now),
+            2 => a.activity(now),
+            _ => match a.settled_at() {
+                0 => a.activity(now),
+                t => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t))),
+            },
         };
         let place = a
             .host
@@ -563,6 +567,9 @@ fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
         };
         if let Some(t) = a.pending_tool().filter(|_| a.is_blocked()) {
             field("waiting", &format!("to run {t}"), 1);
+        }
+        if let Some(ask) = s.ask() {
+            field("asks", &ask, 2);
         }
         if let Some(r) = &s.recap {
             field("recap", r, 3);
