@@ -378,6 +378,9 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
                 if !long {
                     // conversation text only when asked for
                     j.summary = None;
+                    for s in &mut j.subagents {
+                        s.said = None;
+                    }
                 }
                 j
             })
@@ -582,6 +585,16 @@ fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
             .collect();
         if !servers.is_empty() {
             field("servers", &servers.join(" "), 1);
+        }
+        // running ones, then the three most recently finished
+        let done = a.subagents.iter().filter(|s| !s.running).take(3);
+        for sub in a.subagents.iter().filter(|s| s.running).chain(done) {
+            let state = if sub.running {
+                sub.doing.clone().unwrap_or_else(|| "running".into())
+            } else {
+                "done".into()
+            };
+            field("spawned", &format!("{} — {state}", sub.task), 1);
         }
         let Some(s) = &a.summary else {
             continue;
@@ -1335,6 +1348,24 @@ struct AgentJson {
     /// What it last said, from its transcript (Claude Code): only with
     /// `--long`, since it carries conversation text; `null` otherwise.
     summary: Option<SummaryJson>,
+    /// Subagents it started (Claude Code's Agent tool, Codex threads):
+    /// running ones and those finished in the last half hour.
+    subagents: Vec<SubagentJson>,
+}
+
+#[derive(Serialize)]
+struct SubagentJson {
+    id: String,
+    task: String,
+    kind: Option<String>,
+    background: bool,
+    running: bool,
+    started_secs_ago: Option<u64>,
+    updated_secs_ago: u64,
+    /// The tool call it's on, while running.
+    doing: Option<String>,
+    /// What it last said: only with `--long`.
+    said: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1452,6 +1483,21 @@ impl AgentJson {
                 pr_url: s.pr_url.clone(),
                 updated_secs_ago: s.updated.map(|u| now.saturating_sub(u)),
             }),
+            subagents: a
+                .subagents
+                .iter()
+                .map(|s| SubagentJson {
+                    id: s.id.clone(),
+                    task: s.task.clone(),
+                    kind: s.kind.clone(),
+                    background: s.background,
+                    running: s.running,
+                    started_secs_ago: s.started.map(|t| now.saturating_sub(t)),
+                    updated_secs_ago: now.saturating_sub(s.updated),
+                    doing: s.doing.clone(),
+                    said: s.said.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -1663,10 +1709,11 @@ mod tests {
             "git",
             "looks_finished",
             "summary",
+            "subagents",
         ] {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
-        assert_eq!(obj.len(), 20);
+        assert_eq!(obj.len(), 21);
         assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
         assert_eq!(j["shells"][0]["command"], "cargo test");
         assert_eq!(j["servers"][0]["ports"][0], 3000);

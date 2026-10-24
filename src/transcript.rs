@@ -198,6 +198,12 @@ const ENDED_EVERY: Duration = Duration::from_secs(30);
 /// The transcript tail, newest record first. Lines are filtered by their
 /// type before parsing: request blobs can be hundreds of kilobytes each.
 pub fn parse_tail(text: &str) -> Summary {
+    parse_tail_of(text, false)
+}
+
+/// [`parse_tail`] of a session's own records, or (`sidechain`) of a
+/// subagent's transcript, whose records are all marked as its sidechain.
+fn parse_tail_of(text: &str, sidechain: bool) -> Summary {
     let mut s = Summary::default();
     // set once the newest message (assistant/user) has been seen
     let mut seen_message = false;
@@ -218,8 +224,8 @@ pub fn parse_tail(text: &str) -> Summary {
             continue; // the partial first line of the window, or garbage
         };
         let kind = v["type"].as_str();
-        if v["isSidechain"].as_bool() == Some(true) {
-            continue; // a subagent's turn
+        if v["isSidechain"].as_bool().unwrap_or(false) != sidechain {
+            continue; // a subagent's turn in the session's own transcript
         }
         if s.updated.is_none() {
             s.updated = v["timestamp"].as_str().and_then(parse_ts);
@@ -557,6 +563,80 @@ pub fn parse_codex(meta: &str, tail: &str) -> Summary {
     s
 }
 
+/// A subagent a session started: Claude Code's Agent tool, a Codex
+/// spawned thread. Its work happens inside the session's own process.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Subagent {
+    pub id: String,
+    /// What it was asked to do (Claude Code's description; Codex's
+    /// nickname, else its first prompt).
+    pub task: String,
+    /// `Explore`, `general-purpose`, a Codex role.
+    pub kind: Option<String>,
+    pub background: bool,
+    pub running: bool,
+    /// Unix seconds: its first and newest records.
+    pub started: Option<u64>,
+    pub updated: u64,
+    /// The tool call it's on, while running.
+    pub doing: Option<String>,
+    /// What it last said.
+    pub said: Option<String>,
+}
+
+/// A subagent nothing has been heard from this long isn't running, whatever
+/// its record says (its session was killed mid-turn).
+const SUBAGENT_STALE: u64 = 30 * 60;
+/// Finished subagents are listed this long after they last did something.
+const SUBAGENT_KEEP: u64 = 30 * 60;
+
+/// A Claude Code subagent from its `agent-<id>.meta.json` (`meta`) and the
+/// tail of its transcript: running until the meta says `finished`.
+pub fn parse_claude_subagent(
+    id: &str,
+    meta: &str,
+    tail: &str,
+    started: Option<u64>,
+    mtime: u64,
+    now: u64,
+) -> Subagent {
+    let m: Value = serde_json::from_str(meta).unwrap_or_default();
+    let s = parse_tail_of(tail, true);
+    let updated = s.updated.unwrap_or(mtime).max(mtime);
+    let running =
+        m["finished"].as_bool() != Some(true) && now.saturating_sub(updated) < SUBAGENT_STALE;
+    Subagent {
+        id: id.to_string(),
+        task: text_of(&m["description"])
+            .or(s.last_prompt.clone())
+            .unwrap_or_else(|| "subagent".into()),
+        kind: text_of(&m["agentType"]),
+        background: m["requestShape"] == "background",
+        running,
+        started,
+        updated,
+        doing: s.pending_tool.filter(|_| running),
+        said: s.last_reply,
+    }
+}
+
+/// The thread that spawned a Codex rollout, and the nickname and role it
+/// gave it.
+pub type Spawner = (String, Option<String>, Option<String>);
+
+/// The parent thread of a Codex rollout, from its `session_meta`: set on
+/// threads another thread spawned (`source.subagent.thread_spawn`).
+pub fn codex_parent(head: &str) -> Option<Spawner> {
+    let m: Value = serde_json::from_str(head.lines().next()?).ok()?;
+    let spawn = &m["payload"]["source"]["subagent"]["thread_spawn"];
+    let parent = spawn["parent_thread_id"].as_str()?.to_string();
+    Some((
+        parent,
+        text_of(&spawn["agent_nickname"]),
+        text_of(&spawn["agent_role"]),
+    ))
+}
+
 /// opencode: `opencode session export <id>` JSON.
 pub fn parse_opencode(json: &str) -> Option<Summary> {
     let v: Value = serde_json::from_str(json).ok()?;
@@ -616,14 +696,25 @@ fn read_head(path: &Path, bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`): the rollout whose
-/// name ends in `-<id>.jsonl`.
+/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`).
+fn codex_sessions() -> Option<PathBuf> {
+    Some(
+        match std::env::var_os("CODEX_HOME") {
+            Some(h) => PathBuf::from(h),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".codex"),
+        }
+        .join("sessions"),
+    )
+}
+
+/// Running first, then the most recently active.
+fn sort_subagents(v: &mut [Subagent]) {
+    v.sort_by(|a, b| b.running.cmp(&a.running).then(b.updated.cmp(&a.updated)));
+}
+
+/// The rollout under Codex's sessions dir whose name ends in `-<id>.jsonl`.
 fn find_codex(id: &str) -> Option<PathBuf> {
-    let root = match std::env::var_os("CODEX_HOME") {
-        Some(h) => PathBuf::from(h),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".codex"),
-    }
-    .join("sessions");
+    let root = codex_sessions()?;
     let suffix = format!("-{id}.jsonl");
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
@@ -653,10 +744,41 @@ struct Entry {
     summary: Summary,
 }
 
+/// A subagent as last read, and the file stamps it was read at.
+struct SubEntry {
+    stamp: (SystemTime, u64, SystemTime),
+    sub: Subagent,
+}
+
+/// Rollouts lately written under Codex's sessions dir, looked for at most
+/// every `CODEX_SCAN_EVERY`: path -> the thread that spawned it, if any.
+#[derive(Default)]
+struct CodexScan {
+    at: Option<Instant>,
+    parents: HashMap<PathBuf, Option<Spawner>>,
+}
+
+const CODEX_SCAN_EVERY: Duration = Duration::from_secs(5);
+
+/// The first record's timestamp.
+fn first_ts(path: &Path) -> Option<u64> {
+    let head = read_head(path, 16 * 1024)?;
+    let v: Value = serde_json::from_str(head.lines().next()?).ok()?;
+    v["timestamp"].as_str().and_then(parse_ts)
+}
+
+fn mtime_secs(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Summaries per session id, re-read only when the transcript changes.
 #[derive(Default)]
 pub struct Cache {
     entries: HashMap<String, Entry>,
+    subs: HashMap<PathBuf, SubEntry>,
+    codex_scan: CodexScan,
     /// The last look for ended sessions, and what it found.
     ended: Option<(Instant, Vec<Ended>)>,
 }
@@ -752,6 +874,185 @@ impl Cache {
         Some(summary)
     }
 
+    /// The subagents of Claude Code session `id` (whose summary `get` has
+    /// read): running ones and those finished in the last half hour,
+    /// newest first. Each is re-read only when its files change.
+    pub fn claude_subagents(&mut self, id: &str, now: u64) -> Vec<Subagent> {
+        let Some(dir) = self
+            .entries
+            .get(id)
+            .map(|e| e.path.with_extension("").join("subagents"))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let meta_path = e.path();
+            let Some(sub_id) = meta_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".meta.json"))
+                .and_then(|n| n.strip_prefix("agent-"))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let log = dir.join(format!("agent-{sub_id}.jsonl"));
+            let (Ok(lm), Ok(mm)) = (std::fs::metadata(&log), e.metadata()) else {
+                continue;
+            };
+            let (Ok(lt), Ok(mt)) = (lm.modified(), mm.modified()) else {
+                continue;
+            };
+            let latest = mtime_secs(lt).max(mtime_secs(mt));
+            let stamp = (lt, lm.len(), mt);
+            let fresh = self.subs.get(&log).is_some_and(|s| s.stamp == stamp);
+            if !fresh {
+                // long finished and never read: not worth opening
+                if now.saturating_sub(latest) > SUBAGENT_KEEP {
+                    continue;
+                }
+                let (Some(meta), Some(tail)) = (
+                    std::fs::read_to_string(&meta_path).ok(),
+                    read_tail(&log, 64 * 1024),
+                ) else {
+                    continue;
+                };
+                let sub = parse_claude_subagent(&sub_id, &meta, &tail, first_ts(&log), latest, now);
+                self.subs.insert(log.clone(), SubEntry { stamp, sub });
+            }
+            let Some(s) = self.subs.get_mut(&log) else {
+                continue;
+            };
+            // time passes without the files changing: go stale
+            s.sub.running &= now.saturating_sub(s.sub.updated) < SUBAGENT_STALE;
+            if s.sub.running || now.saturating_sub(s.sub.updated) <= SUBAGENT_KEEP {
+                out.push(s.sub.clone());
+            }
+        }
+        sort_subagents(&mut out);
+        out
+    }
+
+    /// The subagents of Codex thread `id`: rollouts written lately whose
+    /// `session_meta` names it as the parent. Running while a turn is open.
+    pub fn codex_subagents(&mut self, id: &str, now: u64) -> Vec<Subagent> {
+        self.scan_codex(now);
+        let kids: Vec<(PathBuf, Option<String>, Option<String>)> = self
+            .codex_scan
+            .parents
+            .iter()
+            .filter_map(|(p, parent)| match parent {
+                Some((pid, nick, role)) if pid == id => {
+                    Some((p.clone(), nick.clone(), role.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (path, nick, role) in kids {
+            let Ok(m) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mt) = m.modified() else { continue };
+            let stamp = (mt, m.len(), mt);
+            if self.subs.get(&path).is_none_or(|s| s.stamp != stamp) {
+                let (Some(head), Some(tail)) =
+                    (read_head(&path, 256 * 1024), read_tail(&path, TAIL))
+                else {
+                    continue;
+                };
+                let s = parse_codex(&head, &tail);
+                let updated = s.updated.unwrap_or(mtime_secs(mt));
+                let sub = Subagent {
+                    id: path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.get(n.len().saturating_sub(36)..))
+                        .unwrap_or_default()
+                        .to_string(),
+                    task: nick
+                        .or(s.last_prompt.clone())
+                        .unwrap_or_else(|| "subagent".into()),
+                    kind: role,
+                    background: true,
+                    running: s.in_turn,
+                    started: first_ts(&path),
+                    updated,
+                    doing: None,
+                    said: s.last_reply,
+                };
+                self.subs.insert(path.clone(), SubEntry { stamp, sub });
+            }
+            let Some(s) = self.subs.get_mut(&path) else {
+                continue;
+            };
+            s.sub.running &= now.saturating_sub(s.sub.updated) < SUBAGENT_STALE;
+            if s.sub.running || now.saturating_sub(s.sub.updated) <= SUBAGENT_KEEP {
+                out.push(s.sub.clone());
+            }
+        }
+        sort_subagents(&mut out);
+        out
+    }
+
+    /// Rollouts in the two newest day directories, written in the last
+    /// half hour: which thread spawned each (read once per file).
+    fn scan_codex(&mut self, now: u64) {
+        if self
+            .codex_scan
+            .at
+            .is_some_and(|at| at.elapsed() < CODEX_SCAN_EVERY)
+        {
+            return;
+        }
+        self.codex_scan.at = Some(Instant::now());
+        let Some(root) = codex_sessions() else { return };
+        // sessions/YYYY/MM/DD: the newest two days
+        let newest = |d: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            v.sort();
+            v
+        };
+        let mut days: Vec<PathBuf> = newest(&root)
+            .into_iter()
+            .rev()
+            .take(2)
+            .flat_map(|y| newest(&y).into_iter().rev().take(2))
+            .flat_map(|m| newest(&m).into_iter().rev().take(2))
+            .collect();
+        days.sort();
+        days.reverse();
+        days.truncate(2);
+        let mut seen = Vec::new();
+        for day in days {
+            for e in std::fs::read_dir(&day).into_iter().flatten().flatten() {
+                let p = e.path();
+                let recent = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| now.saturating_sub(mtime_secs(t)) <= SUBAGENT_KEEP);
+                if !recent || p.extension().is_none_or(|x| x != "jsonl") {
+                    continue;
+                }
+                if !self.codex_scan.parents.contains_key(&p) {
+                    let parent = read_head(&p, 256 * 1024).and_then(|h| codex_parent(&h));
+                    self.codex_scan.parents.insert(p.clone(), parent);
+                }
+                seen.push(p);
+            }
+        }
+        self.codex_scan.parents.retain(|p, _| seen.contains(p));
+        self.subs
+            .retain(|p, _| seen.contains(p) || !p.starts_with(&root));
+    }
+
     /// Forget sessions not in `live` (nor listed as ended).
     pub fn retain(&mut self, live: &[&str]) {
         let ended: Vec<String> = self
@@ -761,6 +1062,17 @@ impl Cache {
             .collect();
         self.entries
             .retain(|id, _| live.contains(&id.as_str()) || ended.contains(id));
+        // subagents of sessions still known (Codex's are pruned by the scan)
+        let dirs: Vec<PathBuf> = self
+            .entries
+            .values()
+            .map(|e| e.path.with_extension(""))
+            .collect();
+        let codex = codex_sessions();
+        self.subs.retain(|p, _| {
+            dirs.iter().any(|d| p.starts_with(d))
+                || codex.as_ref().is_some_and(|c| p.starts_with(c))
+        });
     }
 
     /// Recently exited Claude Code sessions, newest first: transcripts
@@ -883,6 +1195,67 @@ fn find(id: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_subagent_runs_until_its_meta_says_finished() {
+        let now = 1_800_000_000;
+        let ts = "2027-01-15T08:00:00Z";
+        let at = parse_ts(ts).unwrap();
+        let tail = [
+            line(
+                serde_json::json!({"type":"user","isSidechain":true,"timestamp":ts,
+                "message":{"role":"user","content":"Find the flaky test"}}),
+            ),
+            line(
+                serde_json::json!({"type":"assistant","isSidechain":true,"timestamp":ts,
+                "message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash",
+                "input":{"command":"cargo test"}}]}}),
+            ),
+        ]
+        .join("\n");
+        let meta = r#"{"agentType":"Explore","description":"Find the flaky test","requestShape":"background"}"#;
+        let s = parse_claude_subagent("a1", meta, &tail, Some(at - 60), at, at + 5);
+        assert!(s.running);
+        assert_eq!(s.task, "Find the flaky test");
+        assert_eq!(s.kind.as_deref(), Some("Explore"));
+        assert!(s.background);
+        assert_eq!(s.doing.as_deref(), Some("Bash: cargo test"));
+        // finished
+        let done = meta.replace('}', r#","finished":true}"#);
+        let s = parse_claude_subagent("a1", &done, &tail, None, at, at + 5);
+        assert!(!s.running && s.doing.is_none());
+        // heard nothing from for over half an hour: not running
+        let s = parse_claude_subagent("a1", meta, &tail, None, at, at + SUBAGENT_STALE + 1);
+        assert!(!s.running);
+        let _ = now;
+    }
+
+    #[test]
+    fn a_codex_rollout_names_the_thread_that_spawned_it() {
+        let head = r#"{"type":"session_meta","payload":{"id":"t2","source":{"subagent":{"thread_spawn":{"parent_thread_id":"t1","depth":1,"agent_nickname":"Ada","agent_role":"explorer"}}}}}"#;
+        assert_eq!(
+            codex_parent(head),
+            Some(("t1".into(), Some("Ada".into()), Some("explorer".into())))
+        );
+        let own = r#"{"type":"session_meta","payload":{"id":"t1","source":"cli"}}"#;
+        assert_eq!(codex_parent(own), None);
+    }
+
+    #[test]
+    fn a_sessions_own_summary_skips_its_subagents_records() {
+        let tail = [
+            line(serde_json::json!({"type":"assistant","isSidechain":false,
+                "message":{"role":"assistant","content":[{"type":"text","text":"Mine."}]}})),
+            line(serde_json::json!({"type":"assistant","isSidechain":true,
+                "message":{"role":"assistant","content":[{"type":"text","text":"The subagent's."}]}})),
+        ]
+        .join("\n");
+        assert_eq!(parse_tail(&tail).last_reply.as_deref(), Some("Mine."));
+        assert_eq!(
+            parse_tail_of(&tail, true).last_reply.as_deref(),
+            Some("The subagent's.")
+        );
+    }
 
     fn line(v: serde_json::Value) -> String {
         v.to_string()

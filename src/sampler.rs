@@ -384,6 +384,12 @@ impl Sampler {
                         "opencode" => tc.get_opencode(&id, oc_service),
                         _ => None,
                     };
+                    let now = crate::ui::unix_now();
+                    a.subagents = match a.name.as_str() {
+                        "claude" => tc.claude_subagents(&id, now),
+                        "codex" => tc.codex_subagents(&id, now),
+                        _ => Vec::new(),
+                    };
                 }
                 let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
                 tc.retain(&live);
@@ -702,6 +708,7 @@ fn build_agents(
                 waiting: false,
                 tree: None,
                 report: None,
+                subagents: Vec::new(),
             })
         })
         .collect();

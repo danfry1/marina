@@ -895,6 +895,19 @@ impl App {
         let label = self.agent_label(a);
         // /exit while it works would be queued (or typed into its prompt),
         // and at a dialog the Esc first would reject the pending call
+        let subs = a.subagents_running();
+        if subs > 0 && !self.waiting_on_you(a) {
+            let (n, them) = if subs == 1 {
+                ("a subagent".to_string(), "it")
+            } else {
+                (format!("{subs} subagents"), "them")
+            };
+            self.set_status(format!(
+                "{label} has {n} still running — ending it would stop {them}; let {them} finish first"
+            ));
+            self.ctl.pending_end = None;
+            return Action::None;
+        }
         if a.is_working(unix_now()) || self.waiting_on_you(a) {
             self.set_status(format!(
                 "{label} is busy — let it finish (or answer it) before ending it, or Enter to jump there"

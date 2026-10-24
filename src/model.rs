@@ -107,6 +107,9 @@ pub struct Agent {
     pub tree: Option<PathBuf>,
     /// What the agent last reported of itself, through marina's hooks.
     pub report: Option<crate::hooks::Report>,
+    /// Subagents it started (Claude Code's Agent tool, Codex threads):
+    /// running ones, and those finished in the last half hour.
+    pub subagents: Vec<crate::transcript::Subagent>,
 }
 
 /// A target this busy (smoothed, whole subtree) or this big is called heavy
@@ -240,6 +243,11 @@ impl Agent {
             .or(self.summary.as_ref().and_then(|s| s.title.as_deref()))
     }
 
+    /// How many of its subagents are still at work.
+    pub fn subagents_running(&self) -> usize {
+        self.subagents.iter().filter(|s| s.running).count()
+    }
+
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
         self.children.iter().filter(|c| c.shell)
     }
@@ -249,7 +257,7 @@ impl Agent {
     /// streams; an idle one leaves the screen alone). Without a terminal, CPU
     /// is the fallback: an idle agent TUI sits around 1%.
     pub fn is_working(&self, now: u64) -> bool {
-        if self.shells().next().is_some() {
+        if self.shells().next().is_some() || self.subagents_running() > 0 {
             return true;
         }
         // A host that watches the screen knows better than timestamps.
@@ -353,10 +361,20 @@ impl Agent {
     /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
     /// `idle 12m` (since its terminal last changed).
     pub fn activity(&self, now: u64) -> String {
+        let subs = match self.subagents_running() {
+            0 => String::new(),
+            1 => " · 1 subagent".into(),
+            n => format!(" · {n} subagents"),
+        };
+        if !subs.is_empty() && self.shells().next().is_none() && !self.is_blocked() {
+            return subs.trim_start_matches(" · ").to_string();
+        }
         let mut shells = self.shells();
-        match (shells.next(), shells.count()) {
+        let activity = match (shells.next(), shells.count()) {
             (Some(c), 0) => format!("$ {}", c.label),
             (Some(c), more) => format!("$ {} +{more}", c.label),
+            // its subagents keep it working, but it can still be asking you
+            (None, _) if !subs.is_empty() && self.is_blocked() => "needs you".into(),
             (None, _) if self.is_working(now) => "working".into(),
             (None, _) if self.is_blocked() => "needs you".into(),
             (None, _) if self.host_status() == Some(HostStatus::Done) => "done".into(),
@@ -364,7 +382,8 @@ impl Agent {
                 Some(t) => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t.output))),
                 None => "idle".into(),
             },
-        }
+        };
+        format!("{activity}{subs}")
     }
 
     /// Fixture: a claude session in `/Users/me/dev/<dir>` running one shell
@@ -405,6 +424,7 @@ impl Agent {
             waiting: false,
             tree: None,
             report: None,
+            subagents: Vec::new(),
         }
     }
 }
@@ -636,6 +656,26 @@ mod tests {
         assert!(t.is_heavy(), "a leak");
         t.pids.clear();
         assert!(!t.is_heavy(), "a container: nothing measured");
+    }
+
+    #[test]
+    fn a_session_works_while_its_subagents_do() {
+        let mut a = Agent::sample(1, "aaaa1111", "a");
+        a.children.retain(|c| !c.shell);
+        a.tty = Some(crate::sources::TtyActivity {
+            output: 100,
+            input: 100,
+        });
+        assert!(!a.is_working(10_000));
+        a.subagents.push(crate::transcript::Subagent {
+            task: "Review the PR".into(),
+            running: true,
+            ..Default::default()
+        });
+        assert!(a.is_working(10_000));
+        assert_eq!(a.activity(10_000), "1 subagent");
+        a.waiting = true;
+        assert!(a.activity(10_000).starts_with("needs you"));
     }
 
     #[test]
