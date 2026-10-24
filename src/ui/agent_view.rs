@@ -21,9 +21,10 @@ use crate::model::Agent;
 const KEY: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
-/// The inbox's groups (see `App::inbox_urgency`).
+/// The inbox section a row is shown under (see `App::section`): its live
+/// state shows in its dot and text even while the order is held.
 fn group_of(app: &App, a: &Agent, now: u64) -> &'static str {
-    match app.inbox_urgency(a, now) {
+    match app.section(a, now) {
         0 => "NEEDS YOU",
         1 => "YOUR TURN",
         2 => "WORKING",
@@ -230,7 +231,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         .snapshot
                         .agents
                         .iter()
-                        .filter(|a| app.matches_agent(a) && app.inbox_urgency(a, now) == 3)
+                        .filter(|a| app.matches_agent(a) && app.section(a, now) == 3)
                         .count();
                     ("PARKED", n, app.ctl.parked_open)
                 } else {

@@ -86,6 +86,13 @@ pub(crate) struct Control {
     /// The inbox's parked / ended groups are unfolded.
     pub parked_open: bool,
     pub ended_open: bool,
+    /// The inbox section (0 needs you … 3 parked) each session was last
+    /// shown in: while you browse, a row keeps its section as well as its
+    /// place, so headers stay contiguous. Updated in `App::reconcile`.
+    pub sections: HashMap<u32, u8>,
+    /// The inbox order is held this frame — decided once per `reconcile`,
+    /// so the order and the sections drawn agree.
+    pub holding: bool,
 }
 
 /// `N`: where and with what to start a session.
@@ -933,6 +940,11 @@ impl App {
     /// `a`: the inbox — every session, what wants you first.
     pub fn toggle_inbox(&mut self) {
         self.ctl.inbox = !self.ctl.inbox;
+        // a fresh view: nothing held over from the other one, or from the
+        // inbox's last visit
+        self.ctl.sections.clear();
+        self.ctl.holding = false;
+        self.last_input = Instant::now() - INBOX_HOLD;
         self.set_status(if self.ctl.inbox {
             "inbox: what needs you first · a to go back"
         } else {
@@ -1026,24 +1038,85 @@ impl App {
             }
         }
         // while you're moving through it, hold the order still: rows that
-        // are still there keep their place, new ones go at the end
-        let browsing = self.last_input.elapsed() < INBOX_HOLD && !self.display.is_empty();
-        if browsing
-            && self
-                .display
-                .iter()
-                .all(|e| matches!(e, Entry::Agent(_) | Entry::Ended(_) | Entry::Fold(_)))
-        {
+        // are still there keep their place (and section), new ones go at
+        // the end of their own section
+        if self.ctl.holding {
             let mut held: Vec<Entry> = self
                 .display
                 .iter()
                 .filter(|e| out.contains(e))
                 .cloned()
                 .collect();
-            held.extend(out.into_iter().filter(|e| !self.display.contains(e)));
+            for e in out.into_iter().filter(|e| !self.display.contains(e)) {
+                let r = self.rank(&e, now);
+                let at = held
+                    .iter()
+                    .rposition(|h| self.rank(h, now) <= r)
+                    .map_or(0, |i| i + 1);
+                held.insert(at, e);
+            }
+            // held parked rows stay under their fold, even with none parked now
+            let parked = |e: &Entry| e != &Entry::Fold(0) && self.rank(e, now) == 3;
+            if !held.contains(&Entry::Fold(0)) {
+                if let Some(i) = held.iter().position(parked) {
+                    held.insert(i, Entry::Fold(0));
+                }
+            }
             return held;
         }
         out
+    }
+
+    /// The inbox order is to be held: a key was pressed in the last
+    /// `INBOX_HOLD`, over a list of inbox rows. Read once per frame, into
+    /// `Control::holding`.
+    pub(crate) fn browsing_inbox(&self) -> bool {
+        self.last_input.elapsed() < INBOX_HOLD
+            && !self.display.is_empty()
+            && self
+                .display
+                .iter()
+                .all(|e| matches!(e, Entry::Agent(_) | Entry::Ended(_) | Entry::Fold(_)))
+    }
+
+    /// The section `a` is shown under: where it was while the order is
+    /// held, else where it is now (its urgency, parked and stale as one).
+    pub(crate) fn section(&self, a: &Agent, now: u64) -> u8 {
+        let held = self.ctl.holding.then(|| self.ctl.sections.get(&a.pid));
+        match held.flatten() {
+            Some(&s) => s,
+            None => self.inbox_urgency(a, now).min(3),
+        }
+    }
+
+    /// Where a row sorts in the inbox: its section, the parked fold with
+    /// (before) the parked rows, ended sessions last.
+    fn rank(&self, e: &Entry, now: u64) -> u8 {
+        match e {
+            Entry::Agent(pid) => self
+                .snapshot
+                .agents
+                .iter()
+                .find(|a| a.pid == *pid)
+                .map_or(3, |a| self.section(a, now)),
+            Entry::Fold(0) => 3,
+            _ => 4,
+        }
+    }
+
+    /// Remember the section each shown session is in, for the hold.
+    pub(crate) fn note_sections(&mut self) {
+        let now = unix_now();
+        let sections: HashMap<u32, u8> = self
+            .display
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Agent(pid) => self.snapshot.agents.iter().find(|a| a.pid == *pid),
+                _ => None,
+            })
+            .map(|a| (a.pid, self.section(a, now)))
+            .collect();
+        self.ctl.sections = sections;
     }
 }
 
@@ -1221,10 +1294,104 @@ mod tests {
         // while browsing, even a real reorder waits
         app.display = vec![Entry::Agent(2), Entry::Agent(1)];
         app.last_input = Instant::now();
+        app.ctl.holding = app.browsing_inbox();
         assert_eq!(
             app.inbox_entries(10_000)[..2],
             [Entry::Agent(2), Entry::Agent(1)]
         );
+    }
+
+    #[test]
+    fn while_browsing_rows_keep_their_section_and_new_ones_join_theirs() {
+        let mut app = App::new();
+        let now = unix_now();
+        let make = move |seq: u64, c_working: bool, d: bool| {
+            let mut s = Snapshot::sample();
+            s.seq = seq;
+            let finished = |pid: u32, id: &str, at: u64| {
+                let mut a = Agent::sample(pid, id, id);
+                a.children.retain(|c| !c.shell);
+                a.summary = Some(crate::transcript::Summary {
+                    turn_ended: Some(at),
+                    updated: Some(at),
+                    recap: Some("Done. Next: say go.".into()),
+                    ..Default::default()
+                });
+                a
+            };
+            let mut c = finished(3, "cccc3333", now - 60);
+            if c_working {
+                c = Agent::sample(3, "cccc3333", "cccc3333");
+            }
+            s.agents = vec![
+                finished(1, "aaaa1111", now - 600),
+                finished(2, "bbbb2222", now - 900),
+                c,
+            ];
+            if d {
+                let mut d = finished(4, "dddd4444", now - 1200);
+                d.waiting = true;
+                s.agents.push(d);
+            }
+            Arc::new(s)
+        };
+        app.apply(make(1, true, false));
+        app.toggle_inbox();
+        app.last_input = Instant::now() - INBOX_HOLD * 2;
+        app.reconcile();
+        let agents = |app: &App| -> Vec<Entry> {
+            app.display
+                .iter()
+                .filter(|e| matches!(e, Entry::Agent(_)))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            agents(&app),
+            [Entry::Agent(1), Entry::Agent(2), Entry::Agent(3)]
+        );
+
+        // browsing: c finishes (it would sort first), d starts waiting on you
+        app.last_input = Instant::now();
+        app.apply(make(2, false, true));
+        app.reconcile();
+        assert_eq!(
+            agents(&app),
+            [
+                Entry::Agent(4),
+                Entry::Agent(1),
+                Entry::Agent(2),
+                Entry::Agent(3)
+            ],
+            "c keeps its place; d goes into needs-you, not to the bottom"
+        );
+        let c = app.snapshot.agents.iter().find(|a| a.pid == 3).unwrap();
+        assert_eq!(app.section(c, unix_now()), 2, "still shown under working");
+
+        // the hold over, everything is where it belongs
+        app.last_input = Instant::now() - INBOX_HOLD * 2;
+        app.reconcile();
+        assert_eq!(
+            agents(&app),
+            [
+                Entry::Agent(4),
+                Entry::Agent(3),
+                Entry::Agent(1),
+                Entry::Agent(2)
+            ]
+        );
+
+        // leaving and coming back holds nothing over from before, even
+        // straight after a key press
+        app.last_input = Instant::now();
+        app.reconcile();
+        assert!(!app.ctl.sections.is_empty());
+        app.toggle_inbox();
+        app.select_next();
+        app.toggle_inbox();
+        app.reconcile();
+        assert!(!app.ctl.holding);
+        assert_eq!(agents(&app)[0], Entry::Agent(4));
     }
 
     #[test]

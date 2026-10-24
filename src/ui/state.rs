@@ -718,7 +718,11 @@ impl App {
     /// row still exists, else the nearest neighbor (same list position), never
     /// a jump back to the top. Called by render before drawing.
     pub(crate) fn reconcile(&mut self) {
+        self.ctl.holding = self.ctl.inbox && self.browsing_inbox();
         self.display = self.compute_entries();
+        if self.ctl.inbox {
+            self.note_sections();
+        }
         let idx = self
             .selected
             .as_ref()
