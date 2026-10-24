@@ -147,6 +147,18 @@ marina                   # opens on the inbox when agents are running
   counts as working while any of its subagents is, so one waiting on
   background agents isn't shown as done, and `X` won't end it mid-way.
   `marina agents --long/--json` list them too.
+- **Land the work** (`L`) — on a session (or an ended one): its branch,
+  how far ahead of the main checkout's branch, and what's uncommitted, with
+  what can be done from there. `p` has the agent commit, push and open a
+  pull request (it writes the message); `m` fast-forwards the main
+  checkout's branch to it — only when both trees are clean and it's
+  strictly ahead; `w` removes its worktree, and its branch once that's
+  merged (an unmerged branch is kept, commits and all) — only when nothing
+  would be lost: no uncommitted or untracked files, no ignored files beyond
+  dependency and build folders (an `.env` blocks it), no detached commits
+  nothing else points to, and no session or server still running there.
+  Each is re-checked at the moment it runs; if any of it can't be read,
+  nothing is offered; nothing is ever forced.
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; with
   hooks installed, the agent's own; elsewhere

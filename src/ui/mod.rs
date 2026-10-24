@@ -12,7 +12,7 @@ mod format;
 mod render;
 mod state;
 
-pub use control::Action;
+pub use control::{Action, LandAction};
 
 /// Load which agent replies have been read (`<state dir>/seen.json`).
 pub fn load_seen(app: &mut App) {

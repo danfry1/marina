@@ -296,6 +296,72 @@ fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
 }
 
 fn footer_line(app: &App) -> Line<'static> {
+    if let Some(m) = app.land_menu() {
+        let head = Span::styled(
+            format!("  land {} › ", m.label),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        );
+        let Some(l) = m.landing.as_ref() else {
+            return Line::from(vec![
+                head,
+                Span::styled("reading its git state…", Style::new().fg(Color::DarkGray)),
+            ]);
+        };
+        let mut state = vec![l.branch.clone().unwrap_or_else(|| "detached".into())];
+        if let Some(base) = l.base.as_ref().filter(|b| Some(*b) != l.branch.as_ref()) {
+            state.push(format!("{} ahead of {base}", l.ahead));
+            if l.behind > 0 {
+                state.push(format!("{} behind", l.behind));
+            }
+        }
+        if l.dirty > 0 {
+            state.push(format!("{} uncommitted", l.dirty));
+        }
+        if l.pushed {
+            state.push("pushed".into());
+        }
+        let on = Style::new().fg(Color::White);
+        let off = Style::new().fg(Color::DarkGray);
+        let into = match &l.base {
+            Some(b) => format!("merge into {b}"),
+            None => "merge".to_string(),
+        };
+        let mut spans = vec![
+            head,
+            Span::styled(
+                format!("{} · ", state.join(", ")),
+                Style::new().fg(Color::Gray),
+            ),
+        ];
+        for (key, what, blocked) in [
+            (
+                "p",
+                "have it open a PR".to_string(),
+                app.land_pr_blocker(m).is_some(),
+            ),
+            ("m", into, l.merge_blocker().is_some()),
+            (
+                "w",
+                "remove worktree".to_string(),
+                app.land_remove_blocker(l).is_some(),
+            ),
+        ] {
+            let style = if blocked { off } else { on };
+            spans.push(Span::styled(
+                format!("{key} "),
+                style.add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!("{what}  "), style));
+        }
+        spans.push(Span::styled("· Esc", off));
+        if let Some(n) = &m.note {
+            spans.push(Span::styled(
+                format!("   {n}"),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        return Line::from(spans);
+    }
     if let Some(d) = app.new_draft() {
         let place = crate::launch::here()
             .map(|p| p.name())
@@ -1177,6 +1243,10 @@ fn help_lines() -> Vec<Line<'static>> {
         row("N", "new session here (Tab: in its own git worktree)"),
         row("d", "set aside: parked until it does something new"),
         row("X", "end it (twice; sends /exit) · on PARKED: all of them"),
+        row(
+            "L",
+            "land its work: have it open a PR · merge into main · remove worktree",
+        ),
         row("D", "uncommitted diff of its work tree"),
         Line::from(""),
         head("SERVERS"),

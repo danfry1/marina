@@ -664,6 +664,27 @@ window.
   `X` on the parked fold ends every parked session marina can type into
   (`Action::SendAll`), after a second press.
 
+**Landing** (`L`, `git::Landing`): `git::landing` reads, off the UI
+thread, the session's tree (`rev-parse --show-toplevel`), the main
+checkout (the first `git worktree list --porcelain` entry, or `bare`),
+both branches (full `symbolic-ref`), uncommitted, untracked and ignored
+files (`status --ignored=matching`; ignored paths under known dependency
+and build folders don't count), `rev-list --left-right --count
+base...HEAD`, whether `@{u}` is up to date, and whether any ref contains
+HEAD. Any command failing or timing out (15s) makes the whole reading
+`None` — unknown is never read as "nothing there". The reply carries the
+directory it was for; one for a menu since closed or replaced is dropped. `merge_blocker` / `remove_blocker` (plus "a session still runs
+there") decide what the footer offers. `p` sends the agent a prompt rather
+than running git itself, so the commit message and PR description are
+written by what did the work. `m` is `git merge --ff-only` in the main
+checkout; `w` is `git worktree remove` (never `--force`) and then
+`git branch -d` (which refuses an unmerged branch) when the branch has
+nothing the base hasn't; an unmerged branch stays, so a worktree on a
+branch can go with nothing lost, while a detached one needs its HEAD in
+some ref. Ignored files block it: `worktree remove` deletes them without
+asking. Both re-read the state and re-check before acting,
+so a stale menu can't merge or remove something that changed since.
+
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
 every 2s and sends the same notices (`App::take_notifications`) as desktop
 notifications. It holds an exclusive `flock` on `<state dir>/watch.pid`
