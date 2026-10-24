@@ -90,6 +90,9 @@ pub(crate) struct Control {
     /// shown in: while you browse, a row keeps its section as well as its
     /// place, so headers stay contiguous. Updated in `App::reconcile`.
     pub sections: HashMap<u32, u8>,
+    /// The inbox order is held this frame — decided once per `reconcile`,
+    /// so the order and the sections drawn agree.
+    pub holding: bool,
 }
 
 /// `N`: where and with what to start a session.
@@ -937,6 +940,11 @@ impl App {
     /// `a`: the inbox — every session, what wants you first.
     pub fn toggle_inbox(&mut self) {
         self.ctl.inbox = !self.ctl.inbox;
+        // a fresh view: nothing held over from the other one, or from the
+        // inbox's last visit
+        self.ctl.sections.clear();
+        self.ctl.holding = false;
+        self.last_input = Instant::now() - INBOX_HOLD;
         self.set_status(if self.ctl.inbox {
             "inbox: what needs you first · a to go back"
         } else {
@@ -1032,7 +1040,7 @@ impl App {
         // while you're moving through it, hold the order still: rows that
         // are still there keep their place (and section), new ones go at
         // the end of their own section
-        if self.browsing_inbox() {
+        if self.ctl.holding {
             let mut held: Vec<Entry> = self
                 .display
                 .iter()
@@ -1047,14 +1055,22 @@ impl App {
                     .map_or(0, |i| i + 1);
                 held.insert(at, e);
             }
+            // held parked rows stay under their fold, even with none parked now
+            let parked = |e: &Entry| e != &Entry::Fold(0) && self.rank(e, now) == 3;
+            if !held.contains(&Entry::Fold(0)) {
+                if let Some(i) = held.iter().position(parked) {
+                    held.insert(i, Entry::Fold(0));
+                }
+            }
             return held;
         }
         out
     }
 
-    /// The inbox order is being held: a key was pressed in the last
-    /// `INBOX_HOLD`, over a list of inbox rows.
-    fn browsing_inbox(&self) -> bool {
+    /// The inbox order is to be held: a key was pressed in the last
+    /// `INBOX_HOLD`, over a list of inbox rows. Read once per frame, into
+    /// `Control::holding`.
+    pub(crate) fn browsing_inbox(&self) -> bool {
         self.last_input.elapsed() < INBOX_HOLD
             && !self.display.is_empty()
             && self
@@ -1066,7 +1082,7 @@ impl App {
     /// The section `a` is shown under: where it was while the order is
     /// held, else where it is now (its urgency, parked and stale as one).
     pub(crate) fn section(&self, a: &Agent, now: u64) -> u8 {
-        let held = self.browsing_inbox().then(|| self.ctl.sections.get(&a.pid));
+        let held = self.ctl.holding.then(|| self.ctl.sections.get(&a.pid));
         match held.flatten() {
             Some(&s) => s,
             None => self.inbox_urgency(a, now).min(3),
@@ -1278,6 +1294,7 @@ mod tests {
         // while browsing, even a real reorder waits
         app.display = vec![Entry::Agent(2), Entry::Agent(1)];
         app.last_input = Instant::now();
+        app.ctl.holding = app.browsing_inbox();
         assert_eq!(
             app.inbox_entries(10_000)[..2],
             [Entry::Agent(2), Entry::Agent(1)]
@@ -1363,6 +1380,18 @@ mod tests {
                 Entry::Agent(2)
             ]
         );
+
+        // leaving and coming back holds nothing over from before, even
+        // straight after a key press
+        app.last_input = Instant::now();
+        app.reconcile();
+        assert!(!app.ctl.sections.is_empty());
+        app.toggle_inbox();
+        app.select_next();
+        app.toggle_inbox();
+        app.reconcile();
+        assert!(!app.ctl.holding);
+        assert_eq!(agents(&app)[0], Entry::Agent(4));
     }
 
     #[test]

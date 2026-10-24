@@ -231,7 +231,7 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         .snapshot
                         .agents
                         .iter()
-                        .filter(|a| app.matches_agent(a) && app.inbox_urgency(a, now) == 3)
+                        .filter(|a| app.matches_agent(a) && app.section(a, now) == 3)
                         .count();
                     ("PARKED", n, app.ctl.parked_open)
                 } else {
