@@ -35,6 +35,7 @@ pub enum UiEvent {
     Screen {
         pid: u32,
         generation: u64,
-        rows: Option<Vec<String>>,
+        /// The rows, or why they couldn't be read.
+        rows: Result<Vec<String>, String>,
     },
 }

@@ -13,8 +13,9 @@
 //! Multiplexers are queried only when their server process is running,
 //! through their own CLIs, with a deadline, at most every few seconds.
 //! Terminal apps are recognised from the agent's ancestry alone and only
-//! scripted when jumping (AppleScript on macOS; `wezterm cli`), so sampling
-//! never triggers an automation prompt.
+//! scripted on a keystroke — jumping, and for iTerm2 also the preview and
+//! answering (AppleScript on macOS; `wezterm cli`) — so sampling never
+//! triggers an automation prompt.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -473,8 +474,10 @@ const GHOSTTY_FOCUS: &str = r#"function run(argv) {
   return String(hits.length || ts.length);
 }"#;
 
-/// The visible screen of the iTerm2 session on a tty (argv 1).
+/// The visible screen of the iTerm2 session on a tty (argv 1). Asks only a
+/// running iTerm2 — `tell` alone would launch it.
 const ITERM_READ: &str = r#"on run argv
+  if application "iTerm2" is not running then return "marina:not-running"
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
@@ -489,8 +492,9 @@ end run"#;
 
 /// Type into the iTerm2 session on a tty (argv 1): `enter`, `esc`, or
 /// `text` with the text as argv 3 — as keystrokes, not a paste, like
-/// `tmux send-keys -l`.
+/// `tmux send-keys -l`. Only into a running iTerm2.
 const ITERM_WRITE: &str = r#"on run argv
+  if application "iTerm2" is not running then return "marina:not-running"
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
@@ -512,6 +516,16 @@ const ITERM_WRITE: &str = r#"on run argv
   end tell
   return "missing"
 end run"#;
+
+/// The screen text of the iTerm2 session on `tty`, or why not.
+fn iterm_read(tty: &str) -> Result<String, String> {
+    match osascript(ITERM_READ, &[tty]).as_deref() {
+        Some("marina:not-running") => Err("iTerm2 isn't running".into()),
+        Some("marina:missing") => Err(format!("no iTerm2 session on {tty} any more")),
+        Some(text) => Ok(text.to_string()),
+        None => Err("couldn't script iTerm2 — allow marina's terminal to control it under System Settings › Privacy › Automation".into()),
+    }
+}
 
 /// Type into the iTerm2 session on `tty`: `Some` once it took it.
 fn iterm_write(tty: &str, key: &str, text: &str) -> Option<String> {
@@ -646,9 +660,16 @@ impl HostKind {
     }
 }
 
-/// The last `lines` rows of the session's screen, from its multiplexer.
+/// The last `lines` rows of the session's screen, from its multiplexer or
+/// terminal app.
 pub fn read_screen(host: &HostInfo, lines: usize) -> Option<Vec<String>> {
+    read_screen_or_why(host, lines).ok()
+}
+
+/// [`read_screen`], saying why when it can't.
+pub fn read_screen_or_why(host: &HostInfo, lines: usize) -> Result<Vec<String>, String> {
     let n = lines.to_string();
+    let failed = || format!("couldn't read the {}", host.describe());
     let text = match host.kind {
         HostKind::Herdr => run(
             "herdr",
@@ -661,19 +682,24 @@ pub fn read_screen(host: &HostInfo, lines: usize) -> Option<Vec<String>> {
                 "--lines",
                 &n,
             ],
-        )?,
-        HostKind::Tmux => run("tmux", &["capture-pane", "-p", "-t", &host.target])?,
-        HostKind::ITerm => {
-            Some(osascript(ITERM_READ, &[&host.target])?).filter(|t| t != "marina:missing")?
+        )
+        .ok_or_else(failed)?,
+        HostKind::Tmux => {
+            run("tmux", &["capture-pane", "-p", "-t", &host.target]).ok_or_else(failed)?
         }
-        _ => return None,
+        HostKind::ITerm => iterm_read(&host.target)?,
+        _ => {
+            return Err(format!(
+                "marina can read the screen of {TYPABLE} sessions only"
+            ))
+        }
     };
     let mut rows: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
     while rows.last().is_some_and(|l| l.is_empty()) {
         rows.pop();
     }
     let skip = rows.len().saturating_sub(lines);
-    Some(rows.split_off(skip))
+    Ok(rows.split_off(skip))
 }
 
 /// Does the screen show an approval or question dialog *now*? Only the
@@ -748,10 +774,7 @@ pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
         o.map(|_| format!("{what} → {}", host.describe()))
             .ok_or_else(|| format!("{} didn't take it", host.kind.name()))
     };
-    let screen = read_screen(host, 40).ok_or_else(|| match host.kind {
-        HostKind::ITerm => "couldn't read its iTerm2 screen — allow marina's terminal to control iTerm2 under System Settings › Privacy › Automation".to_string(),
-        _ => "couldn't read its screen".to_string(),
-    })?;
+    let screen = read_screen_or_why(host, 40)?;
     let dialog = shows_dialog(&screen) || host.status == Some(HostStatus::Blocked);
     match what {
         Send::Approve => approvable(&screen)?,

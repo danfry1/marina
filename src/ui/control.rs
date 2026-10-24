@@ -2,8 +2,9 @@
 //! from marina (`r` / `y` / `n`), and the inbox view (`a`).
 //!
 //! marina only ever types into a session on an explicit keystroke on that
-//! session's row, and only through a multiplexer that can address the pane
-//! (herdr, tmux) — never by synthesising keystrokes into a GUI terminal.
+//! session's row, and only where the pane can be addressed exactly and its
+//! screen read first: a multiplexer (herdr, tmux) or iTerm2, by tty. Other
+//! GUI terminals are never typed into.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,6 +42,8 @@ pub(crate) struct Screen {
     pub pid: u32,
     pub at: Instant,
     pub rows: Vec<String>,
+    /// Why it couldn't be read (then `rows` is empty).
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -232,17 +235,31 @@ impl App {
         Some((pid, self.ctl.screen_gen, host))
     }
 
-    pub fn screen_ready(&mut self, pid: u32, generation: u64, rows: Option<Vec<String>>) {
+    pub fn screen_ready(&mut self, pid: u32, generation: u64, rows: Result<Vec<String>, String>) {
         self.ctl.screen_pending = false;
         if generation != self.ctl.screen_gen {
             return; // read before marina last sent something: stale
         }
+        let (rows, error) = match rows {
+            Ok(rows) => (rows, None),
+            Err(why) => (Vec::new(), Some(why)),
+        };
         self.ctl.screen = Some(Screen {
             pid,
             at: Instant::now(),
-            rows: rows.unwrap_or_default(),
+            rows,
+            error,
         });
         self.dirty = true;
+    }
+
+    /// Why the current screen of agent `pid` couldn't be read, if it couldn't.
+    pub(crate) fn screen_error(&self, pid: u32) -> Option<&str> {
+        self.ctl
+            .screen
+            .as_ref()
+            .filter(|s| s.pid == pid)
+            .and_then(|s| s.error.as_deref())
     }
 
     /// The fetched screen of agent `pid`, if it's the current one.
@@ -815,7 +832,10 @@ impl App {
             self.set_status(if total == 0 {
                 "nothing is parked".to_string()
             } else {
-                format!("none of the {total} parked sessions is in tmux or herdr — end them in their windows")
+                format!(
+                    "none of the {total} parked sessions is in {} — end them in their windows",
+                    hosts::TYPABLE
+                )
             });
             return Action::None;
         }
@@ -1099,11 +1119,11 @@ mod tests {
         // a read requested before marina sent something lands late: dropped
         let generation = app.ctl.screen_gen;
         app.drop_screen();
-        app.screen_ready(7, generation, Some(dialog.clone()));
+        app.screen_ready(7, generation, Ok(dialog.clone()));
         assert!(app.screen_of(7).is_none());
         assert!(!app.waiting_on_you(&a));
         // a current read counts
-        app.screen_ready(7, app.ctl.screen_gen, Some(dialog));
+        app.screen_ready(7, app.ctl.screen_gen, Ok(dialog));
         assert!(app.waiting_on_you(&a));
         // ...but not once it's old
         app.ctl.screen.as_mut().unwrap().at -= SCREEN_EVERY * 3;
