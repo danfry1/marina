@@ -566,7 +566,8 @@ window.
   (subagent) records are ignored. Cached per session, re-read when the file
   changes, at most every 2s. `[agents] transcripts = false` disables it.
 - *Preview* (`p`): the summary, or the session's live screen via
-  `herdr agent read --source visible` / `tmux capture-pane`, read
+  `herdr agent read --source visible` / `tmux capture-pane` / iTerm2's
+  `contents of session` (AppleScript, by tty), read
   off-thread every 1.5s while open.
 - *Answering*: offered when the session is waiting (a host status is
   trusted; otherwise the inference, or a screen read in the last ~3s
@@ -576,10 +577,16 @@ window.
   in the bottom 14 rows) or herdr reports *blocked*; `r` sends Esc first
   only then, then the prompt (`herdr agent prompt`, with a leading `-`
   space-prefixed as herdr has no `--`; tmux `send-keys -l -- text` +
-  Enter). Screen reads carry a generation bumped on every send, so a read
+  Enter; iTerm2 `write text … newline no`, which arrives as keystrokes,
+  not a paste, then `write text ""` for the `\r`). Screen reads carry a generation bumped on every send, so a read
   in flight is dropped; the cached screen is dropped when the preview
   closes or the selection moves. Arguments go as argv, never through a
-  shell. GUI terminals are never typed into.
+  shell. Of the GUI terminals only iTerm2 is typed into: its sessions are
+  found by exact tty and its screen can be read, so the same checks hold.
+  Ghostty can take input but its screen can't be read and its terminals
+  are matched by directory, so it stays jump-only. iTerm2 is scripted only
+  on a keystroke — the sampler's dialog check reads tmux screens alone —
+  so sampling never raises an automation prompt.
 - *Waiting*, without a host status: `Agent::infer_waiting` — a turn under
   way (`in_turn`: the newest user/assistant/system record is a prompt, a
   tool result or a tool call, not the `system` record a turn ends with),
@@ -630,7 +637,7 @@ window.
   else the reply's first sentence. Rows are one line: what's asked,
   running, or (parked) the title. `App::inbox_reason` gives the detail's
   *why* line, naming the source (herdr, the agent's report, or inference).
-  `X` on the parked fold ends every parked herdr/tmux session
+  `X` on the parked fold ends every parked session marina can type into
   (`Action::SendAll`), after a second press.
 
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless

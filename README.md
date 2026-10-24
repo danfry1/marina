@@ -132,11 +132,11 @@ marina                   # opens on the inbox when agents are running
   running", "it reported this itself"), and says up front when a session
   sits in a terminal marina can't type into. `d` sets a session aside —
   parked until it does something new — and `X` on the *parked* fold ends
-  every parked herdr/tmux session at once (after a second press).
+  every parked session marina can type into at once (after a second press).
   The detail beside it leads with *your turn* and *what it did*, then one
   line of context (directory, branch and changes, PR, servers, shared
   tree, context size) and the full conversation (`[` `]` to scroll); `p`
-  switches it to the session's live screen (herdr and tmux panes).
+  switches it to the session's live screen (herdr, tmux and iTerm2).
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; with
   hooks installed, the agent's own; elsewhere
@@ -162,7 +162,7 @@ marina                   # opens on the inbox when agents are running
   Terminal window (the command is typed into that window's shell, so it
   gets your PATH); `Tab` puts it in its own `git worktree` beside the repo
   so it can't collide with sessions already there. `X` (twice) ends a
-  herdr/tmux session with its exit command, warning first about
+  herdr, tmux or iTerm2 session with its exit command, warning first about
   uncommitted work or servers it leaves running. The inbox lists sessions
   that exited in the last two days under *ended*; `Enter` resumes one
   (`claude --resume <id>`) the same way `N` starts one.
@@ -178,7 +178,7 @@ marina                   # opens on the inbox when agents are running
 - **Quick replies** — `1`–`9` on a session open the reply box with a canned
   reply (`commit it`, `push it`, `run the tests`, `continue` — set your own
   with `[agents] quick`); Enter sends it.
-- **Answer from marina** — on a herdr or tmux session: `y` approves what
+- **Answer from marina** — on a herdr, tmux or iTerm2 session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
   dialog first). Each re-reads the session's screen at the moment of
   sending: `y` sends Enter only if the highlighted choice is a *Yes*
@@ -448,8 +448,11 @@ marina is deliberately boring on this front:
   summaries come from `opencode session export` while its service runs.
   Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts
-  = false` turns this off. The live screen of a herdr/tmux pane is read
-  (`herdr agent read`, `tmux capture-pane`) only while its preview is open.
+  = false` turns this off. The live screen of a herdr, tmux or iTerm2
+  session is read (`herdr agent read`, `tmux capture-pane`, iTerm2's
+  scripting) only while its preview is open or when you answer it; iTerm2
+  is never scripted in the background, so macOS asks for the automation
+  permission only after a keystroke.
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
   `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
@@ -459,7 +462,8 @@ marina is deliberately boring on this front:
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
   `Enter` on an agent asks its multiplexer or terminal app to focus it,
   and `y` / `n` / `r` on an agent send that keystroke or your reply to its
-  herdr/tmux pane (`herdr agent send-keys` / `prompt`, `tmux send-keys`). The one unprompted
+  herdr/tmux pane or iTerm2 session (`herdr agent send-keys` / `prompt`,
+  `tmux send-keys`, iTerm2's `write text`). The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind, finishes, or needs you (`[notify] desktop = false` disables it).
 

@@ -289,7 +289,7 @@ fn run(
         if let Some((pid, generation, host)) = app.screen_due() {
             let ev = ev_tx.clone();
             std::thread::spawn(move || {
-                let rows = hosts::read_screen(&host, ui::control_rows());
+                let rows = hosts::read_screen_or_why(&host, ui::control_rows());
                 let _ = ev.send(UiEvent::Screen {
                     pid,
                     generation,

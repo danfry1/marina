@@ -730,13 +730,17 @@ fn summary_lines(
 
 fn screen_lines(app: &App, a: &Agent) -> Vec<Line<'static>> {
     let interactive = a.host.as_ref().is_some_and(|h| h.kind.interactive());
+    if let Some(why) = app.screen_error(a.pid) {
+        return vec![Line::styled(format!(" {why}"), DIM)];
+    }
     match app.screen_of(a.pid) {
         Some(rows) if !rows.is_empty() => rows.iter().map(|r| Line::raw(r.clone())).collect(),
         Some(_) => vec![Line::styled(" (the screen is empty)", DIM)],
         None if interactive => vec![Line::styled(" reading the screen…", DIM)],
         None => vec![Line::styled(
             format!(
-                " marina can read the screen of herdr and tmux panes only — this is a {}",
+                " marina can read the screen of {} sessions only — this is a {}",
+                crate::hosts::TYPABLE,
                 a.host
                     .as_ref()
                     .map(|h| h.describe())
