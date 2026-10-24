@@ -394,6 +394,7 @@ const AGENT_PLUMBING: &[&str] = &[
     "--bg-pty-host",
     "--bg-spare",
     "app-server",
+    "exec-server",
     "mcp",
     "mcp-server",
     "serve",
@@ -402,13 +403,13 @@ const AGENT_PLUMBING: &[&str] = &[
 ];
 
 /// Is `p` an agent *session* — the process a person (or another agent) is
-/// talking to — and which agent? Plumbing processes and an agent's own
-/// same-named helper children are not sessions.
+/// talking to — and which agent? Plumbing processes, an agent's own
+/// same-named helper children and desktop apps are not sessions.
 pub fn agent_session(p: &ProcInfo, procs: &HashMap<u32, ProcInfo>) -> Option<&'static str> {
     let Some((LauncherKind::Agent, name)) = classify(p) else {
         return None;
     };
-    if plumbing(p).is_some() {
+    if plumbing(p).is_some() || in_app_bundle(p) {
         return None;
     }
     // A same-named agent spawned directly by a session is that session's
@@ -431,11 +432,33 @@ pub fn plumbing(p: &ProcInfo) -> Option<&'static str> {
         Some(prog) if SCRIPT_HOSTS.contains(&prog) => 2,
         _ => 1,
     };
-    p.argv
-        .iter()
-        .skip(skip)
+    // The first two arguments, past any `-c key=value` overrides
+    // (`codex -c … app-server`).
+    let mut args = Vec::new();
+    let mut it = p.argv.iter().skip(skip);
+    while let Some(a) = it.next() {
+        if a == "-c" || a == "--config" {
+            it.next();
+        } else {
+            args.push(a);
+        }
+    }
+    args.into_iter()
         .take(2)
         .find_map(|a| AGENT_PLUMBING.iter().copied().find(|&k| k == a))
+}
+
+/// A macOS app's own GUI process — the Claude or Codex desktop app and its
+/// Electron helpers (`Claude`, `Codex (Renderer)`): run from inside a bundle
+/// and named like an app. A CLI that ships in a bundle keeps a CLI's name
+/// (`ClaudeCode.app/…/claude`, an editor's bundled `node`) and still counts.
+fn in_app_bundle(p: &ProcInfo) -> bool {
+    p.argv.first().is_some_and(|a| {
+        a.contains(".app/Contents/")
+            && !basename(a)
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
+    })
 }
 
 /// An agent's background service — `opencode serve`, Claude Code's daemon —
@@ -973,6 +996,31 @@ mod tests {
                 ],
             ),
             p(30, 1, "codex", &["codex", "app-server", "--listen"]),
+            p(33, 1, "codex", &["codex", "-c", "x=true", "app-server"]),
+            p(34, 1, "codex", &["codex", "-c", "y=1", "exec-server", "--remote"]),
+            // a CLI that ships in a bundle is still a session
+            p(
+                37,
+                1,
+                "claude",
+                &["/u/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude"],
+            ),
+            p(
+                38,
+                1,
+                "node",
+                &["/Applications/Cursor.app/Contents/Resources/app/resources/helpers/node", "/u/.npm-global/bin/codex"],
+            ),
+            // a flag's value isn't a subcommand
+            p(39, 1, "codex", &["codex", "--full-auto", "--profile", "server"]),
+            // the desktop apps and their Electron helpers
+            p(35, 1, "Claude", &["/Applications/Claude.app/Contents/MacOS/Claude"]),
+            p(
+                36,
+                1,
+                "Codex (Renderer)",
+                &["/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)", "--type=renderer"],
+            ),
             p(31, 1, "opencode", &["opencode", "serve"]),
             p(32, 1, "node", &["node", "/x/bin/opencode", "serve"]),
             p(40, 1, "opencode", &["opencode"]),
@@ -990,6 +1038,9 @@ mod tests {
             vec![
                 (10, "claude"),
                 (22, "claude"),
+                (37, "claude"),
+                (38, "codex"),
+                (39, "codex"),
                 (40, "opencode"),
                 (51, "claude")
             ]
