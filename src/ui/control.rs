@@ -187,7 +187,10 @@ impl App {
                 Some(PreviewMode::Screen) => None,
                 _ if screen => Some(PreviewMode::Screen),
                 _ => {
-                    self.set_status("marina can show the screen of herdr and tmux panes only");
+                    self.set_status(format!(
+                        "marina can show the screen of {} sessions only",
+                        crate::hosts::TYPABLE
+                    ));
                     None
                 }
             };
@@ -828,7 +831,7 @@ impl App {
             }
             if parked.len() < total {
                 note.push_str(&format!(
-                    " · {} not in tmux/herdr stay",
+                    " · {} marina can't type into stay",
                     total - parked.len()
                 ));
             }
@@ -1027,7 +1030,8 @@ impl App {
 fn cant_type(a: &Agent) -> String {
     match &a.host {
         Some(h) => format!(
-            "marina can only type into herdr or tmux panes — {} is a {}; Enter jumps there",
+            "marina can only type into {} sessions — {} is a {}; Enter jumps there",
+            crate::hosts::TYPABLE,
             a.name,
             h.describe()
         ),

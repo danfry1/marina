@@ -38,10 +38,14 @@ pub fn run() -> i32 {
             (reachable == n).then_some(true),
             &format!("{n} session{} running", if n == 1 { "" } else { "s" }),
             &if reachable == n {
-                "all in tmux or herdr: reply, approve and end them from marina".to_string()
+                format!(
+                    "all in {}: reply, approve and end them from marina",
+                    crate::hosts::TYPABLE
+                )
             } else {
                 format!(
-                    "{reachable} in tmux or herdr; for the other {}, marina can only jump to their window (start sessions in tmux/herdr, or with N, to answer from marina)",
+                    "{reachable} in {}; for the other {}, marina can only jump to their window (start sessions in one of those, or with N, to answer from marina)",
+                    crate::hosts::TYPABLE,
                     n - reachable
                 )
             },

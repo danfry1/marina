@@ -736,7 +736,8 @@ fn screen_lines(app: &App, a: &Agent) -> Vec<Line<'static>> {
         None if interactive => vec![Line::styled(" reading the screen…", DIM)],
         None => vec![Line::styled(
             format!(
-                " marina can read the screen of herdr and tmux panes only — this is a {}",
+                " marina can read the screen of {} sessions only — this is a {}",
+                crate::hosts::TYPABLE,
                 a.host
                     .as_ref()
                     .map(|h| h.describe())

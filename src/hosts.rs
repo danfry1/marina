@@ -473,6 +473,51 @@ const GHOSTTY_FOCUS: &str = r#"function run(argv) {
   return String(hits.length || ts.length);
 }"#;
 
+/// The visible screen of the iTerm2 session on a tty (argv 1).
+const ITERM_READ: &str = r#"on run argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is (item 1 of argv) then return contents of s
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "marina:missing"
+end run"#;
+
+/// Type into the iTerm2 session on a tty (argv 1): `enter`, `esc`, or
+/// `text` with the text as argv 3 — as keystrokes, not a paste, like
+/// `tmux send-keys -l`.
+const ITERM_WRITE: &str = r#"on run argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is (item 1 of argv) then
+            set k to item 2 of argv
+            if k is "enter" then
+              tell s to write text ""
+            else if k is "esc" then
+              tell s to write text (character id 27) newline no
+            else
+              tell s to write text (item 3 of argv) newline no
+            end if
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "missing"
+end run"#;
+
+/// Type into the iTerm2 session on `tty`: `Some` once it took it.
+fn iterm_write(tty: &str, key: &str, text: &str) -> Option<String> {
+    osascript(ITERM_WRITE, &[tty, key, text]).filter(|o| o == "ok")
+}
+
 #[derive(Deserialize)]
 struct WezPane {
     pane_id: u64,
@@ -589,10 +634,15 @@ pub enum Send {
     Reply(String),
 }
 
+/// The hosts `interactive` names, for sentences.
+pub const TYPABLE: &str = "herdr, tmux and iTerm2";
+
 impl HostKind {
-    /// Hosts marina can read a session's screen from and type into.
+    /// Hosts marina can read a session's screen from and type into. iTerm2
+    /// is scripted only on a keystroke (preview, answer), never by the
+    /// sampler, so sampling never raises an automation prompt.
     pub fn interactive(self) -> bool {
-        matches!(self, HostKind::Herdr | HostKind::Tmux)
+        matches!(self, HostKind::Herdr | HostKind::Tmux | HostKind::ITerm)
     }
 }
 
@@ -613,6 +663,9 @@ pub fn read_screen(host: &HostInfo, lines: usize) -> Option<Vec<String>> {
             ],
         )?,
         HostKind::Tmux => run("tmux", &["capture-pane", "-p", "-t", &host.target])?,
+        HostKind::ITerm => {
+            Some(osascript(ITERM_READ, &[&host.target])?).filter(|t| t != "marina:missing")?
+        }
         _ => return None,
     };
     let mut rows: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
@@ -695,7 +748,10 @@ pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
         o.map(|_| format!("{what} → {}", host.describe()))
             .ok_or_else(|| format!("{} didn't take it", host.kind.name()))
     };
-    let screen = read_screen(host, 40).ok_or("couldn't read its screen")?;
+    let screen = read_screen(host, 40).ok_or_else(|| match host.kind {
+        HostKind::ITerm => "couldn't read its iTerm2 screen — allow marina's terminal to control iTerm2 under System Settings › Privacy › Automation".to_string(),
+        _ => "couldn't read its screen".to_string(),
+    })?;
     let dialog = shows_dialog(&screen) || host.status == Some(HostStatus::Blocked);
     match what {
         Send::Approve => approvable(&screen)?,
@@ -754,8 +810,18 @@ pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
                 .ok_or("tmux didn't take the text")?;
             ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "sent")
         }
+        (HostKind::ITerm, Send::Approve) => ok(iterm_write(t, "enter", ""), "approved"),
+        (HostKind::ITerm, Send::Reject) => ok(iterm_write(t, "esc", ""), "rejected"),
+        (HostKind::ITerm, Send::Reply(text)) => {
+            if dialog {
+                iterm_write(t, "esc", "").ok_or("iTerm2 couldn't dismiss the dialog")?;
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            iterm_write(t, "text", text).ok_or("iTerm2 didn't take the text")?;
+            ok(iterm_write(t, "enter", ""), "sent")
+        }
         _ => Err(format!(
-            "marina can't type into {} — only herdr and tmux panes",
+            "marina can't type into {} — only {TYPABLE}",
             host.describe()
         )),
     }
