@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Regenerate demo/marina.gif. Requires: vhs (brew install vhs) and node.
+# Regenerate demo/marina.gif (the servers view, from a real scene) and
+# demo/inbox.gif (the agent inbox, from `marina demo`).
+# Requires: vhs (brew install vhs) and node.
 #
 # Runs VHS from a throwaway directory so VHS's own helper processes (ttyd, the
 # headless renderer) have a cwd outside any dev project and aren't picked up by
@@ -14,6 +16,6 @@ trap 'rm -rf "$work"; pkill -f "$HOME/.cache/marina-demo" 2>/dev/null || true; r
 
 export MARINA_BIN="$REPO/target/release/marina"
 export MARINA_SCENE="$REPO/demo"
-( cd "$work" && vhs "$REPO/demo/demo.tape" )
-mv "$work/marina.gif" "$REPO/demo/marina.gif"
-echo "wrote $REPO/demo/marina.gif"
+( cd "$work" && vhs "$REPO/demo/demo.tape" && vhs "$REPO/demo/inbox.tape" )
+mv "$work/marina.gif" "$work/inbox.gif" "$REPO/demo/"
+echo "wrote $REPO/demo/marina.gif and $REPO/demo/inbox.gif"

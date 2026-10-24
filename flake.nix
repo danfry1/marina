@@ -1,5 +1,5 @@
 {
-  description = "marina — a developer-process cockpit (TUI + CLI)";
+  description = "marina — an inbox for coding-agent sessions and their dev servers (TUI + CLI)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,7 +21,7 @@
           doCheck = false;
 
           meta = with pkgs.lib; {
-            description = "A developer-process cockpit — dev servers and processes, resolved into names you recognize";
+            description = "One inbox for your coding-agent sessions (Claude Code, Codex, opencode) and the dev servers they start";
             homepage = "https://github.com/danfry1/marina";
             license = licenses.asl20;
             mainProgram = "marina";

@@ -40,7 +40,7 @@ use crate::ui::{fmt_uptime, tildify};
 use crate::verbs;
 
 pub const USAGE: &str = "\
-marina — developer-process cockpit
+marina — one inbox for your coding agents and the dev servers they start
 
 USAGE:
     marina                       launch the TUI
@@ -70,6 +70,8 @@ USAGE:
                                  or done, instead of marina inferring it
     marina doctor                what marina can see and do here, and how to
                                  set up the rest (hooks, notices, watcher)
+    marina demo                  the TUI on made-up sessions — try it with no
+                                 agents running; nothing real is touched
     marina version               print the version
 
 SELECTOR:

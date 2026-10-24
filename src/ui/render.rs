@@ -105,7 +105,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             String::new()
         };
         format!(
-            " inbox (a) · ▸ SERVERS │ {} targets{heavy}{agents} · sort:{}{} ",
+            " {}inbox (a) · ▸ SERVERS │ {} targets{heavy}{agents} · sort:{}{} ",
+            if app.demo { "DEMO · " } else { "" },
             app.snapshot.targets.len(),
             app.sort.label(),
             match app.group_by {
