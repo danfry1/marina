@@ -165,6 +165,8 @@ fn run(
                     } else if app.is_landing() {
                         // `L`: p / m / w, or Esc
                         match key.code {
+                            // Ctrl+W must never mean `w`
+                            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                             KeyCode::Char(c) => match app.land_key(c) {
                                 ui::LandAction::None => {}
                                 ui::LandAction::Send(action) => {
@@ -257,7 +259,8 @@ fn run(
                                 if let Some(dir) = app.start_land() {
                                     let ev = ev_tx.clone();
                                     std::thread::spawn(move || {
-                                        let _ = ev.send(UiEvent::Land(git::landing(&dir)));
+                                        let l = git::landing(&dir);
+                                        let _ = ev.send(UiEvent::Land(dir, l));
                                     });
                                 }
                             }
@@ -336,7 +339,7 @@ fn run(
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
                 UiEvent::Status(s) => app.set_status(s),
-                UiEvent::Land(l) => app.land_ready(l),
+                UiEvent::Land(dir, l) => app.land_ready(dir, l),
                 UiEvent::LogReady { project, path } => on_log_ready(app, project, path),
                 UiEvent::Screen {
                     pid,

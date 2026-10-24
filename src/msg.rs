@@ -34,7 +34,7 @@ pub enum UiEvent {
         path: Option<PathBuf>,
     },
     /// The git state of a session's tree, read off-thread for `L`.
-    Land(Option<crate::git::Landing>),
+    Land(PathBuf, Option<crate::git::Landing>),
     /// An agent session's screen, read off-thread for the preview pane.
     Screen {
         pid: u32,

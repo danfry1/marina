@@ -105,6 +105,9 @@ pub(crate) struct LandMenu {
     pub label: String,
     /// The live session it's for, if any.
     pub pid: Option<u32>,
+    /// The directory whose git state was asked for: a reply for any other
+    /// (an earlier `L`, answered late) is dropped.
+    pub dir: PathBuf,
     /// Its git state; `None` while it's being read.
     pub landing: Option<crate::git::Landing>,
     /// Why the last key pressed can't be done.
@@ -728,6 +731,7 @@ impl App {
         self.ctl.land = Some(LandMenu {
             label,
             pid,
+            dir: dir.clone(),
             landing: None,
             note: None,
         });
@@ -735,13 +739,23 @@ impl App {
         Some(dir)
     }
 
-    pub fn land_ready(&mut self, l: Option<crate::git::Landing>) {
+    pub fn land_ready(&mut self, dir: PathBuf, l: Option<crate::git::Landing>) {
+        if self
+            .ctl
+            .land
+            .as_ref()
+            .is_none_or(|m| m.dir != dir || m.landing.is_some())
+        {
+            return; // for a menu that's gone, or another one
+        }
         match (self.ctl.land.as_mut(), l) {
             (Some(m), Some(l)) => m.landing = Some(l),
             (Some(m), None) => {
                 let label = m.label.clone();
                 self.ctl.land = None;
-                self.set_status(format!("{label} isn't in a git repository"));
+                self.set_status(format!(
+                    "couldn't read {label}'s git state (not a repository, or git timed out)"
+                ));
             }
             (None, _) => {}
         }
@@ -801,6 +815,14 @@ impl App {
             .any(|a| a.cwd.starts_with(&l.tree));
         if running && l.linked() {
             return Some("a session still runs there — X ends it first".into());
+        }
+        let serving = self
+            .snapshot
+            .targets
+            .iter()
+            .any(|t| !t.pids.is_empty() && t.cwd.starts_with(&l.tree));
+        if serving && l.linked() {
+            return Some("a server still runs there — K stops it first".into());
         }
         l.remove_blocker()
     }

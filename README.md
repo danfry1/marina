@@ -152,10 +152,13 @@ marina                   # opens on the inbox when agents are running
   what can be done from there. `p` has the agent commit, push and open a
   pull request (it writes the message); `m` fast-forwards the main
   checkout's branch to it — only when both trees are clean and it's
-  strictly ahead; `w` removes its worktree, and the branch too once it's
-  merged — only when nothing would be lost (no uncommitted files, and every
-  commit merged or pushed) and no session still runs there. Each is
-  re-checked at the moment it runs; nothing is ever forced.
+  strictly ahead; `w` removes its worktree, and its branch once that's
+  merged (an unmerged branch is kept, commits and all) — only when nothing
+  would be lost: no uncommitted or untracked files, no ignored files beyond
+  dependency and build folders (an `.env` blocks it), no detached commits
+  nothing else points to, and no session or server still running there.
+  Each is re-checked at the moment it runs; if any of it can't be read,
+  nothing is offered; nothing is ever forced.
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; with
   hooks installed, the agent's own; elsewhere

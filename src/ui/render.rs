@@ -322,7 +322,10 @@ fn footer_line(app: &App) -> Line<'static> {
         }
         let on = Style::new().fg(Color::White);
         let off = Style::new().fg(Color::DarkGray);
-        let base = l.base.clone().unwrap_or_else(|| "main".into());
+        let into = match &l.base {
+            Some(b) => format!("merge into {b}"),
+            None => "merge".to_string(),
+        };
         let mut spans = vec![
             head,
             Span::styled(
@@ -336,11 +339,7 @@ fn footer_line(app: &App) -> Line<'static> {
                 "have it open a PR".to_string(),
                 app.land_pr_blocker(m).is_some(),
             ),
-            (
-                "m",
-                format!("merge into {base}"),
-                l.merge_blocker().is_some(),
-            ),
+            ("m", into, l.merge_blocker().is_some()),
             (
                 "w",
                 "remove worktree".to_string(),
