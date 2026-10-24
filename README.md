@@ -24,16 +24,19 @@ you recognize (`client-portal · next dev · :3000 · 340MB`), with who started
 each one, and one-key kill, restart and logs. Not a system monitor (btop/bottom
 own that), and not an `lsof` wrapper.
 
+![the servers view: grouping, logs, sort and filter](https://raw.githubusercontent.com/danfry1/marina/main/demo/marina.gif)
+
 **Getting set up:**
 
 ```sh
 brew install danfry1/tap/marina
+marina demo              # try the inbox on made-up sessions first (nothing real is touched)
 marina hooks --install   # agents report their own state (see below)
 marina doctor            # what marina can see and do here, and what's left to set up
 marina                   # opens on the inbox when agents are running
 ```
 
-![marina in action](https://raw.githubusercontent.com/danfry1/marina/main/demo/marina.gif)
+![the marina inbox: approving, replying, and sessions finishing](https://raw.githubusercontent.com/danfry1/marina/main/demo/inbox.gif)
 
 > A marina is a harbour full of berthed boats — a cockpit of dev services each
 > occupying a port. `marina` enumerates what's listening, resolves each to a
@@ -304,6 +307,7 @@ marina digest today           # what your agents did: per project, time working,
 marina watch --install        # background notices at login (--status, --uninstall)
 marina hooks --install        # agents report their own state (--uninstall; bare: status)
 marina doctor                 # what marina can see and do here, and what to set up
+marina demo                   # the TUI on made-up sessions (approve, reply, end act on them)
 marina version
 ```
 

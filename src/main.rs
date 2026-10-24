@@ -1,7 +1,8 @@
-//! marina — a developer-process cockpit.
+//! marina — one inbox for coding-agent sessions and the dev servers they start.
 
 mod cli;
 mod config;
+mod demo;
 mod digest;
 mod docker;
 mod doctor;
@@ -54,11 +55,22 @@ fn main() -> io::Result<()> {
     // CLI subcommands (ls/kill/restart/url/version/help). Unknown args error
     // there rather than falling through; only a bare `marina` reaches the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = cli::dispatch(&args) {
-        std::process::exit(code);
+    let demo = args.first().is_some_and(|a| a == "demo");
+    if demo && args.len() > 1 {
+        eprintln!("marina: demo takes no arguments");
+        std::process::exit(2);
+    }
+    if !demo {
+        if let Some(code) = cli::dispatch(&args) {
+            std::process::exit(code);
+        }
     }
 
-    let (rx, ctl) = sampler::spawn();
+    let (rx, ctl) = if demo {
+        demo::spawn()
+    } else {
+        sampler::spawn()
+    };
     let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableMouseCapture);
@@ -70,13 +82,17 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
-    ui::load_seen(&mut app);
+    // the demo keeps read / set-aside in memory: it writes no state
+    app.demo = demo;
+    if !demo {
+        ui::load_seen(&mut app);
+    }
     let agents_cfg = config::load().agents;
     app.set_quick_replies(agents_cfg.quick);
     app.set_start_in_inbox(agents_cfg.start.as_deref() != Some("servers"));
     let notify = config::load().notify;
     app.notify_agents = notify.agents;
-    let desktop_notify = notify.desktop;
+    let desktop_notify = notify.desktop && !demo;
     let result = run(
         &mut terminal,
         &mut app,
@@ -127,6 +143,10 @@ fn run(
                         match key.code {
                             KeyCode::Esc => app.new_cancel(),
                             KeyCode::Tab => app.new_toggle_worktree(),
+                            KeyCode::Enter if app.demo => {
+                                app.new_cancel();
+                                demo_only(app, "would start a session");
+                            }
                             KeyCode::Enter => {
                                 if let Some((req, place)) = app.new_commit() {
                                     let ev = ev_tx.clone();
@@ -148,7 +168,7 @@ fn run(
                             KeyCode::Esc => app.reply_cancel(),
                             KeyCode::Enter => {
                                 let action = app.reply_commit();
-                                run_action(app, action, &ev_tx);
+                                run_action(app, action, &ev_tx, &ctl);
                             }
                             KeyCode::Backspace => app.reply_backspace(),
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -173,6 +193,11 @@ fn run(
                         }
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('K' | 'R' | 'T' | 'O')
+                                if demo_only(app, "would act on a real process") => {}
+                            KeyCode::Char('Y')
+                                if demo_only(app, "would copy it to your clipboard") => {}
+                            KeyCode::Char('D') if demo_only(app, "would show its git diff") => {}
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                             KeyCode::Char('g') => app.jump_top(),
@@ -183,6 +208,9 @@ fn run(
                             // a fold row (inbox): show / hide what's behind it
                             KeyCode::Enter if app.toggle_fold() => {}
                             // an ended session (inbox): resume it
+                            KeyCode::Enter
+                                if app.is_ended_selected() && demo_only(app, "would resume it") => {
+                            }
                             KeyCode::Enter if app.is_ended_selected() => {
                                 if let Some((req, place)) = app.resume_selected() {
                                     let ev = ev_tx.clone();
@@ -203,14 +231,14 @@ fn run(
                             KeyCode::Char('N') => app.start_new(),
                             KeyCode::Char('X') => {
                                 let action = app.end_session();
-                                run_action(app, action, &ev_tx);
+                                run_action(app, action, &ev_tx, &ctl);
                             }
                             KeyCode::Char(c @ '1'..='9') if app.selected_agent().is_some() => {
                                 app.quick_reply(c as usize - '0' as usize)
                             }
                             KeyCode::Char(c @ ('y' | 'n')) => {
                                 let action = app.answer(c == 'y');
-                                run_action(app, action, &ev_tx);
+                                run_action(app, action, &ev_tx, &ctl);
                             }
                             KeyCode::Char('d') if app.selected_agent().is_some() => {
                                 app.toggle_aside()
@@ -288,8 +316,13 @@ fn run(
         // The open preview's live screen, read off the UI thread.
         if let Some((pid, generation, host)) = app.screen_due() {
             let ev = ev_tx.clone();
+            let demo = app.demo;
             std::thread::spawn(move || {
-                let rows = hosts::read_screen_or_why(&host, ui::control_rows());
+                let rows = if demo {
+                    demo::screen(pid).ok_or_else(|| "no screen".to_string())
+                } else {
+                    hosts::read_screen_or_why(&host, ui::control_rows())
+                };
                 let _ = ev.send(UiEvent::Screen {
                     pid,
                     generation,
@@ -400,6 +433,9 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
         return;
     };
     app.mark_read(pid);
+    if demo_only(app, "would jump to its terminal") {
+        return;
+    }
     let Some(a) = app.selected_agent() else {
         return;
     };
@@ -432,9 +468,34 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
     }
 }
 
+/// In the demo, say what `what` would have done instead, and do nothing.
+fn demo_only(app: &mut ui::App, what: &str) -> bool {
+    if app.demo {
+        app.set_status(format!("demo: {what} — nothing real is touched"));
+    }
+    app.demo
+}
+
 /// Carry out a control action (approve / reject / reply) off the UI thread:
-/// herdr and tmux calls can take a moment.
-fn run_action(app: &mut ui::App, action: ui::Action, ev: &Sender<UiEvent>) {
+/// herdr and tmux calls can take a moment. The demo's go to its sessions.
+fn run_action(
+    app: &mut ui::App,
+    action: ui::Action,
+    ev: &Sender<UiEvent>,
+    ctl: &Sender<SamplerCtl>,
+) {
+    if app.demo {
+        let all = match action {
+            ui::Action::None => return,
+            ui::Action::Send(host, what) => vec![(host, what)],
+            ui::Action::SendAll(all) => all,
+        };
+        app.set_status(format!("demo: sent to {} session(s)", all.len()));
+        for (host, what) in all {
+            let _ = ctl.send(SamplerCtl::Demo(host.target, what));
+        }
+        return;
+    }
     let (host, what) = match action {
         ui::Action::None => return,
         ui::Action::Send(host, what) => (host, what),

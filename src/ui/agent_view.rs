@@ -337,7 +337,11 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             parts.push("nothing needs you".into());
         }
         clip(
-            &format!(" ▸ INBOX · servers (a) │ {} ", parts.join(" · ")),
+            &format!(
+                " {}▸ INBOX · servers (a) │ {} ",
+                if app.demo { "DEMO · " } else { "" },
+                parts.join(" · ")
+            ),
             inner_w,
         )
     };

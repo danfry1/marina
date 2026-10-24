@@ -123,6 +123,8 @@ pub(crate) struct PendingKill {
 }
 
 pub struct App {
+    /// `marina demo`: made-up sessions; verbs only say what they'd do.
+    pub demo: bool,
     pub(crate) snapshot: Arc<Snapshot>,
     pub(crate) selected: Option<Entry>,
     /// Where the cursor last sat in `display` — the nearest-neighbor fallback
@@ -192,6 +194,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            demo: false,
             snapshot: Arc::new(Snapshot::empty()),
             selected: None,
             last_index: 0,

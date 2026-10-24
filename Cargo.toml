@@ -3,12 +3,12 @@
 name = "marina-tui"
 version = "0.6.0"
 edition = "2021"
-description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
+description = "One inbox for your coding-agent sessions (Claude Code, Codex, opencode) and the dev servers they start"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/danfry1/marina"
 homepage = "https://github.com/danfry1/marina"
-keywords = ["tui", "cli", "ports", "devtools", "process"]
+keywords = ["tui", "ai-agents", "claude-code", "codex", "devtools"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/demo", "/.github", "/docs", "/.agents"]
 

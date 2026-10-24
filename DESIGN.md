@@ -175,6 +175,14 @@ A thin layer over two mature crates — not raw syscalls.
 3. **`resolve`** — heuristic pipeline + cache + user-override config.
 4. **`verbs`** — kill-tree, restart, copy/open, best-effort log discovery.
 5. **`ui`** — Ratatui widgets, view state, event loop, sort/hysteresis/navigation.
+6. **`demo`** — `marina demo`: a stand-in for the sampler thread that sends
+   snapshots of made-up sessions, scripted against the clock (one finishes,
+   one stops to ask). Approve / reject / reply / end arrive as
+   `SamplerCtl::Demo` and play that session's script; every other verb is
+   stopped in `main` (`demo_only`) and only says what it would do; seen and
+   set-aside stay in memory. Its pids sit above any OS's pid range, so a verb
+   that slipped through could reach no process. `demo/inbox.tape` records the
+   README's inbox GIF from it.
 
 ### Anchor & subtree boundary
 
@@ -235,6 +243,7 @@ enum SamplerMsg { Snapshot(Arc<Snapshot>) }
 // UI -> sampler. Dropping the sender shuts the thread down.
 enum SamplerCtl {
     Refresh,   // rebuild NOW (sent right after a verb) instead of sleeping
+    Demo(String, Send), // `marina demo`: act on the made-up session at that host target
 }
 
 // background verb / log-discovery threads -> UI, drained each loop tick

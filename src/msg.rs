@@ -19,6 +19,8 @@ pub enum SamplerCtl {
     /// Rebuild a snapshot now (right after a verb) instead of waiting out the
     /// adaptive-cadence sleep — a killed row disappears immediately.
     Refresh,
+    /// `marina demo`: send this to the made-up session at that host target.
+    Demo(String, crate::hosts::Send),
 }
 
 /// Background verb / log-discovery threads -> UI. Drained every loop tick.
