@@ -432,27 +432,33 @@ pub fn plumbing(p: &ProcInfo) -> Option<&'static str> {
         Some(prog) if SCRIPT_HOSTS.contains(&prog) => 2,
         _ => 1,
     };
-    // The subcommand is the first positional, after any flags and
-    // `-c key=value` overrides (`codex -c … app-server`).
-    let mut args = p.argv.iter().skip(skip);
-    while let Some(a) = args.next() {
-        if let Some(k) = AGENT_PLUMBING.iter().copied().find(|&k| k == a) {
-            return Some(k);
-        }
+    // The first two arguments, past any `-c key=value` overrides
+    // (`codex -c … app-server`).
+    let mut args = Vec::new();
+    let mut it = p.argv.iter().skip(skip);
+    while let Some(a) = it.next() {
         if a == "-c" || a == "--config" {
-            args.next();
-        } else if !a.starts_with('-') {
-            return None;
+            it.next();
+        } else {
+            args.push(a);
         }
     }
-    None
+    args.into_iter()
+        .take(2)
+        .find_map(|a| AGENT_PLUMBING.iter().copied().find(|&k| k == a))
 }
 
-/// A process run from inside a macOS app bundle — the Claude or Codex desktop
-/// app and its Electron helpers (`Codex (Renderer)`): a GUI, not a session in
-/// a terminal, whatever its name.
+/// A macOS app's own GUI process — the Claude or Codex desktop app and its
+/// Electron helpers (`Claude`, `Codex (Renderer)`): run from inside a bundle
+/// and named like an app. A CLI that ships in a bundle keeps a CLI's name
+/// (`ClaudeCode.app/…/claude`, an editor's bundled `node`) and still counts.
 fn in_app_bundle(p: &ProcInfo) -> bool {
-    p.argv.first().is_some_and(|a| a.contains(".app/Contents/"))
+    p.argv.first().is_some_and(|a| {
+        a.contains(".app/Contents/")
+            && !basename(a)
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
+    })
 }
 
 /// An agent's background service — `opencode serve`, Claude Code's daemon —
@@ -992,6 +998,21 @@ mod tests {
             p(30, 1, "codex", &["codex", "app-server", "--listen"]),
             p(33, 1, "codex", &["codex", "-c", "x=true", "app-server"]),
             p(34, 1, "codex", &["codex", "-c", "y=1", "exec-server", "--remote"]),
+            // a CLI that ships in a bundle is still a session
+            p(
+                37,
+                1,
+                "claude",
+                &["/u/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude"],
+            ),
+            p(
+                38,
+                1,
+                "node",
+                &["/Applications/Cursor.app/Contents/Resources/app/resources/helpers/node", "/u/.npm-global/bin/codex"],
+            ),
+            // a flag's value isn't a subcommand
+            p(39, 1, "codex", &["codex", "--full-auto", "--profile", "server"]),
             // the desktop apps and their Electron helpers
             p(35, 1, "Claude", &["/Applications/Claude.app/Contents/MacOS/Claude"]),
             p(
@@ -1017,6 +1038,9 @@ mod tests {
             vec![
                 (10, "claude"),
                 (22, "claude"),
+                (37, "claude"),
+                (38, "codex"),
+                (39, "codex"),
                 (40, "opencode"),
                 (51, "claude")
             ]
