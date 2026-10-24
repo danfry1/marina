@@ -603,8 +603,13 @@ pub fn parse_claude_subagent(
     let m: Value = serde_json::from_str(meta).unwrap_or_default();
     let s = parse_tail_of(tail, true);
     let updated = s.updated.unwrap_or(mtime).max(mtime);
-    let running =
-        m["finished"].as_bool() != Some(true) && now.saturating_sub(updated) < SUBAGENT_STALE;
+    let end = subagent_end(tail);
+    // done: the meta says so (finished, or stopped with Esc), or its
+    // transcript ends a turn — older Claude Codes never write `finished`
+    let running = m["finished"].as_bool() != Some(true)
+        && m["stoppedByUser"].as_bool() != Some(true)
+        && !end.ended
+        && now.saturating_sub(updated) < SUBAGENT_STALE;
     Subagent {
         id: id.to_string(),
         task: text_of(&m["description"])
@@ -616,7 +621,51 @@ pub fn parse_claude_subagent(
         started,
         updated,
         doing: s.pending_tool.filter(|_| running),
-        said: s.last_reply,
+        said: end.report.or(s.last_reply),
+    }
+}
+
+/// How a subagent's transcript ends: whether its newest message closes a
+/// turn, and the report it handed back, if it did that.
+struct SubagentEnd {
+    ended: bool,
+    report: Option<String>,
+}
+
+/// The newest messages of a subagent's transcript: an assistant message
+/// that ended its turn (`end_turn`), or the result of its handback tool
+/// call (the report it delivered to its caller) — whose message is what it
+/// said.
+fn subagent_end(tail: &str) -> SubagentEnd {
+    let mut messages = tail
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| matches!(v["type"].as_str(), Some("user" | "assistant")));
+    let newest = messages.next();
+    let handback = |v: &Value| {
+        v["message"]["content"].as_array().and_then(|b| {
+            b.iter()
+                .find(|b| b["type"] == "tool_use" && b["name"] == "SubagentHandback")
+                .map(|b| text_of(&b["input"]["message"]))
+        })
+    };
+    match newest {
+        Some(v) if v["type"] == "assistant" => SubagentEnd {
+            ended: v["message"]["stop_reason"] == "end_turn",
+            report: handback(&v).flatten(),
+        },
+        Some(_) => {
+            let report = messages.next().as_ref().and_then(handback);
+            SubagentEnd {
+                ended: report.is_some(),
+                report: report.flatten(),
+            }
+        }
+        None => SubagentEnd {
+            ended: false,
+            report: None,
+        },
     }
 }
 
@@ -747,6 +796,7 @@ struct Entry {
 /// A subagent as last read, and the file stamps it was read at.
 struct SubEntry {
     stamp: (SystemTime, u64, SystemTime),
+    read_at: Instant,
     sub: Subagent,
 }
 
@@ -906,7 +956,10 @@ impl Cache {
             };
             let latest = mtime_secs(lt).max(mtime_secs(mt));
             let stamp = (lt, lm.len(), mt);
-            let fresh = self.subs.get(&log).is_some_and(|s| s.stamp == stamp);
+            let known = self.subs.get(&log);
+            // unchanged, or changed again within the re-read throttle
+            let fresh = known.is_some_and(|s| s.stamp == stamp || s.read_at.elapsed() < MIN_REREAD);
+            let started = known.and_then(|s| s.sub.started);
             if !fresh {
                 // long finished and never read: not worth opening
                 if now.saturating_sub(latest) > SUBAGENT_KEEP {
@@ -918,8 +971,16 @@ impl Cache {
                 ) else {
                     continue;
                 };
-                let sub = parse_claude_subagent(&sub_id, &meta, &tail, first_ts(&log), latest, now);
-                self.subs.insert(log.clone(), SubEntry { stamp, sub });
+                let started = started.or_else(|| first_ts(&log));
+                let sub = parse_claude_subagent(&sub_id, &meta, &tail, started, latest, now);
+                self.subs.insert(
+                    log.clone(),
+                    SubEntry {
+                        stamp,
+                        read_at: Instant::now(),
+                        sub,
+                    },
+                );
             }
             let Some(s) = self.subs.get_mut(&log) else {
                 continue;
@@ -956,10 +1017,23 @@ impl Cache {
             };
             let Ok(mt) = m.modified() else { continue };
             let stamp = (mt, m.len(), mt);
-            if self.subs.get(&path).is_none_or(|s| s.stamp != stamp) {
-                let (Some(head), Some(tail)) =
-                    (read_head(&path, 256 * 1024), read_tail(&path, TAIL))
-                else {
+            let known = self.subs.get(&path);
+            let fresh = known.is_some_and(|s| s.stamp == stamp || s.read_at.elapsed() < MIN_REREAD);
+            if !fresh {
+                // the head (its session_meta) never changes: read it once
+                let started = known.and_then(|s| s.sub.started);
+                let head = match started {
+                    Some(_) => String::new(),
+                    None => read_head(&path, 256 * 1024).unwrap_or_default(),
+                };
+                let started = started.or_else(|| {
+                    let m: Value = serde_json::from_str(head.lines().next()?).ok()?;
+                    m["payload"]["timestamp"]
+                        .as_str()
+                        .or(m["timestamp"].as_str())
+                        .and_then(parse_ts)
+                });
+                let Some(tail) = read_tail(&path, TAIL) else {
                     continue;
                 };
                 let s = parse_codex(&head, &tail);
@@ -977,12 +1051,19 @@ impl Cache {
                     kind: role,
                     background: true,
                     running: s.in_turn,
-                    started: first_ts(&path),
+                    started,
                     updated,
                     doing: None,
                     said: s.last_reply,
                 };
-                self.subs.insert(path.clone(), SubEntry { stamp, sub });
+                self.subs.insert(
+                    path.clone(),
+                    SubEntry {
+                        stamp,
+                        read_at: Instant::now(),
+                        sub,
+                    },
+                );
             }
             let Some(s) = self.subs.get_mut(&path) else {
                 continue;
@@ -1228,6 +1309,43 @@ mod tests {
         let s = parse_claude_subagent("a1", meta, &tail, None, at, at + SUBAGENT_STALE + 1);
         assert!(!s.running);
         let _ = now;
+    }
+
+    #[test]
+    fn a_subagent_is_done_when_its_transcript_ends_a_turn_or_it_was_stopped() {
+        let ts = "2027-01-15T08:00:00Z";
+        let at = parse_ts(ts).unwrap();
+        let meta = r#"{"description":"Find the flaky test"}"#;
+        // older Claude Codes never write `finished`: its last message ends the turn
+        let ended = line(
+            serde_json::json!({"type":"assistant","isSidechain":true,"timestamp":ts,
+            "message":{"role":"assistant","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"Found it."}]}}),
+        );
+        let s = parse_claude_subagent("a", meta, &ended, None, at, at + 5);
+        assert!(!s.running);
+        assert_eq!(s.said.as_deref(), Some("Found it."));
+        // a report handed back through a tool, and its result
+        let handback = [
+            line(serde_json::json!({"type":"assistant","isSidechain":true,"timestamp":ts,
+                "message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use",
+                "name":"SubagentHandback","input":{"message":"Three tests use local time."}}]}})),
+            line(serde_json::json!({"type":"user","isSidechain":true,"timestamp":ts,
+                "message":{"role":"user","content":[{"type":"tool_result","content":"delivered"}]}})),
+        ]
+        .join("\n");
+        let s = parse_claude_subagent("a", meta, &handback, None, at, at + 5);
+        assert!(!s.running);
+        assert_eq!(s.said.as_deref(), Some("Three tests use local time."));
+        // stopped with Esc: never finished, but not running
+        let mid = line(
+            serde_json::json!({"type":"assistant","isSidechain":true,"timestamp":ts,
+            "message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use",
+            "name":"Bash","input":{"command":"cargo test"}}]}}),
+        );
+        assert!(parse_claude_subagent("a", meta, &mid, None, at, at + 5).running);
+        let stopped = r#"{"description":"x","stoppedByUser":true}"#;
+        assert!(!parse_claude_subagent("a", stopped, &mid, None, at, at + 5).running);
     }
 
     #[test]

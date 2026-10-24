@@ -1319,7 +1319,7 @@ struct AgentJson {
     session: Option<String>,
     /// How to get back into it (`claude --resume <id>`, …).
     resume: Option<String>,
-    /// `working` (a shell running, or recent terminal output), `blocked`
+    /// `working` (a shell or subagent running, or recent terminal output), `blocked`
     /// (waiting on a question, host-reported), `idle`, or `stale` (idle, no
     /// terminal input for over a day).
     state: &'static str,
@@ -1434,7 +1434,10 @@ impl AgentJson {
             pid: a.pid,
             session: a.session.clone(),
             resume: a.as_launcher().resume_hint(),
-            state: if a.is_working(now) {
+            // asking you something outranks subagents still at work
+            state: if a.is_blocked() && a.shells().next().is_none() {
+                "blocked"
+            } else if a.is_working(now) {
                 "working"
             } else if a.is_blocked() {
                 "blocked"
