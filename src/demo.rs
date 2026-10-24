@@ -103,6 +103,9 @@ struct Sess {
     started: u64,
     input: u64,
     tokens: u64,
+    /// Subagents: what each was asked, its kind, and how long after the
+    /// demo starts it finishes (0: finished already).
+    subs: Vec<(&'static str, &'static str, u64)>,
     /// What happens next, unprompted.
     next: Vec<Step>,
     on_yes: Vec<Step>,
@@ -130,6 +133,7 @@ impl Sess {
             started: now - 3 * 3600,
             input: now - 60,
             tokens: 60_000,
+            subs: Vec::new(),
             next: Vec::new(),
             on_yes: vec![
                 step(0, St::Working),
@@ -248,6 +252,15 @@ fn scenario(now: u64) -> Vec<Sess> {
     s.prompt = "The date tests fail around midnight UTC — find out why and fix it".into();
     s.st = St::Working;
     s.shell = Some("pnpm vitest run");
+    s.subs = vec![
+        ("Find tests that build dates in local time", "Explore", 9),
+        (
+            "Check the CI logs for midnight failures",
+            "general-purpose",
+            6,
+        ),
+        ("Read the date utils", "Explore", 0),
+    ];
     s.git = git(2, 0, 19, 7, 0);
     s.next = vec![step(12, St::Idle).says(
         "Fixed: the tests built dates in local time. All 214 pass now. Want me to open a PR?",
@@ -316,6 +329,38 @@ fn scenario(now: u64) -> Vec<Sess> {
 
 fn dir(project: &str) -> PathBuf {
     PathBuf::from("/Users/you/dev").join(project)
+}
+
+/// When the demo started, for the subagents' clocks.
+fn demo_start() -> u64 {
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(crate::ui::unix_now)
+}
+
+fn subagents_of(s: &Sess, now: u64) -> Vec<crate::transcript::Subagent> {
+    let start = demo_start();
+    s.subs
+        .iter()
+        .enumerate()
+        .map(|(i, &(task, kind, ends))| {
+            let running = now < start + ends;
+            crate::transcript::Subagent {
+                id: format!("demo-sub-{i}"),
+                task: task.into(),
+                kind: Some(kind.into()),
+                background: true,
+                running,
+                started: Some(start.saturating_sub(40 + 30 * i as u64)),
+                updated: if running {
+                    now
+                } else {
+                    (start + ends).min(now)
+                },
+                doing: running.then(|| "Grep: new Date".into()),
+                said: (!running).then(|| "Found it: three tests build dates in local time.".into()),
+            }
+        })
+        .collect()
 }
 
 fn agent_of(i: usize, s: &Sess, now: u64) -> Agent {
@@ -413,6 +458,7 @@ fn agent_of(i: usize, s: &Sess, now: u64) -> Agent {
             at: s.at,
             chain: vec![pid],
         }),
+        subagents: subagents_of(s, now),
     }
 }
 

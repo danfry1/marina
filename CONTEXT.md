@@ -121,6 +121,10 @@
   (finished and asking something, or unread), *working*, *parked*
   (finished, nothing asked, or set aside), and *ended*.
 
+- **Subagent** — an agent a session started inside its own process
+  (Claude Code's Agent tool, a Codex spawned thread). Shown under its
+  session, never as a session; while one runs, its session is working.
+
 - **Report** — what an agent said of its own state through marina's hooks
   (working, blocked, idle). Trusted over inference until the transcript
   records something newer.

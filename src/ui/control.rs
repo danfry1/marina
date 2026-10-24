@@ -391,7 +391,9 @@ impl App {
         if self.waiting_on_you(a) {
             return 0;
         }
-        if a.is_working(now) {
+        // herdr's done (finished, unread) shows even while its subagents run
+        let done = a.host_status() == Some(crate::hosts::HostStatus::Done);
+        if a.is_working(now) && !(done && a.shells().next().is_none()) {
             return 2;
         }
         if self.is_aside(a) {
@@ -399,7 +401,6 @@ impl App {
         }
         let recent = now.saturating_sub(a.settled_at()) < YOUR_TURN_FOR;
         let asks = a.summary.as_ref().is_some_and(|s| s.ask().is_some());
-        let done = a.host_status() == Some(crate::hosts::HostStatus::Done);
         if (asks && recent) || done || self.is_unread(a, now) {
             1
         } else {
@@ -427,6 +428,10 @@ impl App {
             }
             0 => format!("waiting on an approval or a question — {source}"),
             2 if a.shells().next().is_some() => "running a command".into(),
+            2 if a.subagents_running() > 0 => match a.subagents_running() {
+                1 => "a subagent it started is still working".into(),
+                n => format!("{n} subagents it started are still working"),
+            },
             2 if a.host_status().is_some() => format!("working — {source}"),
             2 if a.tty.is_some() => "inferred: its screen is changing".into(),
             2 => "inferred: it's using CPU".into(),
@@ -895,6 +900,19 @@ impl App {
         let label = self.agent_label(a);
         // /exit while it works would be queued (or typed into its prompt),
         // and at a dialog the Esc first would reject the pending call
+        let subs = a.subagents_running();
+        if subs > 0 && !self.waiting_on_you(a) {
+            let (n, them) = if subs == 1 {
+                ("a subagent".to_string(), "it")
+            } else {
+                (format!("{subs} subagents"), "them")
+            };
+            self.set_status(format!(
+                "{label} has {n} still running — ending it would stop {them}; let {them} finish first"
+            ));
+            self.ctl.pending_end = None;
+            return Action::None;
+        }
         if a.is_working(unix_now()) || self.waiting_on_you(a) {
             self.set_status(format!(
                 "{label} is busy — let it finish (or answer it) before ending it, or Enter to jump there"

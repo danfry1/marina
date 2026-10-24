@@ -140,6 +140,13 @@ marina                   # opens on the inbox when agents are running
   line of context (directory, branch and changes, PR, servers, shared
   tree, context size) and the full conversation (`[` `]` to scroll); `p`
   switches it to the session's live screen (herdr, tmux and iTerm2).
+- **Subagents** — the subagents a session starts (Claude Code's Agent
+  tool, Codex's spawned threads) are listed under it, not as sessions of
+  their own: the detail shows each one running with what it's on, and the
+  ones finished in the last half hour with what they said. A session
+  counts as working while any of its subagents is, so one waiting on
+  background agents isn't shown as done, and `X` won't end it mid-way.
+  `marina agents --long/--json` list them too.
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; with
   hooks installed, the agent's own; elsewhere
@@ -447,8 +454,11 @@ marina is deliberately boring on this front:
   *tail* of each Claude Code session's transcript (`~/.claude/projects/*/<session>.jsonl`;
   the last 256KB, more only if the last reply is further back): its title,
   your last prompt, its last reply and recap, a pending tool call, and a PR
-  link (the digest also reads turn durations and token counts). Codex
-  rollouts under `~/.codex/sessions` are read the same way, and opencode
+  link (the digest also reads turn durations and token counts). For its
+  subagents it reads `<session>/subagents/agent-*.meta.json` and the tail of
+  each subagent transcript beside it. Codex
+  rollouts under `~/.codex/sessions` are read the same way (the first record
+  of the last two days' rollouts names any parent thread), and opencode
   summaries come from `opencode session export` while its service runs.
   Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts

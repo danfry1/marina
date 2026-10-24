@@ -71,6 +71,12 @@ fn row_text(app: &App, a: &Agent, now: u64) -> String {
         },
         2 => {
             let shells: Vec<&str> = a.shells().map(|c| c.label.as_str()).collect();
+            let subs = subagents_running(a);
+            match (shells.is_empty(), subs) {
+                (false, Some(subs)) => return format!("$ {} · {subs}", shells.join(", ")),
+                (true, Some(subs)) => return subs,
+                _ => {}
+            }
             if !shells.is_empty() {
                 format!("$ {}", shells.join(", "))
             } else if let Some(t) = a.pending_tool() {
@@ -92,6 +98,91 @@ fn row_text(app: &App, a: &Agent, now: u64) -> String {
             .or_else(|| s.and_then(|s| s.did()))
             .unwrap_or_default(),
     }
+}
+
+/// `2 subagents: Review the PR, Find the flaky test` — what its running
+/// subagents are doing, if any are.
+fn subagents_running(a: &Agent) -> Option<String> {
+    let running: Vec<&str> = a
+        .subagents
+        .iter()
+        .filter(|s| s.running)
+        .map(|s| s.task.as_str())
+        .collect();
+    match running.len() {
+        0 => None,
+        1 => Some(format!("subagent: {}", running[0])),
+        n => Some(format!("{n} subagents: {}", running.join(", "))),
+    }
+}
+
+/// The detail's SUBAGENTS section: each running one with what it's on,
+/// then the recently finished with what they last said.
+fn subagent_lines(a: &Agent, now: u64, w: usize) -> Vec<Line<'static>> {
+    if a.subagents.is_empty() {
+        return Vec::new();
+    }
+    let running = a.subagents_running();
+    let done = a.subagents.len() - running;
+    let mut head = vec![format!(" SUBAGENTS")];
+    if running > 0 {
+        head.push(format!("{running} running"));
+    }
+    if done > 0 {
+        head.push(format!("{done} done lately"));
+    }
+    let color = if running > 0 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let mut out = vec![
+        Line::raw(""),
+        Line::styled(
+            head.join(" · "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for s in a.subagents.iter().take(6) {
+        let mut text = s.task.clone();
+        if let Some(k) = s.kind.as_deref().filter(|k| *k != "general-purpose") {
+            text.push_str(&format!(" · {k}"));
+        }
+        let (mark, style, tail) = if s.running {
+            let since = s.started.map(|t| fmt_age(now.saturating_sub(t)));
+            let doing = s.doing.clone().unwrap_or_else(|| "thinking".into());
+            (
+                "◐",
+                Style::new().fg(Color::Yellow),
+                match since {
+                    Some(t) => format!(" · {t} · {doing}"),
+                    None => format!(" · {doing}"),
+                },
+            )
+        } else {
+            let said = s
+                .said
+                .as_deref()
+                .map(|t| format!(" — {}", first_sentence(t)))
+                .unwrap_or_default();
+            (
+                "✓",
+                DIM,
+                format!(" · {} ago{said}", fmt_age(now.saturating_sub(s.updated))),
+            )
+        };
+        out.push(Line::styled(
+            clip(&format!("   {mark} {text}{tail}"), w.saturating_sub(1)),
+            style,
+        ));
+    }
+    if a.subagents.len() > 6 {
+        out.push(Line::styled(
+            format!("   … and {} more", a.subagents.len() - 6),
+            DIM,
+        ));
+    }
+    out
 }
 
 pub(crate) fn first_sentence(s: &str) -> String {
@@ -616,6 +707,7 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
             );
         }
     }
+    out.extend(subagent_lines(a, now, w));
     // context, in one line: where, branch and changes, PR, servers, mates
     out.push(Line::raw(""));
     let mut meta: Vec<Span<'static>> = vec![Span::styled(

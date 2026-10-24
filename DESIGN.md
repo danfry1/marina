@@ -574,6 +574,21 @@ window.
   leading `{"type":…` without parsing (request blobs are huge); sidechain
   (subagent) records are ignored. Cached per session, re-read when the file
   changes, at most every 2s. `[agents] transcripts = false` disables it.
+- *Subagents* (`Agent::subagents`, `transcript::Subagent`): Claude Code
+  writes each subagent to `<id>/subagents/agent-<sub>.jsonl` beside the
+  session's transcript, with an `agent-<sub>.meta.json` (description,
+  `agentType`, `requestShape`; `finished: true` once its turn ends — absent
+  while it works). One is running until then, and stops counting as running
+  after 30 minutes without a record (a session killed mid-turn). Codex
+  spawned threads have their own rollouts, whose `session_meta` names the
+  parent (`source.subagent.thread_spawn.parent_thread_id`, with a nickname
+  and role); the last two days' rollouts written in the last half hour are
+  scanned every 5s, each file's head read once; one is running while its
+  turn is open. Finished subagents are kept for 30 minutes. Each file is
+  re-read only when its stamp changes. A session with a running subagent
+  `is_working`, so it sorts under *working*, isn't "done", and `X` refuses
+  to end it. A subagent's shells are children of the session's process, so
+  they show as the session's own.
 - *Preview* (`p`): the summary, or the session's live screen via
   `herdr agent read --source visible` / `tmux capture-pane` / iTerm2's
   `contents of session` (AppleScript, by tty), read
