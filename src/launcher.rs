@@ -394,6 +394,7 @@ const AGENT_PLUMBING: &[&str] = &[
     "--bg-pty-host",
     "--bg-spare",
     "app-server",
+    "exec-server",
     "mcp",
     "mcp-server",
     "serve",
@@ -402,13 +403,13 @@ const AGENT_PLUMBING: &[&str] = &[
 ];
 
 /// Is `p` an agent *session* — the process a person (or another agent) is
-/// talking to — and which agent? Plumbing processes and an agent's own
-/// same-named helper children are not sessions.
+/// talking to — and which agent? Plumbing processes, an agent's own
+/// same-named helper children and desktop apps are not sessions.
 pub fn agent_session(p: &ProcInfo, procs: &HashMap<u32, ProcInfo>) -> Option<&'static str> {
     let Some((LauncherKind::Agent, name)) = classify(p) else {
         return None;
     };
-    if plumbing(p).is_some() {
+    if plumbing(p).is_some() || in_app_bundle(p) {
         return None;
     }
     // A same-named agent spawned directly by a session is that session's
@@ -431,11 +432,27 @@ pub fn plumbing(p: &ProcInfo) -> Option<&'static str> {
         Some(prog) if SCRIPT_HOSTS.contains(&prog) => 2,
         _ => 1,
     };
-    p.argv
-        .iter()
-        .skip(skip)
-        .take(2)
-        .find_map(|a| AGENT_PLUMBING.iter().copied().find(|&k| k == a))
+    // The subcommand is the first positional, after any flags and
+    // `-c key=value` overrides (`codex -c … app-server`).
+    let mut args = p.argv.iter().skip(skip);
+    while let Some(a) = args.next() {
+        if let Some(k) = AGENT_PLUMBING.iter().copied().find(|&k| k == a) {
+            return Some(k);
+        }
+        if a == "-c" || a == "--config" {
+            args.next();
+        } else if !a.starts_with('-') {
+            return None;
+        }
+    }
+    None
+}
+
+/// A process run from inside a macOS app bundle — the Claude or Codex desktop
+/// app and its Electron helpers (`Codex (Renderer)`): a GUI, not a session in
+/// a terminal, whatever its name.
+fn in_app_bundle(p: &ProcInfo) -> bool {
+    p.argv.first().is_some_and(|a| a.contains(".app/Contents/"))
 }
 
 /// An agent's background service — `opencode serve`, Claude Code's daemon —
@@ -973,6 +990,16 @@ mod tests {
                 ],
             ),
             p(30, 1, "codex", &["codex", "app-server", "--listen"]),
+            p(33, 1, "codex", &["codex", "-c", "x=true", "app-server"]),
+            p(34, 1, "codex", &["codex", "-c", "y=1", "exec-server", "--remote"]),
+            // the desktop apps and their Electron helpers
+            p(35, 1, "Claude", &["/Applications/Claude.app/Contents/MacOS/Claude"]),
+            p(
+                36,
+                1,
+                "Codex (Renderer)",
+                &["/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)", "--type=renderer"],
+            ),
             p(31, 1, "opencode", &["opencode", "serve"]),
             p(32, 1, "node", &["node", "/x/bin/opencode", "serve"]),
             p(40, 1, "opencode", &["opencode"]),
