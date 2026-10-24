@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
-use super::format::unix_now;
+use super::format::{tildify, unix_now};
 use super::state::{App, Entry};
 use crate::hosts::{self, HostInfo, Send};
 use crate::model::Agent;
@@ -77,6 +77,9 @@ pub(crate) struct Control {
     pub quick: Vec<String>,
     /// A new session being set up (`N`).
     pub new_session: Option<NewDraft>,
+    /// `L`: landing a session's work — waiting for its git state, then the
+    /// choices it allows.
+    pub land: Option<LandMenu>,
     /// `X` pressed once on this agent: press again to end it.
     pub pending_end: Option<(u32, Instant)>,
     /// Open on the inbox once the first snapshot shows agent sessions.
@@ -96,6 +99,27 @@ pub(crate) struct Control {
 }
 
 /// `N`: where and with what to start a session.
+/// `L` on a session (or an ended one): what can be done with its work.
+pub(crate) struct LandMenu {
+    /// `claude·api`, or the ended session's directory.
+    pub label: String,
+    /// The live session it's for, if any.
+    pub pid: Option<u32>,
+    /// Its git state; `None` while it's being read.
+    pub landing: Option<crate::git::Landing>,
+    /// Why the last key pressed can't be done.
+    pub note: Option<String>,
+}
+
+/// What a key in the land menu asks of the main loop.
+pub enum LandAction {
+    None,
+    /// Send the agent a prompt (`p`).
+    Send(Action),
+    Merge(crate::git::Landing),
+    Remove(crate::git::Landing),
+}
+
 pub(crate) struct NewDraft {
     pub dir: PathBuf,
     pub agent: String,
@@ -686,6 +710,145 @@ impl App {
             .get(&a.pid)
             .cloned()
             .unwrap_or_else(|| a.name.clone())
+    }
+
+    // --- land a session's work (L) ------------------------------------------
+
+    /// `L`: the directory whose git state the land menu needs (read it
+    /// off-thread and hand it to `land_ready`).
+    pub fn start_land(&mut self) -> Option<PathBuf> {
+        let (label, pid, dir) = if let Some(a) = self.selected_agent() {
+            (self.agent_label(a), Some(a.pid), a.cwd.clone())
+        } else if let Some(e) = self.selected_ended() {
+            (tildify(&e.cwd.display().to_string()), None, e.cwd.clone())
+        } else {
+            self.set_status("select a session to land its work");
+            return None;
+        };
+        self.ctl.land = Some(LandMenu {
+            label,
+            pid,
+            landing: None,
+            note: None,
+        });
+        self.dirty = true;
+        Some(dir)
+    }
+
+    pub fn land_ready(&mut self, l: Option<crate::git::Landing>) {
+        match (self.ctl.land.as_mut(), l) {
+            (Some(m), Some(l)) => m.landing = Some(l),
+            (Some(m), None) => {
+                let label = m.label.clone();
+                self.ctl.land = None;
+                self.set_status(format!("{label} isn't in a git repository"));
+            }
+            (None, _) => {}
+        }
+        self.dirty = true;
+    }
+
+    pub fn is_landing(&self) -> bool {
+        self.ctl.land.is_some()
+    }
+
+    pub fn land_cancel(&mut self) {
+        self.ctl.land = None;
+        self.dirty = true;
+    }
+
+    pub(crate) fn land_menu(&self) -> Option<&LandMenu> {
+        self.ctl.land.as_ref()
+    }
+
+    /// Why `p` (have the agent open a PR) isn't offered, if it isn't.
+    pub(crate) fn land_pr_blocker(&self, m: &LandMenu) -> Option<String> {
+        let l = m.landing.as_ref()?;
+        let Some(a) = m
+            .pid
+            .and_then(|p| self.snapshot.agents.iter().find(|a| a.pid == p))
+        else {
+            return Some("its session has ended — resume it (Enter), then L".into());
+        };
+        if !a.host.as_ref().is_some_and(|h| h.kind.interactive()) {
+            return Some(cant_type(a));
+        }
+        if self.waiting_on_you(a) {
+            return Some("it's waiting on you — answer it first".into());
+        }
+        if a.is_working(unix_now()) {
+            return Some("it's working — let it finish".into());
+        }
+        let on_base = l.branch.is_some() && l.branch == l.base;
+        let nothing = l.dirty == 0 && if on_base { l.pushed } else { l.ahead == 0 };
+        if nothing {
+            return Some(match &l.base {
+                Some(base) if !on_base => {
+                    format!("nothing to land: no changes, nothing {base} hasn't got")
+                }
+                _ => "nothing to land: no changes, nothing unpushed".into(),
+            });
+        }
+        None
+    }
+
+    /// Why `w` (remove the worktree) isn't offered, if it isn't.
+    pub(crate) fn land_remove_blocker(&self, l: &crate::git::Landing) -> Option<String> {
+        let running = self
+            .snapshot
+            .agents
+            .iter()
+            .any(|a| a.cwd.starts_with(&l.tree));
+        if running && l.linked() {
+            return Some("a session still runs there — X ends it first".into());
+        }
+        l.remove_blocker()
+    }
+
+    /// A key in the land menu.
+    pub fn land_key(&mut self, c: char) -> LandAction {
+        let Some(m) = self.ctl.land.as_ref() else {
+            return LandAction::None;
+        };
+        let Some(l) = m.landing.clone() else {
+            return LandAction::None; // still reading
+        };
+        let blocked = match c {
+            'p' => self.land_pr_blocker(m),
+            'm' => l.merge_blocker(),
+            'w' => self.land_remove_blocker(&l),
+            _ => return LandAction::None,
+        };
+        if let Some(why) = blocked {
+            if let Some(m) = self.ctl.land.as_mut() {
+                m.note = Some(format!("can't: {why}"));
+            }
+            self.dirty = true;
+            return LandAction::None;
+        }
+        let pid = m.pid;
+        self.ctl.land = None;
+        match c {
+            'p' => {
+                let Some(a) = pid.and_then(|p| self.snapshot.agents.iter().find(|a| a.pid == p))
+                else {
+                    return LandAction::None;
+                };
+                let Some(host) = a.host.clone() else {
+                    return LandAction::None;
+                };
+                let prompt = match (&l.branch, &l.base) {
+                    (Some(b), Some(base)) if b == base => format!(
+                        "Move this work onto a new branch off {base}, commit it, push it and open a pull request with gh. Reply with the PR link."
+                    ),
+                    _ => "Commit any remaining changes, push this branch and open a pull request for it with gh. Reply with the PR link.".to_string(),
+                };
+                self.ctl.screen_gen += 1;
+                LandAction::Send(Action::Send(host, Send::Reply(prompt)))
+            }
+            'm' => LandAction::Merge(l),
+            _ => LandAction::Remove(l),
+        }
     }
 
     // --- start / end sessions ------------------------------------------------

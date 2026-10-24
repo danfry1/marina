@@ -162,6 +162,29 @@ fn run(
                             }
                             _ => {}
                         }
+                    } else if app.is_landing() {
+                        // `L`: p / m / w, or Esc
+                        match key.code {
+                            KeyCode::Char(c) => match app.land_key(c) {
+                                ui::LandAction::None => {}
+                                ui::LandAction::Send(action) => {
+                                    run_action(app, action, &ev_tx, &ctl)
+                                }
+                                ui::LandAction::Merge(l) => {
+                                    land_off_thread(app, &ev_tx, &ctl, "merging…", move || {
+                                        git::merge_ff(&l)
+                                    })
+                                }
+                                ui::LandAction::Remove(l) => land_off_thread(
+                                    app,
+                                    &ev_tx,
+                                    &ctl,
+                                    "removing the worktree…",
+                                    move || git::remove_worktree(&l),
+                                ),
+                            },
+                            _ => app.land_cancel(),
+                        }
                     } else if app.is_replying() {
                         // The reply box captures keystrokes until Enter/Esc.
                         match key.code {
@@ -229,6 +252,15 @@ fn run(
                             KeyCode::Char('a') => app.toggle_inbox(),
                             KeyCode::Char('r') => app.start_reply(),
                             KeyCode::Char('N') => app.start_new(),
+                            KeyCode::Char('L') if demo_only(app, "would read its git state") => {}
+                            KeyCode::Char('L') => {
+                                if let Some(dir) = app.start_land() {
+                                    let ev = ev_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = ev.send(UiEvent::Land(git::landing(&dir)));
+                                    });
+                                }
+                            }
                             KeyCode::Char('X') => {
                                 let action = app.end_session();
                                 run_action(app, action, &ev_tx, &ctl);
@@ -304,6 +336,7 @@ fn run(
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
                 UiEvent::Status(s) => app.set_status(s),
+                UiEvent::Land(l) => app.land_ready(l),
                 UiEvent::LogReady { project, path } => on_log_ready(app, project, path),
                 UiEvent::Screen {
                     pid,
@@ -522,6 +555,25 @@ fn run_action(
     std::thread::spawn(move || {
         let msg = hosts::send(&host, &what).unwrap_or_else(|e| e);
         let _ = ev.send(UiEvent::Status(msg));
+    });
+}
+
+/// Run a git step of `L` off the UI thread; its result goes to the status
+/// line, then the sampler rescans so the change shows.
+fn land_off_thread(
+    app: &mut ui::App,
+    ev: &Sender<UiEvent>,
+    ctl: &Sender<SamplerCtl>,
+    doing: &str,
+    step: impl FnOnce() -> Result<String, String> + std::marker::Send + 'static,
+) {
+    app.set_status(doing.to_string());
+    let ev = ev.clone();
+    let ctl = ctl.clone();
+    std::thread::spawn(move || {
+        let msg = step().unwrap_or_else(|e| e);
+        let _ = ev.send(UiEvent::Status(msg));
+        let _ = ctl.send(SamplerCtl::Refresh);
     });
 }
 

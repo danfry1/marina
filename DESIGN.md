@@ -664,6 +664,19 @@ window.
   `X` on the parked fold ends every parked session marina can type into
   (`Action::SendAll`), after a second press.
 
+**Landing** (`L`, `git::Landing`): `git::landing` reads, off the UI
+thread, the session's tree (`rev-parse --show-toplevel`), the main
+checkout (the parent of `--git-common-dir`), both branches, uncommitted
+files, `rev-list --left-right --count base...HEAD` and whether `@{u}` is
+up to date. `merge_blocker` / `remove_blocker` (plus "a session still runs
+there") decide what the footer offers. `p` sends the agent a prompt rather
+than running git itself, so the commit message and PR description are
+written by what did the work. `m` is `git merge --ff-only` in the main
+checkout; `w` is `git worktree remove` (never `--force`) and then
+`git branch -d` (which refuses an unmerged branch) when the branch has
+nothing the base hasn't. Both re-read the state and re-check before acting,
+so a stale menu can't merge or remove something that changed since.
+
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
 every 2s and sends the same notices (`App::take_notifications`) as desktop
 notifications. It holds an exclusive `flock` on `<state dir>/watch.pid`

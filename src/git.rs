@@ -214,6 +214,202 @@ impl Cache {
     }
 }
 
+/// Where a session's work stands, for landing it (`L`): its tree and
+/// branch, and the main checkout's branch it would merge into.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Landing {
+    pub tree: PathBuf,
+    /// The repository's main checkout; `tree` itself unless that's a
+    /// linked worktree.
+    pub main: PathBuf,
+    pub branch: Option<String>,
+    /// The main checkout's branch.
+    pub base: Option<String>,
+    /// Uncommitted or untracked files in `tree`.
+    pub dirty: u32,
+    /// The main checkout has uncommitted changes to tracked files.
+    pub main_dirty: bool,
+    /// Commits on the branch that `base` hasn't got, and the reverse.
+    pub ahead: u32,
+    pub behind: u32,
+    /// It has an upstream and nothing unpushed.
+    pub pushed: bool,
+}
+
+impl Landing {
+    pub fn linked(&self) -> bool {
+        self.tree != self.main
+    }
+
+    /// Why its branch can't be fast-forwarded into the main checkout's,
+    /// if it can't.
+    pub fn merge_blocker(&self) -> Option<String> {
+        let (Some(b), Some(base)) = (&self.branch, &self.base) else {
+            return Some("it isn't on a branch".into());
+        };
+        if !self.linked() || b == base {
+            return Some(format!("it works on {base} itself"));
+        }
+        if self.dirty > 0 {
+            return Some(format!("{} uncommitted file(s) — commit first", self.dirty));
+        }
+        if self.ahead == 0 {
+            return Some(format!("{b} has nothing {base} hasn't"));
+        }
+        if self.behind > 0 {
+            return Some(format!(
+                "{base} has {} commit(s) {b} hasn't — rebase it first",
+                self.behind
+            ));
+        }
+        if self.main_dirty {
+            return Some(format!(
+                "the main checkout has uncommitted changes on {base}"
+            ));
+        }
+        None
+    }
+
+    /// Why its worktree can't be removed without losing anything, if it
+    /// can't.
+    pub fn remove_blocker(&self) -> Option<String> {
+        if !self.linked() {
+            return Some("it's the repository's main checkout".into());
+        }
+        if self.dirty > 0 {
+            return Some(format!("{} uncommitted file(s) would be lost", self.dirty));
+        }
+        if self.ahead > 0 && !self.pushed {
+            return Some(format!(
+                "{} commit(s) are only on this branch — merge or push first",
+                self.ahead
+            ));
+        }
+        None
+    }
+}
+
+/// Where the work in the tree containing `dir` stands; `None` outside a
+/// repository.
+pub fn landing(dir: &Path) -> Option<Landing> {
+    let tree = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?.trim());
+    let common = git(
+        &tree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim());
+    let main = match common.file_name() {
+        Some(n) if n == ".git" => common.parent()?.to_path_buf(),
+        _ => tree.clone(), // a bare repository's worktree: treat as its own
+    };
+    let branch_of = |d: &Path| {
+        git(d, &["symbolic-ref", "--short", "-q", "HEAD"])
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+    };
+    let branch = branch_of(&tree);
+    let base = branch_of(&main);
+    let dirty = git(
+        &tree,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .map(|s| s.lines().count() as u32)
+    .unwrap_or(0);
+    let main_dirty = git(&main, &["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|s| !s.trim().is_empty());
+    let (behind, ahead) = match &base {
+        Some(base) => git(
+            &tree,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{base}...HEAD"),
+            ],
+        )
+        .and_then(|s| {
+            let mut n = s.split_whitespace().map(|n| n.parse::<u32>().ok());
+            Some((n.next()??, n.next()??))
+        })
+        .unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    let pushed =
+        git(&tree, &["rev-list", "--count", "@{u}..HEAD"]).is_some_and(|n| n.trim() == "0");
+    Some(Landing {
+        tree,
+        main,
+        branch,
+        base,
+        dirty,
+        main_dirty,
+        ahead,
+        behind,
+        pushed,
+    })
+}
+
+/// Run a git command that changes something; `Err` carries git's message.
+fn git_do(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .next()
+            .unwrap_or("git failed")
+            .trim()
+            .to_string())
+    }
+}
+
+/// Fast-forward the main checkout's branch to `l`'s branch — after
+/// checking again that nothing has changed since `l` was read.
+pub fn merge_ff(l: &Landing) -> Result<String, String> {
+    let now = landing(&l.tree).ok_or("its tree is gone")?;
+    if let Some(why) = now.merge_blocker() {
+        return Err(format!("not merging: {why}"));
+    }
+    let (Some(b), Some(base)) = (&now.branch, &now.base) else {
+        return Err("not on a branch".into());
+    };
+    git_do(&now.main, &["merge", "--ff-only", "--quiet", b])?;
+    Ok(format!(
+        "{base} fast-forwarded to {b} (+{} commit(s))",
+        now.ahead
+    ))
+}
+
+/// Remove `l`'s worktree (never forced), and its branch when that's merged
+/// — after checking again that nothing would be lost.
+pub fn remove_worktree(l: &Landing) -> Result<String, String> {
+    let now = landing(&l.tree).ok_or("its tree is gone")?;
+    if let Some(why) = now.remove_blocker() {
+        return Err(format!("not removing: {why}"));
+    }
+    let path = now.tree.display().to_string();
+    git_do(&now.main, &["worktree", "remove", &path])?;
+    match (&now.branch, now.ahead) {
+        // merged: the branch has nothing left; `-d` refuses otherwise anyway
+        (Some(b), 0) if now.base.as_ref() != Some(b) => {
+            match git_do(&now.main, &["branch", "-d", b]) {
+                Ok(()) => Ok(format!("removed {path} and its merged branch {b}")),
+                Err(e) => Ok(format!("removed {path}; kept branch {b} ({e})")),
+            }
+        }
+        (Some(b), _) => Ok(format!("removed {path}; branch {b} is kept (pushed)")),
+        (None, _) => Ok(format!("removed {path}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +452,89 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs
         assert_eq!(s.describe(), "clean · 3 behind upstream");
         let s = parse(" 1 file changed, 1 insertion(+)", "");
         assert!(s.is_clean(), "shortstat alone doesn't make a file changed");
+    }
+
+    #[test]
+    fn landing_a_worktree_merges_only_forward_and_removes_only_what_is_safe() {
+        let base = std::env::temp_dir().join(format!("marina-land-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let wt = base.join("repo-wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        // nothing done yet: nothing to merge; removable (nothing to lose)
+        let l = landing(&wt).unwrap();
+        assert!(l.linked());
+        assert_eq!(l.branch.as_deref(), Some("feature"));
+        assert_eq!(l.base.as_deref(), Some("main"));
+        assert!(l.merge_blocker().is_some());
+        assert_eq!(l.remove_blocker(), None);
+
+        // uncommitted work: neither
+        std::fs::write(wt.join("b.txt"), "new\n").unwrap();
+        let l = landing(&wt).unwrap();
+        assert_eq!(l.dirty, 1);
+        assert!(l.merge_blocker().unwrap().contains("uncommitted"));
+        assert!(l.remove_blocker().unwrap().contains("lost"));
+
+        // committed, unpushed: mergeable, not removable
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-qm", "b"]);
+        let l = landing(&wt).unwrap();
+        assert_eq!((l.ahead, l.behind, l.dirty), (1, 0, 0));
+        assert_eq!(l.merge_blocker(), None);
+        assert!(l.remove_blocker().unwrap().contains("only on this branch"));
+        assert!(
+            remove_worktree(&l).is_err(),
+            "refuses again at the moment of acting"
+        );
+        assert!(wt.exists());
+
+        // main moved on: no fast-forward
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "c"]);
+        let l2 = landing(&wt).unwrap();
+        assert!(l2.merge_blocker().unwrap().contains("rebase"));
+        assert!(merge_ff(&l).is_err(), "re-checked, not the stale reading");
+        run(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        // merge, then remove: the worktree and its merged branch go
+        merge_ff(&landing(&wt).unwrap()).unwrap();
+        assert!(repo.join("b.txt").exists());
+        let msg = remove_worktree(&landing(&wt).unwrap()).unwrap();
+        assert!(msg.contains("merged branch feature"), "{msg}");
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
