@@ -273,6 +273,28 @@ impl App {
             if let Some(msg) = crashed {
                 self.set_status(msg);
             }
+            // a target turning heavy (runaway test runner, leak): say so once
+            let was_heavy: HashSet<&TargetKey> = old
+                .targets
+                .iter()
+                .filter(|t| t.is_heavy())
+                .map(|t| &t.key)
+                .collect();
+            if let Some(t) = self
+                .snapshot
+                .targets
+                .iter()
+                .find(|t| t.is_heavy() && !was_heavy.contains(&t.key))
+            {
+                let msg = format!(
+                    "⚠ {} in {} is using {:.0}% CPU · {} — select it and K to stop it",
+                    t.command_label,
+                    t.project,
+                    t.cpu_pct,
+                    super::format::fmt_mem(t.mem_bytes)
+                );
+                self.set_status(msg);
+            }
             // An agent session that ended and left servers running: say so
             // once, at the transition, and queue a desktop notification.
             for msg in orphan_notices(&old, &self.snapshot) {

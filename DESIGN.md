@@ -590,6 +590,28 @@ window.
   `in_turn`. A thinking agent animates its screen; a running tool has a
   child or a spinner.
   It feeds `is_blocked`, so the inbox, notices and `y`/`n` use it.
+- *Reports* (`hooks.rs`): `marina hooks --install` registers
+  `marina hook <agent>` as a Claude Code / Codex command hook (same JSON
+  shape: `SessionStart`/`Stop` → idle, `UserPromptSubmit`/`PostToolUse`/
+  `PreToolUse` → working, `PermissionRequest`, a `PreToolUse` of
+  `AskUserQuestion`/`request_user_input`, and Claude's permission /
+  elicitation `Notification` → blocked), and writes two opencode plugins:
+  `plugins/marina.js` (1.x server events) and `plugins/marina/tui.js`
+  (opencode 2's TUI `api.data.listen` feed: `session.execution.*`,
+  `permission.*`, `form.*`). Each call writes `reports/<agent>-<session>.json`
+  (status, time, the hook's six nearest ancestors) atomically and prints
+  nothing — Claude Code adds a prompt hook's stdout to the conversation.
+  The sampler re-reads changed files each tick and takes, per agent, the
+  newest report made since it started whose ancestry holds its pid (which
+  also gives it its current session id) or that names its session.
+  `Agent::host_status` is herdr's status, else `Agent::reported`: the report,
+  unless the transcript recorded something more than 5s after it (a prompt
+  typed, a turn interrupted — no hook fires for an interrupt), and a blocked
+  report with a shell running reads as working (approved). Settings files
+  are edited with order kept (`serde_json/preserve_order`), other hooks
+  untouched, a `.marina-backup` of the previous file.
+- *Set aside* (`d`): `aside.json` maps session id → its transcript time
+  then; the session is parked until the transcript is newer.
 - *Unread*: `seen.json` in the state dir maps session id → the transcript
   time last seen. A session is unread when its transcript's newest record
   is newer and it isn't working; it's marked read when shown in the inbox
@@ -606,7 +628,10 @@ window.
   the question (with the sentence before it when short) or instruction to
   you that the reply ends with; `Summary::did` is the recap before that,
   else the reply's first sentence. Rows are one line: what's asked,
-  running, or (parked) the title.
+  running, or (parked) the title. `App::inbox_reason` gives the detail's
+  *why* line, naming the source (herdr, the agent's report, or inference).
+  `X` on the parked fold ends every parked herdr/tmux session
+  (`Action::SendAll`), after a second press.
 
 **Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
 every 2s and sends the same notices (`App::take_notifications`) as desktop

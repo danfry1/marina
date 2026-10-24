@@ -98,8 +98,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.snapshot.agents.len()
         )
     } else {
+        let heavy = app.snapshot.targets.iter().filter(|t| t.is_heavy()).count();
+        let heavy = if heavy > 0 {
+            format!(" · ⚠ {heavy} heavy")
+        } else {
+            String::new()
+        };
         format!(
-            " inbox (a) · ▸ SERVERS │ {} targets{agents} · sort:{}{} ",
+            " inbox (a) · ▸ SERVERS │ {} targets{heavy}{agents} · sort:{}{} ",
             app.snapshot.targets.len(),
             app.sort.label(),
             match app.group_by {
@@ -1032,12 +1038,24 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
     } else {
         Cell::from(port)
     };
+    // a runaway process stands out where its numbers are
+    let heavy = |hot: bool, text: String| {
+        if hot {
+            Cell::from(Span::styled(
+                text,
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Cell::from(text)
+        }
+    };
+    let measured = !t.pids.is_empty();
     let row = Row::new(vec![
         project,
         command,
         port_cell,
-        Cell::from(cpu),
-        Cell::from(mem),
+        heavy(measured && t.cpu_pct >= crate::model::HEAVY_CPU, cpu),
+        heavy(measured && t.mem_bytes >= crate::model::HEAVY_MEM, mem),
         match &t.launcher {
             Some(l) => Cell::from(Span::styled(l.short(), launcher_style(l))),
             None => Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
@@ -1156,7 +1174,8 @@ fn help_lines() -> Vec<Line<'static>> {
             "reply · quick reply ([agents] quick); Enter sends",
         ),
         row("N", "new session here (Tab: in its own git worktree)"),
-        row("X", "end the session (press twice; sends /exit)"),
+        row("d", "set aside: parked until it does something new"),
+        row("X", "end it (twice; sends /exit) · on PARKED: all of them"),
         row("D", "uncommitted diff of its work tree"),
         Line::from(""),
         head("SERVERS"),

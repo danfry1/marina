@@ -67,6 +67,9 @@ pub(crate) struct Control {
     pub detail_pid: Option<u32>,
     /// What you've read: session id -> transcript time last seen.
     pub seen: Seen,
+    /// Set aside (`d`): session id -> transcript time when you did. Parked
+    /// until it records something newer.
+    pub aside: Seen,
     /// Canned replies on keys 1-9 (`[agents] quick`).
     pub quick: Vec<String>,
     /// A new session being set up (`N`).
@@ -75,6 +78,8 @@ pub(crate) struct Control {
     pub pending_end: Option<(u32, Instant)>,
     /// Open on the inbox once the first snapshot shows agent sessions.
     pub start_in_inbox: bool,
+    /// Said once with the first look: what's left to set up.
+    pub setup_tip: Option<String>,
     /// The inbox's parked / ended groups are unfolded.
     pub parked_open: bool,
     pub ended_open: bool,
@@ -112,6 +117,17 @@ impl Seen {
             path: Some(path),
             dirty: false,
         }
+    }
+
+    /// Like `load`, but a missing file is just empty.
+    pub fn load_plain(path: PathBuf) -> Seen {
+        let mut s = Seen::load(path);
+        s.seed = false;
+        s
+    }
+
+    fn unmark(&mut self, id: &str) {
+        self.dirty |= self.map.remove(id).is_some();
     }
 
     fn mark(&mut self, id: &str, at: u64) {
@@ -153,6 +169,8 @@ pub enum Action {
     None,
     /// Send this to the agent's host on a background thread.
     Send(HostInfo, Send),
+    /// The same for several sessions, one after another.
+    SendAll(Vec<(HostInfo, Send)>),
 }
 
 impl App {
@@ -329,16 +347,28 @@ impl App {
         !a.is_working(now) && self.ctl.seen.get(id).is_none_or(|seen| at > seen)
     }
 
+    /// Set aside with `d`, and nothing new since.
+    pub(crate) fn is_aside(&self, a: &Agent) -> bool {
+        let Some(id) = a.session.as_deref() else {
+            return false;
+        };
+        let at = a.summary.as_ref().and_then(|s| s.updated).unwrap_or(0);
+        self.ctl.aside.get(id).is_some_and(|when| when >= at)
+    }
+
     /// The inbox's groups, by what's needed of you: 0 *needs you* (an
     /// approval or a question is up), 1 *your turn* (it finished and asks
     /// you something, or has a reply you haven't read), 2 *working*,
-    /// 3 *parked* (finished, nothing asked).
+    /// 3 *parked* (finished, nothing asked — or set aside).
     pub(crate) fn inbox_urgency(&self, a: &Agent, now: u64) -> u8 {
         if self.waiting_on_you(a) {
             return 0;
         }
         if a.is_working(now) {
             return 2;
+        }
+        if self.is_aside(a) {
+            return 3;
         }
         let recent = now.saturating_sub(a.settled_at()) < YOUR_TURN_FOR;
         let asks = a.summary.as_ref().is_some_and(|s| s.ask().is_some());
@@ -348,6 +378,90 @@ impl App {
         } else {
             3
         }
+    }
+
+    /// Why `a` is in its inbox group, in a few words, and how sure marina
+    /// is: it said so (hooks, herdr), or marina is inferring it.
+    pub(crate) fn inbox_reason(&self, a: &Agent, now: u64) -> String {
+        let source = if a.host.as_ref().is_some_and(|h| h.status.is_some()) {
+            "herdr says so"
+        } else if a.reported().is_some() {
+            "it reported this itself"
+        } else {
+            "inferred"
+        };
+        match self.inbox_urgency(a, now) {
+            0 if a.host_status().is_none() => {
+                if a.summary.as_ref().is_some_and(|s| s.pending_tool.is_some()) {
+                    "inferred: a tool call is pending and nothing is running".into()
+                } else {
+                    "its screen shows a dialog".into()
+                }
+            }
+            0 => format!("waiting on an approval or a question — {source}"),
+            2 if a.shells().next().is_some() => "running a command".into(),
+            2 if a.host_status().is_some() => format!("working — {source}"),
+            2 if a.tty.is_some() => "inferred: its screen is changing".into(),
+            2 => "inferred: it's using CPU".into(),
+            1 if a.host_status() == Some(crate::hosts::HostStatus::Done) => {
+                "herdr marks it done and unread".into()
+            }
+            1 if a.summary.as_ref().is_some_and(|s| s.ask().is_some()) => {
+                "its last reply asks you something · d sets it aside".into()
+            }
+            1 => "a reply you haven't read · d sets it aside".into(),
+            _ if self.is_aside(a) => {
+                "set aside until it does something new · d brings it back".into()
+            }
+            _ if a.summary.as_ref().is_some_and(|s| s.ask().is_some()) => format!(
+                "it asked something {} ago — over 3 days, so parked",
+                super::format::fmt_age(now.saturating_sub(a.settled_at()))
+            ),
+            _ if a.summary.is_none() => "no transcript, and nothing running".into(),
+            _ => "finished, and its last reply asks nothing".into(),
+        }
+    }
+
+    /// `d`: set the selected session aside (parked until it records
+    /// something new), or bring it back.
+    pub fn toggle_aside(&mut self) {
+        let Some(a) = self.selected_agent() else {
+            return;
+        };
+        let label = self.agent_label(a);
+        let Some(id) = a.session.clone() else {
+            self.set_status(format!(
+                "{label}: marina doesn't know its session id, so can't set it aside"
+            ));
+            return;
+        };
+        let now = unix_now();
+        if self.is_aside(a) {
+            self.ctl.aside.unmark(&id);
+            self.set_status(format!("{label} is back in your inbox"));
+        } else if self.waiting_on_you(a) || a.is_working(now) {
+            self.set_status(format!(
+                "{label} is busy — only a finished session can be set aside"
+            ));
+            return;
+        } else {
+            let at = a.summary.as_ref().and_then(|s| s.updated).unwrap_or(now);
+            self.ctl.aside.mark(&id, at);
+            self.set_status(format!(
+                "{label} set aside: parked until it does something new · d on it brings it back"
+            ));
+        }
+        let live: Vec<String> = self
+            .snapshot
+            .agents
+            .iter()
+            .filter_map(|a| a.session.clone())
+            .collect();
+        let live: Vec<&str> = live.iter().map(String::as_str).collect();
+        self.ctl.aside.save(&live);
+        // the row moves now, not after the browsing hold
+        self.last_input = Instant::now() - INBOX_HOLD;
+        self.dirty = true;
     }
 
     /// After each snapshot: what you're looking at now is read (the
@@ -673,7 +787,73 @@ impl App {
 
     /// `X`: end the selected session by sending its exit command — on a
     /// second press, after saying what it would leave behind.
+    /// `X` on the *parked* fold: end every parked session marina can type
+    /// into, after a second press.
+    fn end_parked(&mut self) -> Action {
+        let now = unix_now();
+        let parked: Vec<(HostInfo, &'static str, bool)> = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| self.inbox_urgency(a, now) == 3)
+            .filter_map(|a| {
+                let host = a.host.clone().filter(|h| h.kind.interactive())?;
+                let exit = if a.name == "codex" { "/quit" } else { "/exit" };
+                Some((host, exit, a.git.is_some_and(|g| !g.is_clean())))
+            })
+            .collect();
+        let total = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| self.inbox_urgency(a, now) == 3)
+            .count();
+        if parked.is_empty() {
+            self.set_status(if total == 0 {
+                "nothing is parked".to_string()
+            } else {
+                format!("none of the {total} parked sessions is in tmux or herdr — end them in their windows")
+            });
+            return Action::None;
+        }
+        let confirmed = self
+            .ctl
+            .pending_end
+            .is_some_and(|(p, at)| p == 0 && at.elapsed() < Duration::from_secs(4));
+        if !confirmed {
+            let dirty = parked.iter().filter(|p| p.2).count();
+            let mut note = String::new();
+            if dirty > 0 {
+                note.push_str(&format!(" — {dirty} with uncommitted work (kept on disk)"));
+            }
+            if parked.len() < total {
+                note.push_str(&format!(
+                    " · {} not in tmux/herdr stay",
+                    total - parked.len()
+                ));
+            }
+            self.ctl.pending_end = Some((0, Instant::now()));
+            self.set_status(format!(
+                "press X again to end {} parked session{}{note} (resumable later)",
+                parked.len(),
+                if parked.len() == 1 { "" } else { "s" }
+            ));
+            return Action::None;
+        }
+        self.ctl.pending_end = None;
+        self.drop_screen();
+        Action::SendAll(
+            parked
+                .into_iter()
+                .map(|(h, exit, _)| (h, Send::Reply(exit.into())))
+                .collect(),
+        )
+    }
+
     pub fn end_session(&mut self) -> Action {
+        if self.selected == Some(Entry::Fold(0)) {
+            return self.end_parked();
+        }
         let Some(a) = self.selected_agent() else {
             return Action::None;
         };
@@ -757,8 +937,14 @@ impl App {
         } else {
             "the agent inbox"
         };
+        let tip = self
+            .ctl
+            .setup_tip
+            .take()
+            .map(|t| format!(" · {t}"))
+            .unwrap_or_default();
         self.set_status(format!(
-            "{n} agent session{} · a: {other} · Enter: jump · ?: all keys",
+            "{n} agent session{} · a: {other} · Enter: jump · ?: all keys{tip}",
             if n == 1 { "" } else { "s" }
         ));
     }

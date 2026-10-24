@@ -4,8 +4,10 @@ mod cli;
 mod config;
 mod digest;
 mod docker;
+mod doctor;
 mod exec;
 mod git;
+mod hooks;
 mod hosts;
 mod launch;
 mod launcher;
@@ -209,6 +211,9 @@ fn run(
                             KeyCode::Char(c @ ('y' | 'n')) => {
                                 let action = app.answer(c == 'y');
                                 run_action(app, action, &ev_tx);
+                            }
+                            KeyCode::Char('d') if app.selected_agent().is_some() => {
+                                app.toggle_aside()
                             }
                             KeyCode::Char('v') => app.toggle_group_by(),
                             KeyCode::Char('?') => app.toggle_help(),
@@ -430,8 +435,26 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
 /// Carry out a control action (approve / reject / reply) off the UI thread:
 /// herdr and tmux calls can take a moment.
 fn run_action(app: &mut ui::App, action: ui::Action, ev: &Sender<UiEvent>) {
-    let ui::Action::Send(host, what) = action else {
-        return;
+    let (host, what) = match action {
+        ui::Action::None => return,
+        ui::Action::Send(host, what) => (host, what),
+        ui::Action::SendAll(all) => {
+            let n = all.len();
+            app.set_status(format!("ending {n} sessions…"));
+            let ev = ev.clone();
+            std::thread::spawn(move || {
+                let failed: Vec<String> = all
+                    .iter()
+                    .filter_map(|(h, w)| hosts::send(h, w).err())
+                    .collect();
+                let msg = match failed.first() {
+                    None => format!("ended {n} sessions"),
+                    Some(e) => format!("ended {} of {n} — {e}", n - failed.len()),
+                };
+                let _ = ev.send(UiEvent::Status(msg));
+            });
+            return;
+        }
     };
     app.set_status(format!("sending to the {}…", host.describe()));
     let ev = ev.clone();

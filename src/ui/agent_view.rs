@@ -240,8 +240,9 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     rows.push((Line::raw(""), None));
                 }
                 let what = match (*which, open) {
+                    (0, true) => "Enter hides · X ends them all".to_string(),
                     (_, true) => "Enter hides".to_string(),
-                    (0, false) => "finished, nothing asked · Enter shows".to_string(),
+                    (0, false) => "finished, nothing asked · Enter shows · X ends them".to_string(),
                     _ => "Enter shows · Enter on one resumes it".to_string(),
                 };
                 let sel = selected.as_ref() == Some(e);
@@ -525,6 +526,29 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         out.push(Line::styled(
             format!(" {}", clip(t, w.saturating_sub(1))),
             Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    }
+    // why it's in this group, and how marina knows
+    out.push(Line::styled(
+        format!(
+            " why: {}",
+            clip(&app.inbox_reason(a, now), w.saturating_sub(7))
+        ),
+        DIM,
+    ));
+    // say up front what marina can't do here, not after a keystroke fails
+    let interactive = a.host.as_ref().is_some_and(|h| h.kind.interactive());
+    if !interactive && urgency == 1 {
+        let place = match &a.host {
+            Some(h) => h.describe(),
+            None => "a terminal marina can't reach".into(),
+        };
+        out.push(Line::styled(
+            clip(
+                &format!(" it's in {place}: marina can't type there — Enter jumps to it"),
+                w.saturating_sub(1),
+            ),
+            Style::new().fg(Color::Yellow),
         ));
     }
     let s = a.summary.as_ref();

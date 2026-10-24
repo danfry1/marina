@@ -65,6 +65,11 @@ USAGE:
     marina watch                 send agent notices without the TUI open
           [--install|--uninstall|--status]   …as a login service (launchd /
                                  systemd), and manage it
+    marina hooks [--install|--uninstall]   have Claude Code, Codex and opencode
+                                 report when they're working, waiting on you
+                                 or done, instead of marina inferring it
+    marina doctor                what marina can see and do here, and how to
+                                 set up the rest (hooks, notices, watcher)
     marina version               print the version
 
 SELECTOR:
@@ -82,6 +87,10 @@ SCOPE (ls / kill / restart / url; usable instead of, or with, selectors):
 pub fn dispatch(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     let rest = &args[1..];
+    // run by the agents themselves: no flag checks, never an error
+    if cmd == "hook" {
+        return Some(crate::hooks::run_hook(rest));
+    }
     let flags: Vec<&str> = rest
         .iter()
         .map(String::as_str)
@@ -132,9 +141,9 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if ["--install", "--uninstall", "--status"]
         .iter()
         .any(|f| flags.contains(f))
-        && cmd != "watch"
+        && !matches!(cmd, "watch" | "hooks")
     {
-        eprintln!("marina: --install / --uninstall / --status only apply to `marina watch`");
+        eprintln!("marina: --install / --uninstall / --status only apply to `marina watch` and `marina hooks`");
         return Some(2);
     }
     if flags.contains(&"--long") && cmd != "agents" {
@@ -165,6 +174,16 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
                 crate::watch::status()
             } else {
                 crate::watch::run()
+            }
+        }
+        "doctor" => crate::doctor::run(),
+        "hooks" => {
+            if flags.contains(&"--install") {
+                crate::hooks::install()
+            } else if flags.contains(&"--uninstall") {
+                crate::hooks::uninstall()
+            } else {
+                crate::hooks::status()
             }
         }
         "version" | "--version" | "-V" => {

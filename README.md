@@ -1,15 +1,37 @@
 # marina
 
-A **developer-process cockpit**. A TUI you leave open in a pane all day that
-shows the dev servers and processes you actually care about — resolved into names
-you recognize:
+**One inbox for every coding-agent session you have running — and the dev
+servers they start.**
+
+Claude Code, Codex and opencode sessions spread across terminals, panes and
+worktrees. marina is a TUI you leave open beside them that says which ones need
+you, which have finished and are waiting on your answer, and which are still
+working — and lets you approve, reply, start, end and resume them from one place:
 
 ```
-client-portal · next dev · :3000 · 340MB
+ NEEDS YOU · 1
+▌● api                approve: Bash: cargo publish                             now
+ YOUR TURN · 2
+ ● web                Want me to commit it all now? — Nothing is committed yet…  2h
+ ● docs               Say "push" when you want them shipped.                     5h
+ WORKING · 1
+ ◐ marina ⇄1          $ cargo test                                               now
+ ▸ PARKED · 9   finished, nothing asked · Enter shows · X ends them
 ```
 
-Not a system monitor (btop/bottom own that). Not an `lsof` wrapper. Ruthlessly
-developer-process-centric.
+It also tracks the dev servers and processes behind them — resolved into names
+you recognize (`client-portal · next dev · :3000 · 340MB`), with who started
+each one, and one-key kill, restart and logs. Not a system monitor (btop/bottom
+own that), and not an `lsof` wrapper.
+
+**Getting set up:**
+
+```sh
+brew install danfry1/tap/marina
+marina hooks --install   # agents report their own state (see below)
+marina doctor            # what marina can see and do here, and what's left to set up
+marina                   # opens on the inbox when agents are running
+```
 
 ![marina in action](https://raw.githubusercontent.com/danfry1/marina/main/demo/marina.gif)
 
@@ -44,6 +66,10 @@ developer-process-centric.
   nobody owns any more reads `detached`.
   `marina kill --orphaned` cleans up after finished sessions; an agent can run
   `marina kill --mine` to stop exactly the servers it started.
+- **Runaway processes** — a server or watcher using 90%+ CPU or 2GB+ memory
+  (a test runner left spinning, a leak) is flagged: its numbers turn red, the
+  servers view counts `⚠ N heavy`, and marina says so once when it starts —
+  select it and `K`.
 - **Honest signals** — rows flash green when they appear, turn red while dying,
   and if a long-running server vanishes *without* you killing it, marina says so
   (`⚠ client-portal (:3000) exited unexpectedly`). A `:3000!` port badge warns
@@ -83,6 +109,15 @@ developer-process-centric.
   over 2m`), and each helper's memory. Helpers that every session runs its
   own copy of are totalled (`chrome-devtools-mcp ×19 899MB`) on the agents
   section and at the end of `marina agents`.
+- **Agents report their own state** — `marina hooks --install` registers a
+  small hook with each agent it finds: Claude Code's and Codex's hooks
+  (`~/.claude/settings.json`, `~/.codex/hooks.json`) and an opencode plugin.
+  Each call writes one tiny file per session to `~/.local/state/marina/reports`,
+  so *needs you*, *working* and *done* come from the agent as they happen
+  rather than being inferred from its transcript and screen. Other hooks in
+  those files are left untouched (the previous file is kept as
+  `*.marina-backup`), and `marina hooks --uninstall` takes ours out again.
+  Without hooks, marina still infers it all (below).
 - **Inbox** — where marina opens when agents are running (`a` switches to
   the servers view), organised by what each session needs from you:
   *needs you* (an approval or a question is up), *your turn* (it finished
@@ -92,12 +127,19 @@ developer-process-centric.
   wants, from Claude's own "Next…" recap or the question its reply ends
   with. Sessions with something new are bold until you look; the order
   only changes when a session finishes, and holds still while you browse.
+  The detail says *why* each session is where it is ("its last reply asks
+  you something", "inferred: a tool call is pending and nothing is
+  running", "it reported this itself"), and says up front when a session
+  sits in a terminal marina can't type into. `d` sets a session aside —
+  parked until it does something new — and `X` on the *parked* fold ends
+  every parked herdr/tmux session at once (after a second press).
   The detail beside it leads with *your turn* and *what it did*, then one
   line of context (directory, branch and changes, PR, servers, shared
   tree, context size) and the full conversation (`[` `]` to scroll); `p`
   switches it to the session's live screen (herdr and tmux panes).
 - **Preview** (`p`) — the same session detail under the project view.
-- **Needs you, anywhere** — under herdr marina takes herdr's word; elsewhere
+- **Needs you, anywhere** — under herdr marina takes herdr's word; with
+  hooks installed, the agent's own; elsewhere
   a session counts as waiting when a turn is under way in its transcript
   (your prompt or a tool call with no end-of-turn record after it) yet
   nothing is running — no shell, a still screen, or a Bash call whose
@@ -225,7 +267,8 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `p` | preview an agent: last prompt, recap and reply · again: its live screen |
 | `y` · `n` · `r` | approve · reject · reply to the selected agent (herdr / tmux panes) |
 | `1`–`9` | quick reply: opens the reply box with a canned reply (Enter sends) |
-| `N` · `X` | start a session here (Tab: own git worktree) · end the selected one (twice) |
+| `N` · `X` | start a session here (Tab: own git worktree) · end the selected one (twice; on *parked*: all of them) |
+| `d` | set a session aside: parked until it does something new (again: bring it back) |
 | `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
@@ -259,6 +302,8 @@ marina jump <session>         # focus a session's terminal (id, pid or project)
 marina digest today           # what your agents did: per project, time working,
                               # tokens, commits, PRs, latest recaps (or 24h, 3d)
 marina watch --install        # background notices at login (--status, --uninstall)
+marina hooks --install        # agents report their own state (--uninstall; bare: status)
+marina doctor                 # what marina can see and do here, and what to set up
 marina version
 ```
 
@@ -364,7 +409,14 @@ marina is deliberately boring on this front:
   process (`R` / `marina restart`), the new process's stdout/stderr is captured
   to `logs/<project>.log` so `T` can always tail it; and `marina port` records
   its assignments (port, project root, optional service name, timestamps) in
-  `ports.json`.
+  `ports.json`. The inbox keeps which replies you've read (`seen.json`) and
+  which sessions you set aside (`aside.json`) — session ids and timestamps.
+  With hooks installed, each agent writes `reports/<agent>-<session>.json`:
+  its state (working / blocked / idle), the time, and its process ids —
+  never the prompt, tool input or output it was handed (deleted after a
+  week). `marina hooks --install` edits the agents' own settings only when
+  you run it, keeps the previous file as `*.marina-backup`, and touches no
+  other hook.
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
   ever inspects your own user's processes — system/root daemons and anything
   outside `$HOME` are filtered out (and the OS wouldn't let it read others

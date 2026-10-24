@@ -61,6 +61,8 @@ pub struct Sampler {
     opencode: crate::opencode::Sessions,
     /// Work tree per agent cwd.
     trees: HashMap<PathBuf, Option<PathBuf>>,
+    /// Agents' own reports, through marina's hooks; `None` in tests.
+    reports: Option<crate::hooks::Reports>,
     /// Claude Code transcript summaries; `None` when turned off in config.
     transcripts: Option<crate::transcript::Cache>,
     /// Agents' working-tree status.
@@ -85,6 +87,7 @@ impl Sampler {
             hosts: Default::default(),
             opencode: Default::default(),
             trees: HashMap::new(),
+            reports: Some(Default::default()),
             transcripts: crate::config::load()
                 .agents
                 .transcripts
@@ -341,6 +344,21 @@ impl Sampler {
                 }
             }
             self.opencode.fill(procs, &mut agents);
+            // what each said of itself. Matched by ancestry, a report also
+            // names its session — the current one, after /clear or resume.
+            if let Some(reps) = self.reports.as_mut() {
+                reps.refresh();
+                for a in &mut agents {
+                    let Some(r) = reps.find(&a.name, a.pid, a.start_time, a.session.as_deref())
+                    else {
+                        continue;
+                    };
+                    if r.chain.contains(&a.pid) && r.session.is_some() {
+                        a.session = r.session.clone();
+                    }
+                    a.report = Some(r.clone());
+                }
+            }
             // by cwd, cached: it stats every ancestor
             self.trees
                 .retain(|cwd, _| agents.iter().any(|a| &a.cwd == cwd));
@@ -683,6 +701,7 @@ fn build_agents(
                 summary: None,
                 waiting: false,
                 tree: None,
+                report: None,
             })
         })
         .collect();
@@ -1115,6 +1134,7 @@ mod tests {
             hosts: Default::default(),
             opencode: Default::default(),
             trees: HashMap::new(),
+            reports: None,     // nor ~/.local/state
             transcripts: None, // never read ~/.claude in tests
             git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),

@@ -18,6 +18,16 @@ pub use control::Action;
 pub fn load_seen(app: &mut App) {
     if let Some(dir) = crate::logs::state_dir() {
         app.ctl.seen = control::Seen::load(dir.join("seen.json"));
+        app.ctl.aside = control::Seen::load_plain(dir.join("aside.json"));
+        // once: with no agent hooked, point at what's left to set up
+        let marker = dir.join("setup-tip-shown");
+        let hooked = crate::hooks::installed()
+            .iter()
+            .any(|(_, h, _)| *h == crate::hooks::Hooked::Yes);
+        if !hooked && !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(&marker, "");
+            app.ctl.setup_tip = Some("new here? marina doctor shows what to set up".into());
+        }
     }
 }
 
