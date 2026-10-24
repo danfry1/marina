@@ -136,11 +136,21 @@ impl Sess {
                 step(4, St::Idle).says("Done — that went through cleanly."),
             ],
             on_no: vec![step(0, St::Idle).says("Okay, I've left it. What should I do instead?")],
-            on_reply: vec![
+            on_reply: Vec::new(),
+        }
+    }
+
+    /// Play a scripted answer once; after that, a plain one.
+    fn answer(&mut self, script: Vec<Step>, now: u64) {
+        let steps = if script.is_empty() {
+            vec![
                 step(0, St::Working),
                 step(6, St::Idle).says("Done. Nothing else is pending."),
-            ],
-        }
+            ]
+        } else {
+            script
+        };
+        self.play(steps, now);
     }
 
     fn apply(&mut self, s: &Step, now: u64) {
@@ -437,13 +447,15 @@ fn target(
     }
 }
 
-fn snapshot(seq: u64, sessions: &[Sess], ended: &[Ended], now: u64) -> Snapshot {
-    let agents: Vec<Agent> = sessions
+/// The snapshot as of `now`, without the sessions that ended (`gone`):
+/// their servers stay, as orphans.
+fn snapshot(seq: u64, sessions: &[Sess], gone: &[bool], ended: &[Ended], now: u64) -> Snapshot {
+    let all: Vec<Agent> = sessions
         .iter()
         .enumerate()
         .map(|(i, s)| agent_of(i, s, now))
         .collect();
-    let by = |p: &str| agents.iter().find(|a| a.project == p);
+    let by = |p: &str| all.iter().find(|a| a.project == p);
     let http = |p: u16| Some((UrlScheme::Http, format!("http://localhost:{p}")));
     let mut targets = vec![
         target(
@@ -493,6 +505,18 @@ fn snapshot(seq: u64, sessions: &[Sess], ended: &[Ended], now: u64) -> Snapshot 
         cwd: None,
         start_time: 0,
     });
+    for t in targets.iter_mut() {
+        if let Some(l) = t.launcher.as_mut() {
+            let i = all.iter().position(|a| Some(a.pid) == l.pid);
+            l.alive = !i.is_some_and(|i| gone[i]);
+        }
+    }
+    let agents = all
+        .into_iter()
+        .zip(gone)
+        .filter(|(_, &g)| !g)
+        .map(|(a, _)| a)
+        .collect();
     Snapshot {
         seq,
         targets,
@@ -554,9 +578,9 @@ fn find(sessions: &[Sess], target: &str) -> Option<usize> {
     if let Some(i) = target
         .strip_prefix("demo:")
         .and_then(|t| t.split('.').next())
-        .and_then(|i| i.parse().ok())
+        .and_then(|i| i.parse::<usize>().ok())
     {
-        return Some(i);
+        return (i < sessions.len()).then_some(i);
     }
     sessions
         .iter()
@@ -571,7 +595,7 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
     thread::spawn(move || {
         let start = crate::ui::unix_now();
         let mut sessions = scenario(start);
-        let ended = ended(start);
+        let mut ended = ended(start);
         let mut gone = vec![false; sessions.len()];
         let mut seq = 0;
         loop {
@@ -585,13 +609,7 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
                 }
             }
             seq += 1;
-            let mut snap = snapshot(seq, &sessions, &ended, now);
-            // ended sessions keep their index (and pid) for the rest
-            let mut i = 0;
-            snap.agents.retain(|_| {
-                i += 1;
-                !gone[i - 1]
-            });
+            let snap = snapshot(seq, &sessions, &gone, &ended, now);
             if tx.send(SamplerMsg::Snapshot(Arc::new(snap))).is_err() {
                 break;
             }
@@ -605,19 +623,30 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
                     match what {
                         crate::hosts::Send::Approve => {
                             let steps = std::mem::take(&mut s.on_yes);
-                            s.play(steps, now);
+                            s.answer(steps, now);
                         }
                         crate::hosts::Send::Reject => {
                             let steps = std::mem::take(&mut s.on_no);
-                            s.play(steps, now);
+                            s.answer(steps, now);
                         }
                         crate::hosts::Send::Reply(text) if text == "/exit" || text == "/quit" => {
+                            // ended: listed as such, its servers left behind
                             gone[i] = true;
+                            let a = agent_of(i, s, now);
+                            ended.insert(
+                                0,
+                                Ended {
+                                    id: a.session.unwrap_or_default(),
+                                    at: now,
+                                    cwd: a.cwd,
+                                    summary: a.summary.unwrap_or_default(),
+                                },
+                            );
                         }
                         crate::hosts::Send::Reply(text) => {
                             s.prompt = text;
                             let steps = std::mem::take(&mut s.on_reply);
-                            s.play(steps, now);
+                            s.answer(steps, now);
                         }
                     }
                 }
@@ -662,9 +691,24 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_session_leaves_its_servers_orphaned() {
+        let now = 1_000_000;
+        let all = scenario(now);
+        let api = all.iter().position(|s| s.project == "api").unwrap();
+        let mut gone = vec![false; all.len()];
+        gone[api] = true;
+        let snap = snapshot(1, &all, &gone, &[], now);
+        assert!(snap.agents.iter().all(|a| a.project != "api"));
+        let server = snap.targets.iter().find(|t| t.project == "api").unwrap();
+        assert_eq!(server.launcher.as_ref().map(|l| l.alive), Some(false));
+        assert_eq!(find(&all, "demo:99.0"), None);
+    }
+
+    #[test]
     fn the_inbox_has_one_of_everything() {
         let now = 1_000_000;
-        let snap = snapshot(1, &scenario(now), &ended(now), now);
+        let all = scenario(now);
+        let snap = snapshot(1, &all, &vec![false; all.len()], &ended(now), now);
         let st: Vec<_> = snap.agents.iter().map(|a| a.host_status()).collect();
         assert!(st.contains(&Some(HostStatus::Blocked)));
         assert!(st.contains(&Some(HostStatus::Working)));

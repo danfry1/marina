@@ -55,7 +55,11 @@ fn main() -> io::Result<()> {
     // CLI subcommands (ls/kill/restart/url/version/help). Unknown args error
     // there rather than falling through; only a bare `marina` reaches the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let demo = args.len() == 1 && args[0] == "demo";
+    let demo = args.first().is_some_and(|a| a == "demo");
+    if demo && args.len() > 1 {
+        eprintln!("marina: demo takes no arguments");
+        std::process::exit(2);
+    }
     if !demo {
         if let Some(code) = cli::dispatch(&args) {
             std::process::exit(code);
@@ -139,11 +143,12 @@ fn run(
                         match key.code {
                             KeyCode::Esc => app.new_cancel(),
                             KeyCode::Tab => app.new_toggle_worktree(),
+                            KeyCode::Enter if app.demo => {
+                                app.new_cancel();
+                                demo_only(app, "would start a session");
+                            }
                             KeyCode::Enter => {
                                 if let Some((req, place)) = app.new_commit() {
-                                    if demo_only(app, "would start a session") {
-                                        continue;
-                                    }
                                     let ev = ev_tx.clone();
                                     std::thread::spawn(move || {
                                         let msg = launch::start(&req, place).unwrap_or_else(|e| e);
@@ -188,8 +193,11 @@ fn run(
                         }
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Char('K' | 'R' | 'T' | 'O' | 'D')
+                            KeyCode::Char('K' | 'R' | 'T' | 'O')
                                 if demo_only(app, "would act on a real process") => {}
+                            KeyCode::Char('Y')
+                                if demo_only(app, "would copy it to your clipboard") => {}
+                            KeyCode::Char('D') if demo_only(app, "would show its git diff") => {}
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                             KeyCode::Char('g') => app.jump_top(),
@@ -200,11 +208,11 @@ fn run(
                             // a fold row (inbox): show / hide what's behind it
                             KeyCode::Enter if app.toggle_fold() => {}
                             // an ended session (inbox): resume it
+                            KeyCode::Enter
+                                if app.is_ended_selected() && demo_only(app, "would resume it") => {
+                            }
                             KeyCode::Enter if app.is_ended_selected() => {
                                 if let Some((req, place)) = app.resume_selected() {
-                                    if demo_only(app, "would resume it") {
-                                        continue;
-                                    }
                                     let ev = ev_tx.clone();
                                     std::thread::spawn(move || {
                                         let msg = launch::start(&req, place).unwrap_or_else(|e| e);
