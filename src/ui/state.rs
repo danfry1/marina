@@ -719,6 +719,9 @@ impl App {
     /// a jump back to the top. Called by render before drawing.
     pub(crate) fn reconcile(&mut self) {
         self.display = self.compute_entries();
+        if self.ctl.inbox {
+            self.note_sections();
+        }
         let idx = self
             .selected
             .as_ref()
