@@ -712,14 +712,14 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
 
 /// `O`/`Y` on a session: the URL of a web server it started (the next one
 /// on a repeat press), or why there's none.
-fn session_url(app: &mut ui::App) -> Option<Result<(String, String), String>> {
+fn session_url(app: &mut ui::App, verb: char) -> Option<Result<(String, String), String>> {
     let a = app.selected_agent()?;
     let (pid, label) = (a.pid, app.agent_label(a));
     let urls = app.agent_urls(a);
     if urls.is_empty() {
         return Some(Err(format!("{label} hasn't started a web server")));
     }
-    let i = app.next_url(pid, urls.len());
+    let i = app.next_url(verb, pid, urls.len());
     let more = if urls.len() > 1 {
         format!(" ({} of {} — again for the next)", i + 1, urls.len())
     } else {
@@ -729,7 +729,7 @@ fn session_url(app: &mut ui::App) -> Option<Result<(String, String), String>> {
 }
 
 fn verb_copy(app: &mut ui::App) {
-    match session_url(app) {
+    match session_url(app, 'Y') {
         Some(Ok((url, more))) => {
             match verbs::copy_url(&url) {
                 Ok(()) => app.set_status(format!("copied {url}{more}")),
@@ -758,7 +758,7 @@ fn verb_copy(app: &mut ui::App) {
 }
 
 fn verb_open(app: &mut ui::App) {
-    match session_url(app) {
+    match session_url(app, 'O') {
         Some(Ok((url, more))) => {
             let _ = verbs::open_url(&url);
             app.set_status(format!("opening {url}{more}"));

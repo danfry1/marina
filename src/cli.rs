@@ -18,7 +18,7 @@
 //! takes down every target under it — the grouping primitive, via the CLI.
 //! Docker targets are stopped/restarted via `docker stop`/`docker restart`.
 //!
-//! `--mine` narrows ls/kill/restart/url to targets started by the agent
+//! `--mine` narrows ls/kill/restart/url/open to targets started by the agent
 //! session running this command (so an agent can clean up after itself);
 //! `--orphaned` to targets whose launching agent session has ended.
 //!
@@ -81,7 +81,7 @@ SELECTOR:
     a project name (exact or substring), a port (3000 or :3000), or a command.
     `who` and `free` take ports only.
 
-SCOPE (ls / kill / restart / url; usable instead of, or with, selectors):
+SCOPE (ls / kill / restart / url / open; usable instead of, or with, selectors):
     --mine       only targets started by the agent session running marina
     --orphaned   only targets whose launching agent session has ended
 ";
@@ -149,6 +149,10 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         && !matches!(cmd, "watch" | "hooks")
     {
         eprintln!("marina: --install / --uninstall / --status only apply to `marina watch` and `marina hooks`");
+        return Some(2);
+    }
+    if json && cmd == "open" {
+        eprintln!("marina: open doesn't take --json (marina url --json prints the URLs)");
         return Some(2);
     }
     if flags.contains(&"--long") && cmd != "agents" {
@@ -780,16 +784,45 @@ fn url(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
 /// directory — what you mean from a project's terminal.
 fn open(selectors: &[&str], scope: &Scope) -> i32 {
     let snap = snapshot(false);
-    let mut targets = pick(&snap, selectors, scope, false);
-    if selectors.is_empty() && !scope.active() {
+    let bare = selectors.is_empty() && !scope.active();
+    let mut targets = pick(&snap, selectors, scope, bare);
+    if bare {
+        // running here: in this directory or under it, or in a project this
+        // directory is inside (`proj/src` finds proj's server)
         let here = std::env::current_dir().ok();
-        targets.retain(|t| here.as_ref().is_some_and(|h| t.cwd.starts_with(h)));
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if here
+            .as_ref()
+            .is_some_and(|h| h.parent().is_none() || Some(h) == home.as_ref())
+        {
+            eprintln!("marina open: from here that's everything — name one (marina open api, marina open 3000)");
+            return 2;
+        }
+        targets.retain(|t| {
+            here.as_ref().is_some_and(|h| {
+                !t.cwd.as_os_str().is_empty() && (t.cwd.starts_with(h) || h.starts_with(&t.cwd))
+            })
+        });
     }
     let web: Vec<&Target> = targets
         .iter()
         .copied()
         .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
         .collect();
+    // from ~ or / a bare `open` would match everything: list, don't open
+    if bare && web.len() > 3 {
+        eprintln!("{} web servers run under here — name one:", web.len());
+        for t in &web {
+            if let Some(u) = &t.url {
+                eprintln!(
+                    "  marina open {}\t{}",
+                    t.ports.first().copied().unwrap_or_default(),
+                    u.value
+                );
+            }
+        }
+        return 1;
+    }
     if web.is_empty() {
         eprintln!(
             "{}",
@@ -804,7 +837,7 @@ fn open(selectors: &[&str], scope: &Scope) -> i32 {
     for t in web {
         let Some(u) = &t.url else { continue };
         match verbs::open_url(&u.value) {
-            Ok(()) => println!("opened {}\t{}", t.project, u.value),
+            Ok(()) => println!("opening {}\t{}", t.project, u.value),
             Err(e) => {
                 eprintln!("couldn't open {}: {e}", u.value);
                 failed = true;
