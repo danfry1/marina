@@ -348,13 +348,26 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 /// where the platform allows: `terminal-notifier` on macOS when installed
 /// (plain notifications can't run anything on click), and a *Jump* action
 /// on Linux.
-pub fn notify(title: &str, body: &str, jump: Option<&str>) {
+pub fn notify(title: &str, body: &str, jump: Option<&str>, group: Option<&str>) {
     // only ever an id: it goes into a command line
     let jump = jump
         .filter(|j| crate::launcher::is_session_id(j))
         .map(String::from);
+    let group = group
+        .filter(|g| crate::launcher::is_session_id(g))
+        .map(String::from)
+        .or_else(|| jump.clone());
     let exe = stable_exe();
-    let (title, body) = (title.to_string(), body.to_string());
+    // terminal-notifier needs a message, and reads one starting with `-`
+    // or a plist character as something else; notify-send reads a leading
+    // `-` as an option. A leading `\` (stripped by terminal-notifier) and
+    // `--` (for notify-send) keep the text as text.
+    let body = if body.trim().is_empty() {
+        "open marina to see it".to_string()
+    } else {
+        body.to_string()
+    };
+    let title = title.to_string();
     thread::spawn(move || {
         let quiet = |c: &mut Command| {
             c.stdin(Stdio::null())
@@ -364,16 +377,29 @@ pub fn notify(title: &str, body: &str, jump: Option<&str>) {
         if cfg!(target_os = "macos") {
             if let (Some(id), Some(tn), Some(exe)) = (&jump, which("terminal-notifier"), &exe) {
                 let mut c = Command::new(tn);
-                c.args(["-title", &title, "-message", &body, "-group"])
-                    .arg(format!("marina-{id}"))
-                    .arg("-execute")
-                    // run on click by a shell with launchd's bare PATH:
-                    // give it ours, so tmux/herdr are found
-                    .arg(format!(
-                        "PATH={} {} jump {id}",
-                        shell_quote(&std::env::var("PATH").unwrap_or_default()),
-                        shell_quote(&exe.display().to_string())
-                    ));
+                let tn_safe = |t: &str| {
+                    if t.starts_with(['-', '(', '[', '{', '"', '\'', '<', '\\']) {
+                        format!("\\{t}")
+                    } else {
+                        t.to_string()
+                    }
+                };
+                c.args([
+                    "-title",
+                    &tn_safe(&title),
+                    "-message",
+                    &tn_safe(&body),
+                    "-group",
+                ])
+                .arg(format!("marina-{}", group.as_deref().unwrap_or(id)))
+                .arg("-execute")
+                // run on click by a shell with launchd's bare PATH:
+                // give it ours, so tmux/herdr are found
+                .arg(format!(
+                    "PATH={} {} jump {id}",
+                    shell_quote(&std::env::var("PATH").unwrap_or_default()),
+                    shell_quote(&exe.display().to_string())
+                ));
                 quiet(&mut c);
                 if c.status().is_ok_and(|s| s.success()) {
                     return;
@@ -399,7 +425,7 @@ pub fn notify(title: &str, body: &str, jump: Option<&str>) {
             if let (true, Some(id), Some(exe)) = (clickable, &jump, &exe) {
                 // waits for a click or dismissal, printing the action taken
                 let out = Command::new("notify-send")
-                    .args(["--action=jump=Jump", "--wait", &title, &body])
+                    .args(["--action=jump=Jump", "--wait", "--", &title, &body])
                     .stdin(Stdio::null())
                     .stderr(Stdio::null())
                     .output();
@@ -415,7 +441,7 @@ pub fn notify(title: &str, body: &str, jump: Option<&str>) {
                 }
             }
             let mut c = Command::new("notify-send");
-            c.arg(&title).arg(&body);
+            c.arg("--").arg(&title).arg(&body);
             quiet(&mut c);
             let _ = c.status();
         }

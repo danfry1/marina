@@ -215,16 +215,23 @@ marina                   # opens on the inbox when agents are running
   sending: `y` sends Enter only if the highlighted choice is a *Yes*
   (Claude Code's folder-trust prompt highlights *No*), and `n` sends Esc
   only if a dialog is up, so neither can interrupt a working agent. Only on your keystroke, only to the selected session, and
-  never into a GUI terminal window — `Enter` jumps there instead.
+  never into another terminal (Ghostty, Terminal, …) — `Enter` jumps there
+  instead.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
   and `D` opens the uncommitted diff (stat, untracked files, patch) in the
   pane below. A stale session with no servers and a clean, pushed tree is
   marked *looks finished* — the one to close first.
 - **Agent notices** — when a session finishes a stretch of work (30s+, then
-  quiet) or starts waiting on you: `claude·api finished after 12m`,
-  `claude·api needs you`, in the status line and as a desktop notification
-  (`[notify] agents = false` turns these off).
+  quiet) or starts waiting on you, a desktop notification says who and
+  what: `claude·api needs you` — *wants to run pnpm migrate*, or its
+  question (*Should it be per user or per API key?*);
+  `claude·docs finished after 12m` with the first line of its reply, or
+  `· your turn` and its question when it ended on one. Sessions finishing
+  together arrive as one (`3 sessions finished` — *claude·docs, claude·web,
+  codex·api*), which jumps to the first when clicked; each that needs you
+  keeps its own, and clicking it jumps to that session (`[notify] agents
+  = false` turns these off).
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification

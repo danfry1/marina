@@ -1445,13 +1445,13 @@ mod tests {
         let n = app.agent_notices(1_000);
         assert!(
             n.iter()
-                .any(|(t, _)| t.contains("working in the same tree")),
+                .any(|n| n.text().contains("working in the same tree")),
             "{n:?}"
         );
         assert!(
             !app.agent_notices(1_001)
                 .iter()
-                .any(|(t, _)| t.contains("same tree")),
+                .any(|n| n.text().contains("same tree")),
             "once"
         );
     }
