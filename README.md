@@ -101,7 +101,7 @@ marina                   # opens on the inbox when agents are running
   (`herdr·ghostty`, `tmux·iterm`, `ghostty`, `—` for no terminal), and
   `Enter` focuses it there — switching the multiplexer's pane and raising
   the terminal app showing it:
-  a herdr or tmux pane, or the iTerm2 session / Terminal tab / WezTerm pane on
+  a herdr, tmux or Zellij pane, a kitty window, or the iTerm2 session / Terminal tab / WezTerm pane on
   its tty, or a Ghostty terminal in its directory (macOS asks once to let your
   terminal control that app). Anywhere else it copies
   `cd <dir> && claude --resume <id>` to paste into a terminal. Under herdr, marina also shows herdr's view of the
@@ -139,7 +139,8 @@ marina                   # opens on the inbox when agents are running
   The detail beside it leads with *your turn* and *what it did*, then one
   line of context (directory, branch and changes, PR, servers, shared
   tree, context size) and the full conversation (`[` `]` to scroll); `p`
-  switches it to the session's live screen (herdr, tmux and iTerm2).
+  switches it to the session's live screen (herdr, tmux, Zellij, iTerm2,
+  WezTerm and kitty).
 - **Subagents** — the subagents a session starts (Claude Code's Agent
   tool, Codex's spawned threads) are listed under it, not as sessions of
   their own: the detail shows each one running with what it's on, and the
@@ -190,7 +191,7 @@ marina                   # opens on the inbox when agents are running
   Terminal window (the command is typed into that window's shell, so it
   gets your PATH); `Tab` puts it in its own `git worktree` beside the repo
   so it can't collide with sessions already there. `X` (twice) ends a
-  herdr, tmux or iTerm2 session with its exit command, warning first about
+  herdr, tmux, Zellij, iTerm2, WezTerm or kitty session with its exit command, warning first about
   uncommitted work or servers it leaves running. The inbox lists sessions
   that exited in the last two days under *ended* — Claude Code, Codex CLI
   and opencode alike; `Enter` resumes one (`claude --resume <id>`,
@@ -208,7 +209,7 @@ marina                   # opens on the inbox when agents are running
 - **Quick replies** — `1`–`9` on a session open the reply box with a canned
   reply (`commit it`, `push it`, `run the tests`, `continue` — set your own
   with `[agents] quick`); Enter sends it.
-- **Answer from marina** — on a herdr, tmux or iTerm2 session: `y` approves what
+- **Answer from marina** — on a herdr, tmux, Zellij, iTerm2, WezTerm or kitty session: `y` approves what
   it's asking, `n` rejects it, `r` types a reply (dismissing a waiting
   dialog first). Each re-reads the session's screen at the moment of
   sending: `y` sends Enter only if the highlighted choice is a *Yes*
@@ -460,13 +461,15 @@ marina is deliberately boring on this front:
   `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `AI_AGENT`, `AGENT`, … — the full
   list is `MARKERS` in [src/launcher.rs](src/launcher.rs)), used to attribute a
   server to its agent session. Of those, only pids and validated session ids
-  are kept; flag values are never read, and no other variable is kept,
+  are kept; flag values are never read, and besides those and the four
+  that name a Zellij pane or kitty window (below), no variable is kept,
   displayed, or serialized; for agent sessions, their terminal device's
   last-written / last-read timestamps (never the screen contents), their work
   tree's `git status` / `git diff --shortstat` (run with
   `GIT_OPTIONAL_LOCKS=0`, so marina never takes a lock an agent needs), and —
   only when herdr or tmux is running — those tools' own pane listings
-  (`herdr agent list`, `tmux list-panes`); the nearest project
+  (`herdr agent list`, `tmux list-panes`; a session whose dialog is
+  inferred has its tmux or Zellij screen read to confirm it); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
@@ -486,11 +489,19 @@ marina is deliberately boring on this front:
   whether a session has any message).
   Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts
-  = false` turns this off. The live screen of a herdr, tmux or iTerm2
-  session is read (`herdr agent read`, `tmux capture-pane`, iTerm2's
-  scripting) only while its preview is open or when you answer it; iTerm2
-  is never scripted in the background, so macOS asks for the automation
-  permission only after a keystroke.
+  = false` turns this off. The live screen of a herdr, tmux, Zellij, iTerm2, WezTerm or kitty
+  session is read (`herdr agent read`, `tmux capture-pane`,
+  `zellij action dump-screen`, iTerm2's scripting, `wezterm cli get-text`,
+  `kitten @ get-text`) while its preview is open, when you answer it, and —
+  except iTerm2, which is never scripted in the background, so macOS asks
+  for the automation permission only after a keystroke — to confirm an
+  inferred dialog. Which Zellij pane or kitty window a session is in comes
+  from four variables in its environment (`ZELLIJ_SESSION_NAME`,
+  `ZELLIJ_PANE_ID`, `KITTY_WINDOW_ID`, `KITTY_LISTEN_ON`); no other
+  variable is kept. kitty needs remote control on:
+  `allow_remote_control socket-only` and `listen_on unix:/tmp/kitty` in
+  `kitty.conf` (`marina doctor` says so when a session runs in a kitty
+  without it).
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
   `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
@@ -500,8 +511,9 @@ marina is deliberately boring on this front:
   browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
   `Enter` on an agent asks its multiplexer or terminal app to focus it,
   and `y` / `n` / `r` on an agent send that keystroke or your reply to its
-  herdr/tmux pane or iTerm2 session (`herdr agent send-keys` / `prompt`,
-  `tmux send-keys`, iTerm2's `write text`). The one unprompted
+  pane or window (`herdr agent send-keys` / `prompt`, `tmux send-keys`,
+  `zellij action write-chars`, iTerm2's `write text`,
+  `wezterm cli send-text --no-paste`, `kitten @ send-text`). The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind, finishes, or needs you (`[notify] desktop = false` disables it).
 

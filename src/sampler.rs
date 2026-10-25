@@ -399,13 +399,17 @@ impl Sampler {
                     .unwrap_or(0);
                 for a in &mut agents {
                     a.infer_waiting(now);
-                    // where its screen can be read (tmux), confirm the
-                    // inference: there must be a dialog on it
+                    // where its screen can be read cheaply and quietly
+                    // (tmux, Zellij — not iTerm2's scripting, a wedged
+                    // kitty, or a WezTerm whose GUI is closed, which logs a
+                    // file per failed call), confirm the inference: there
+                    // must be a dialog on it
                     if a.waiting {
+                        use crate::hosts::HostKind;
                         if let Some(h) = a
                             .host
                             .as_ref()
-                            .filter(|h| h.kind == crate::hosts::HostKind::Tmux)
+                            .filter(|h| matches!(h.kind, HostKind::Tmux | HostKind::Zellij))
                         {
                             if let Some(screen) = crate::hosts::read_screen(h, 30) {
                                 a.waiting = crate::hosts::shows_dialog(&screen);
@@ -977,6 +981,7 @@ mod tests {
             mem_bytes: 0,
             start_time: 0,
             agent: None,
+            term: None,
         }
     }
     fn map(ps: Vec<ProcInfo>) -> HashMap<u32, ProcInfo> {
