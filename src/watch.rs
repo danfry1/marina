@@ -90,7 +90,7 @@ pub fn run() -> i32 {
         }
         if cfg.notify.desktop {
             for n in crate::ui::coalesce(notices) {
-                crate::verbs::notify(&n.title, &n.body, n.jump.as_deref());
+                crate::verbs::notify(&n.title, &n.body, n.jump.as_deref(), n.group.as_deref());
             }
         }
         std::thread::sleep(EVERY);

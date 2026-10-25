@@ -224,12 +224,14 @@ marina                   # opens on the inbox when agents are running
   marked *looks finished* — the one to close first.
 - **Agent notices** — when a session finishes a stretch of work (30s+, then
   quiet) or starts waiting on you, a desktop notification says who and
-  what: `claude·api needs you` — *wants to run pnpm migrate* or *asks: per
-  user or per API key?*; `claude·docs finished after 12m` with the first
-  line of its reply, or `· your turn` and its question when it ended on
-  one. Sessions finishing together arrive as one (`3 sessions finished:
-  docs, web, api`); each that needs you keeps its own. Clicking one jumps
-  to that session (`[notify] agents = false` turns these off).
+  what: `claude·api needs you` — *wants to run pnpm migrate*, or its
+  question (*Should it be per user or per API key?*);
+  `claude·docs finished after 12m` with the first line of its reply, or
+  `· your turn` and its question when it ended on one. Sessions finishing
+  together arrive as one (`3 sessions finished` — *claude·docs, claude·web,
+  codex·api*), which jumps to the first when clicked; each that needs you
+  keeps its own, and clicking it jumps to that session (`[notify] agents
+  = false` turns these off).
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
   running (480MB)` — in the status line and as a desktop notification

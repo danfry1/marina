@@ -331,7 +331,7 @@ fn run(
         // the background watcher, when running, sends these itself
         if desktop_notify && !notices.is_empty() && !watch::running() {
             for n in ui::coalesce(notices) {
-                verbs::notify(&n.title, &n.body, n.jump.as_deref());
+                verbs::notify(&n.title, &n.body, n.jump.as_deref(), n.group.as_deref());
             }
         }
 

@@ -322,6 +322,8 @@ impl App {
                     body: msg.clone(),
                     jump: None,
                     kind: NoticeKind::Other,
+                    who: String::new(),
+                    group: None,
                 });
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
             }
@@ -393,6 +395,8 @@ impl App {
                 ),
                 jump: None,
                 kind: NoticeKind::Other,
+                who: String::new(),
+                group: None,
             });
         }
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
@@ -406,17 +410,21 @@ impl App {
                 .unwrap_or_else(|| a.name.clone());
             if a.is_blocked() {
                 let ask = a.summary.as_ref().and_then(|s| s.ask());
-                let what = a
-                    .summary
-                    .as_ref()
-                    .map(|s| format!("{:?}@{:?}/{ask:?}", s.pending_tool, s.pending_since))
-                    .unwrap_or_default();
+                // what it's waiting on: the tool call, else the question —
+                // a recap landing during a prompt isn't a new prompt
+                let what = match a.summary.as_ref() {
+                    Some(s) if s.pending_tool.is_some() => {
+                        format!("{:?}@{:?}", s.pending_tool, s.pending_since)
+                    }
+                    Some(_) => format!("{ask:?}"),
+                    None => String::new(),
+                };
                 if self.agent_blocked.get(&a.pid) != Some(&what) {
                     self.agent_blocked.insert(a.pid, what);
                     // say what it wants, so the notification is actionable
                     let body = match (a.pending_tool(), ask) {
                         (Some(t), _) => format!("wants to run {}", clip(&t, 90)),
-                        (None, Some(q)) => format!("asks: {}", clip(&q, 120)),
+                        (None, Some(q)) => clip(&q, 120),
                         (None, None) => String::new(),
                     };
                     out.push(Notice {
@@ -424,6 +432,8 @@ impl App {
                         body,
                         jump: jump_key(a),
                         kind: NoticeKind::NeedsYou,
+                        who: label.clone(),
+                        group: None,
                     });
                 }
                 self.agent_streaks.remove(&a.pid); // the question says it all
@@ -445,9 +455,11 @@ impl App {
                         let notice = match s.and_then(|s| s.ask()) {
                             Some(q) => Notice {
                                 title: format!("{label} finished after {took} · your turn"),
-                                body: format!("asks: {}", clip(&q, 120)),
+                                body: clip(&q, 120),
                                 jump: jump_key(a),
                                 kind: NoticeKind::NeedsYou,
+                                who: label.clone(),
+                                group: None,
                             },
                             None => Notice {
                                 title: format!("{label} finished after {took}"),
@@ -457,6 +469,8 @@ impl App {
                                     .unwrap_or_default(),
                                 jump: jump_key(a),
                                 kind: NoticeKind::Finished,
+                                who: label.clone(),
+                                group: None,
                             },
                         };
                         out.push(notice);
@@ -1542,6 +1556,12 @@ pub struct Notice {
     /// What `marina jump` is given when it's clicked.
     pub jump: Option<String>,
     pub kind: NoticeKind,
+    /// The session's label (`claude·api`, `claude·portal #aaaa`), for
+    /// naming it in a grouped notice.
+    pub who: String,
+    /// A notification group of its own (macOS replaces the banner in the
+    /// same group), instead of the session's.
+    pub group: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1574,15 +1594,16 @@ pub fn coalesce(notices: Vec<Notice>) -> Vec<Notice> {
         0 => {}
         1 => out.extend(finished),
         n => {
-            let who: Vec<&str> = finished
-                .iter()
-                .map(|f| f.title.split(' ').next().unwrap_or_default())
-                .collect();
+            let who: Vec<&str> = finished.iter().map(|f| f.who.as_str()).collect();
             out.push(Notice {
                 title: format!("{n} sessions finished"),
-                body: who.join(", "),
+                body: format!("{} — click for the first", who.join(", ")),
                 jump: finished[0].jump.clone(),
                 kind: NoticeKind::Finished,
+                who: String::new(),
+                // its own group: not replacing (or replaced by) the first
+                // session's own banner
+                group: Some("finished".into()),
             });
         }
     }
@@ -1935,27 +1956,43 @@ mod tests {
 
     #[test]
     fn finished_sessions_arriving_together_are_one_notification() {
-        let n = |title: &str, kind| Notice {
+        let n = |who: &str, title: &str, kind| Notice {
             title: title.into(),
             body: "said something".into(),
-            jump: Some(format!("{title}-id")),
+            jump: Some(format!("{who}-id")),
             kind,
+            who: who.into(),
+            group: None,
         };
         let out = coalesce(vec![
-            n("claude·docs finished after 4m", NoticeKind::Finished),
-            n("claude·api needs you", NoticeKind::NeedsYou),
-            n("codex·web finished after 12m", NoticeKind::Finished),
+            n(
+                "claude·portal #aaaa",
+                "claude·portal #aaaa finished after 4m",
+                NoticeKind::Finished,
+            ),
+            n("claude·api", "claude·api needs you", NoticeKind::NeedsYou),
+            n(
+                "claude·My Project",
+                "claude·My Project finished after 12m",
+                NoticeKind::Finished,
+            ),
         ]);
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0].title, "claude·api needs you", "kept on its own");
         assert_eq!(out[1].title, "2 sessions finished");
-        assert_eq!(out[1].body, "claude·docs, codex·web");
         assert_eq!(
-            out[1].jump.as_deref(),
-            Some("claude·docs finished after 4m-id")
+            out[1].body,
+            "claude·portal #aaaa, claude·My Project — click for the first"
+        );
+        assert_eq!(out[1].jump.as_deref(), Some("claude·portal #aaaa-id"));
+        assert_eq!(
+            out[1].group.as_deref(),
+            Some("finished"),
+            "not the first session's"
         );
         // one alone is left as it is
         let one = coalesce(vec![n(
+            "claude·docs",
             "claude·docs finished after 4m",
             NoticeKind::Finished,
         )]);
