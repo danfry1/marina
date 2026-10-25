@@ -159,6 +159,12 @@ marina                   # opens on the inbox when agents are running
   nothing else points to, and no session or server still running there.
   Each is re-checked at the moment it runs; if any of it can't be read,
   nothing is offered; nothing is ever forced.
+- **Open what it started** — when an agent brings up a web server, marina
+  says so (`claude·web started vite on http://localhost:5173 — O on its
+  session opens it`), and `O` on the session opens it in the browser (`Y`
+  copies it); with several, pressing again moves to the next. From a
+  terminal, `marina open` opens the servers running in the current
+  directory, and an agent can run `marina open --mine` for its own.
 - **Preview** (`p`) — the same session detail under the project view.
 - **Needs you, anywhere** — under herdr marina takes herdr's word; with
   hooks installed, the agent's own; elsewhere
@@ -298,7 +304,7 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `K` · `u` | kill selection · cancel the pending force-kill |
 | `R` · `T` | restart (output captured to a log) · tail logs |
 | `[` / `]`, `+` / `-` | scroll / resize the log pane |
-| `Y` · `O` | copy URL · open in browser |
+| `Y` · `O` | copy URL · open in browser — on an agent session, the web server it started (press again for the next) |
 | `Esc` | close pane / clear filter |
 | `q` / `Ctrl+C` | quit |
 
@@ -314,6 +320,7 @@ marina kill --orphaned        # stop servers whose agent session has ended
 marina kill <selector>        # project name, port (3000 / :3000), or command
 marina restart <selector>     # output captured to ~/.local/state/marina/logs/
 marina url <selector> [--json]
+marina open [selector] [--mine]   # open servers in the browser; bare: the ones running in this directory
 marina who <port>… [--json]   # what's holding a port — dev target or not
 marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
 marina port [name] [--json]   # a stable, collision-free port for this project/worktree

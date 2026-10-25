@@ -125,6 +125,11 @@ pub(crate) struct PendingKill {
 pub struct App {
     /// `marina demo`: made-up sessions; verbs only say what they'd do.
     pub demo: bool,
+    /// `O`/`Y` on a session with several servers: (verb, pid, which, when).
+    pub(crate) url_cycle: Option<(char, u32, usize, Instant)>,
+    /// When each server was last announced as started, so one that keeps
+    /// restarting (a watch mode) is announced once.
+    pub(crate) announced: HashMap<TargetKey, Instant>,
     pub(crate) snapshot: Arc<Snapshot>,
     pub(crate) selected: Option<Entry>,
     /// Where the cursor last sat in `display` — the nearest-neighbor fallback
@@ -195,6 +200,8 @@ impl App {
     pub fn new() -> Self {
         App {
             demo: false,
+            url_cycle: None,
+            announced: HashMap::new(),
             snapshot: Arc::new(Snapshot::empty()),
             selected: None,
             last_index: 0,
@@ -273,7 +280,16 @@ impl App {
                     crashed = Some(format!("⚠ {} ({what}) exited unexpectedly", t.project));
                 }
             }
+            let started = if old.error.is_some() || self.snapshot.error.is_some() {
+                None // a failed scan makes everything look new afterwards
+            } else {
+                self.started_servers(&old_keys, now)
+            };
+            // a crash outranks a server coming up, which doesn't cover a
+            // notice still up from before
             if let Some(msg) = crashed {
+                self.set_status(msg);
+            } else if let Some(msg) = started.filter(|_| !self.notice_showing()) {
                 self.set_status(msg);
             }
             // a target turning heavy (runaway test runner, leak): say so once
@@ -434,6 +450,36 @@ impl App {
         out
     }
 
+    /// The web URLs of the servers `a` started, by port.
+    pub(crate) fn agent_urls(&self, a: &Agent) -> Vec<String> {
+        let mut servers: Vec<&Target> = self
+            .agent_servers(a)
+            .into_iter()
+            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+            .collect();
+        servers.sort_by_key(|t| t.ports.first().copied());
+        servers
+            .iter()
+            .filter_map(|t| t.url.as_ref().map(|u| u.value.clone()))
+            .collect()
+    }
+
+    /// Which of `n` URLs `verb` (`O` or `Y`) on session `pid` takes: the
+    /// next one when the same key is pressed again on it soon after, else
+    /// the first.
+    pub(crate) fn next_url(&mut self, verb: char, pid: u32, n: usize) -> usize {
+        let i = match self.url_cycle {
+            Some((v, p, i, at))
+                if v == verb && p == pid && at.elapsed() < Duration::from_secs(10) =>
+            {
+                (i + 1) % n
+            }
+            _ => 0,
+        };
+        self.url_cycle = Some((verb, pid, i, Instant::now()));
+        i
+    }
+
     /// Servers this agent session started (its live launcher is the agent).
     pub(crate) fn agent_servers(&self, a: &Agent) -> Vec<&Target> {
         self.snapshot
@@ -497,6 +543,56 @@ impl App {
         self.status_at = Instant::now();
         self.status_ttl = STATUS_TTL;
         self.dirty = true;
+    }
+
+    /// A notice (`set_notice`) is still on screen.
+    fn notice_showing(&self) -> bool {
+        self.status.is_some()
+            && self.status_ttl == NOTICE_TTL
+            && self.status_at.elapsed() < NOTICE_TTL
+    }
+
+    /// The line for web servers a live agent session just started (not in
+    /// `old_keys`, and not announced in the last few minutes): the first by
+    /// port — what `O` on that session opens first — and how many more.
+    fn started_servers(&mut self, old_keys: &HashSet<&TargetKey>, now: Instant) -> Option<String> {
+        const AGAIN_AFTER: Duration = Duration::from_secs(300);
+        self.announced.retain(|_, at| at.elapsed() < AGAIN_AFTER);
+        let mut fresh: Vec<(&Target, &Agent)> = self
+            .snapshot
+            .targets
+            .iter()
+            .filter(|t| !old_keys.contains(&t.key) && !self.announced.contains_key(&t.key))
+            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+            .filter_map(|t| {
+                // a session marina can point O at: its launcher's pid is live
+                let l = t.launcher.as_ref().filter(|l| l.alive)?;
+                let a = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|a| l.pid == Some(a.pid) && l.name == a.name)?;
+                Some((t, a))
+            })
+            .collect();
+        fresh.sort_by_key(|(t, _)| t.ports.first().copied());
+        let keys: Vec<TargetKey> = fresh.iter().map(|(t, _)| t.key.clone()).collect();
+        let msg = fresh.first().map(|(t, a)| {
+            let more = match fresh.len() {
+                1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            };
+            format!(
+                "{} started {} on {}{more} — O on its session opens it",
+                self.agent_label(a),
+                t.command_label,
+                t.url.as_ref().map(|u| u.value.as_str()).unwrap_or_default()
+            )
+        });
+        for k in keys {
+            self.announced.insert(k, now);
+        }
+        msg
     }
 
     /// A status message that stays up long enough to act on.
@@ -1460,6 +1556,23 @@ pub(crate) fn is_agent_service(t: &Target) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_on_a_session_moves_through_its_servers() {
+        let mut app = App::new();
+        assert_eq!(app.next_url('O', 7, 3), 0);
+        assert_eq!(app.next_url('O', 7, 3), 1);
+        assert_eq!(app.next_url('O', 7, 3), 2);
+        assert_eq!(app.next_url('O', 7, 3), 0, "wraps round");
+        assert_eq!(
+            app.next_url('O', 8, 3),
+            0,
+            "another session starts at its first"
+        );
+        assert_eq!(app.next_url('Y', 8, 3), 0, "Y after O copies what O opened");
+        app.url_cycle = Some(('O', 8, 1, Instant::now() - Duration::from_secs(60)));
+        assert_eq!(app.next_url('O', 8, 3), 0, "a while later starts over");
+    }
     fn app_with_sample() -> App {
         let mut app = App::new();
         let mut snap = Snapshot::sample();
