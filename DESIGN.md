@@ -724,10 +724,24 @@ script`). The command line is `cd '<dir>' && <agent> '<arg>'…`, every value
 single-quoted, passed to AppleScript as argv. A worktree is `git worktree
 add -b marina/<stamp> <repo>-<stamp>` beside the repo, keeping the
 subdirectory. `X` sends `/exit` (`/quit` for Codex) through `hosts::send`
-after a second press within 4s. *Ended* sessions are transcripts written
-in the last two days whose id isn't live (at most 8, rescanned every 30s,
-needing a reply and a recorded `cwd`); `Enter` resumes one with
-`claude --resume <id>` through the same launcher.
+after a second press within 4s. *Ended* sessions (`transcript::Ended`,
+with the agent to resume it with) are written between a minute and two
+days ago, not live, in a directory that still exists (at most 8 overall,
+rescanned every 30s): Claude Code transcripts with a reply; Codex rollouts
+last written in that window (any day directory: a resumed thread keeps
+the file it started in; files found unlistable are skipped until they
+change) whose `session_meta.source` is `cli`
+(desktop-app threads, `exec` runs and spawned subagents are left out —
+`codex resume` is for the CLI's own) and that ended with a reply; and
+opencode's top-level, unarchived sessions with any message, from
+`sqlite3 -readonly -json` on its `opencode.db` — `session_v2` /
+`session_message` (opencode 2), else `session` / `message` (1.x); if the
+read-only open fails (WAL files removed on close), `immutable=1` (opencode's own
+`session list` is per-project and may start its service; without
+`sqlite3`, none — its placeholder "New session - …" title is dropped).
+A running session marina couldn't identify keeps its agent's ended
+sessions in that directory off the list, so it isn't offered twice.
+`Enter` resumes one through the same launcher (`launch::agent_args`).
 
 **Other agents' history**: Codex rollouts (`$CODEX_HOME/sessions/**/rollout-…-<thread id>.jsonl`)
 give the cwd (first `session_meta` line), user messages, assistant

@@ -353,11 +353,16 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 let Some(x) = app.snapshot.ended.iter().find(|x| &x.id == id) else {
                     continue;
                 };
-                let label = x
+                let dir = x
                     .cwd
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let label = if x.agent == "claude" {
+                    dir
+                } else {
+                    format!("{}·{dir}", x.agent)
+                };
                 let text = x
                     .summary
                     .title
@@ -554,7 +559,7 @@ fn render_ended(frame: &mut Frame, app: &mut App, area: Rect, e: &crate::transcr
         format!(" {}", "─".repeat(w.saturating_sub(2))),
         DIM,
     ));
-    let body = summary_lines(&e.summary, "claude", w, true);
+    let body = summary_lines(&e.summary, &e.agent, w, true);
     let room = inner_h.saturating_sub(head.len());
     let max = body.len().saturating_sub(room);
     let offset = app.ctl.detail_scroll.min(max);

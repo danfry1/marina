@@ -192,8 +192,10 @@ marina                   # opens on the inbox when agents are running
   so it can't collide with sessions already there. `X` (twice) ends a
   herdr, tmux or iTerm2 session with its exit command, warning first about
   uncommitted work or servers it leaves running. The inbox lists sessions
-  that exited in the last two days under *ended*; `Enter` resumes one
-  (`claude --resume <id>`) the same way `N` starts one.
+  that exited in the last two days under *ended* — Claude Code, Codex CLI
+  and opencode alike; `Enter` resumes one (`claude --resume <id>`,
+  `codex resume <id>`, `opencode --session <id>`) the same way `N` starts
+  one, and `L` lands its work.
 - **Daily digest** — `marina digest [today|24h|3d]` summarises your agents'
   work per project: sessions, time spent in turns, tokens used, commits
   made in the repo, PRs opened, and each session's latest recap — a
@@ -478,7 +480,10 @@ marina is deliberately boring on this front:
   each subagent transcript beside it. Codex
   rollouts under `~/.codex/sessions` are read the same way (the first record
   of the last two days' rollouts names any parent thread), and opencode
-  summaries come from `opencode session export` while its service runs.
+  summaries come from `opencode session export` while its service runs;
+  its ended sessions are listed from its database (`opencode.db`, opened
+  read-only with the `sqlite3` CLI: ids, directories, titles, times, and
+  whether a session has any message).
   Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts
   = false` turns this off. The live screen of a herdr, tmux or iTerm2
