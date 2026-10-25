@@ -512,10 +512,10 @@ impl Sampler {
                 let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
                 // a running session marina couldn't identify may own a
                 // transcript in its directory
-                let busy: Vec<PathBuf> = agents
+                let busy: Vec<(String, PathBuf)> = agents
                     .iter()
-                    .filter(|a| a.name == "claude" && a.session.is_none())
-                    .map(|a| a.cwd.clone())
+                    .filter(|a| a.session.is_none())
+                    .map(|a| (a.name.clone(), a.cwd.clone()))
                     .collect();
                 tc.ended(&live, &busy)
             }

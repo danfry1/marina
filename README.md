@@ -482,7 +482,8 @@ marina is deliberately boring on this front:
   of the last two days' rollouts names any parent thread), and opencode
   summaries come from `opencode session export` while its service runs;
   its ended sessions are listed from its database (`opencode.db`, opened
-  read-only with the `sqlite3` CLI: ids, directories, titles and times).
+  read-only with the `sqlite3` CLI: ids, directories, titles, times, and
+  whether a session has any message).
   Nothing else from `~/.claude` is read — never credentials or
   settings — and nothing is written or sent anywhere. `[agents] transcripts
   = false` turns this off. The live screen of a herdr, tmux or iTerm2

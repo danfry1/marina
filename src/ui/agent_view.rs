@@ -559,7 +559,7 @@ fn render_ended(frame: &mut Frame, app: &mut App, area: Rect, e: &crate::transcr
         format!(" {}", "─".repeat(w.saturating_sub(2))),
         DIM,
     ));
-    let body = summary_lines(&e.summary, "claude", w, true);
+    let body = summary_lines(&e.summary, &e.agent, w, true);
     let room = inner_h.saturating_sub(head.len());
     let max = body.len().saturating_sub(room);
     let offset = app.ctl.detail_scroll.min(max);

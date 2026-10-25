@@ -758,38 +758,25 @@ fn codex_sessions() -> Option<PathBuf> {
     )
 }
 
-/// Rollouts under Codex's sessions dir in the newest `days` day
-/// directories (`sessions/YYYY/MM/DD`).
-fn codex_recent_rollouts(days: usize) -> Vec<PathBuf> {
+/// Every rollout under Codex's sessions dir (stat only; the tree is a few
+/// hundred files).
+fn codex_rollouts() -> Vec<PathBuf> {
     let Some(root) = codex_sessions() else {
         return Vec::new();
     };
-    let subdirs = |d: &Path| -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        v.sort();
-        v
-    };
-    let mut dirs: Vec<PathBuf> = subdirs(&root)
-        .into_iter()
-        .rev()
-        .take(2)
-        .flat_map(|y| subdirs(&y).into_iter().rev().take(2))
-        .flat_map(|m| subdirs(&m).into_iter().rev().take(days))
-        .collect();
-    dirs.sort();
-    dirs.reverse();
-    dirs.truncate(days);
-    dirs.iter()
-        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect()
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// opencode's session database (`$XDG_DATA_HOME/opencode/opencode.db`).
@@ -814,17 +801,20 @@ fn opencode_ended(live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
         now.saturating_sub(ENDED_WITHIN) * 1000,
         now.saturating_sub(60) * 1000,
     );
-    // integers only in the query: nothing from outside is spliced in
-    let query = format!(
-        "select id, directory, title, time_updated from session \
-         where parent_id is null and time_archived is null \
-         and time_updated between {from} and {to} \
-         and exists (select 1 from message where message.session_id = session.id) \
-         order by time_updated desc limit {ENDED_MAX}"
-    );
-    let mut cmd = std::process::Command::new("sqlite3");
-    cmd.arg("-readonly").arg("-json").arg(&db).arg(&query);
-    let Some(json) = crate::exec::output(cmd, Duration::from_secs(2)) else {
+    // integers only in the queries: nothing from outside is spliced in.
+    // opencode 2 writes `session_v2`; 1.x wrote `session`
+    let query = |session: &str, message: &str| {
+        format!(
+            "select id, directory, title, time_updated from {session} \
+             where parent_id is null and time_archived is null \
+             and time_updated between {from} and {to} \
+             and exists (select 1 from {message} where {message}.session_id = {session}.id) \
+             order by time_updated desc limit {ENDED_MAX}"
+        )
+    };
+    let Some(json) = sqlite_json(&db, &query("session_v2", "session_message"))
+        .or_else(|| sqlite_json(&db, &query("session", "message")))
+    else {
         return Vec::new();
     };
     parse_opencode_sessions(&json)
@@ -832,6 +822,36 @@ fn opencode_ended(live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
         .filter(|e| !live.contains(&e.id.as_str()))
         .filter(|e| e.cwd.is_dir() && !busy_dirs.contains(&e.cwd))
         .collect()
+}
+
+/// Rows of `query` on `db` as JSON, opened read-only. A database in WAL
+/// mode whose -wal/-shm files were removed when opencode closed can't be
+/// opened read-only; then it's opened as unchanging (`immutable=1`) —
+/// opencode isn't running to change it.
+fn sqlite_json(db: &Path, query: &str) -> Option<String> {
+    let run = |target: &str, readonly: bool| {
+        let mut cmd = std::process::Command::new("sqlite3");
+        if readonly {
+            cmd.arg("-readonly");
+        }
+        cmd.arg("-json").arg(target).arg(query);
+        crate::exec::output(cmd, Duration::from_secs(2))
+    };
+    let path = db.to_str()?;
+    run(path, true).or_else(|| {
+        // a URI filename: escape what a URI would read as syntax
+        let esc: String = path
+            .chars()
+            .map(|c| match c {
+                '%' => "%25".into(),
+                '?' => "%3f".into(),
+                '#' => "%23".into(),
+                ' ' => "%20".into(),
+                c => c.to_string(),
+            })
+            .collect();
+        run(&format!("file:{esc}?mode=ro&immutable=1"), false)
+    })
 }
 
 /// `sqlite3 -json` rows of opencode sessions. A session opencode never
@@ -935,6 +955,8 @@ pub struct Cache {
     entries: HashMap<String, Entry>,
     subs: HashMap<PathBuf, SubEntry>,
     codex_scan: CodexScan,
+    /// Rollouts looked at for ended sessions and not listable, by stamp.
+    codex_skip: HashMap<PathBuf, (SystemTime, u64)>,
     /// The last look for ended sessions, and what it found.
     ended: Option<(Instant, Vec<Ended>)>,
 }
@@ -1266,7 +1288,14 @@ impl Cache {
     /// written in the last two days whose session isn't running. `busy_dirs`
     /// are directories with a running session marina couldn't identify —
     /// a transcript there may be its, so it isn't offered for resuming.
-    pub fn ended(&mut self, live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
+    pub fn ended(&mut self, live: &[&str], busy: &[(String, PathBuf)]) -> Vec<Ended> {
+        let busy_for = |agent: &str| -> Vec<PathBuf> {
+            busy.iter()
+                .filter(|(a, _)| a == agent)
+                .map(|(_, d)| d.clone())
+                .collect()
+        };
+        let busy_dirs = &busy_for("claude");
         if let Some((at, found)) = &self.ended {
             if at.elapsed() < ENDED_EVERY {
                 return found
@@ -1365,8 +1394,8 @@ impl Cache {
                 summary,
             });
         }
-        found.extend(self.codex_ended(live, busy_dirs));
-        found.extend(opencode_ended(live, busy_dirs));
+        found.extend(self.codex_ended(live, &busy_for("codex")));
+        found.extend(opencode_ended(live, &busy_for("opencode")));
         found.sort_by_key(|e| std::cmp::Reverse(e.at));
         found.truncate(ENDED_MAX);
         self.ended = Some((Instant::now(), found.clone()));
@@ -1379,13 +1408,22 @@ impl Cache {
     fn codex_ended(&mut self, live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
         let now = SystemTime::now();
         let mut out = Vec::new();
-        for path in codex_recent_rollouts(3) {
+        let mut seen = Vec::new();
+        // every rollout, by when it was last written: a resumed thread keeps
+        // the file (and day directory) it started in
+        for path in codex_rollouts() {
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
             let Ok(mtime) = meta.modified() else { continue };
             let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
             if !(60..=ENDED_WITHIN).contains(&age) {
+                continue;
+            }
+            let stamp = (mtime, meta.len());
+            seen.push(path.clone());
+            // looked at already, unchanged, and not listable
+            if self.codex_skip.get(&path) == Some(&stamp) {
                 continue;
             }
             let Some(id) = path
@@ -1397,11 +1435,11 @@ impl Cache {
             else {
                 continue;
             };
-            let stamp = (mtime, meta.len());
             let summary = match self.entries.get(&id).filter(|e| e.stamp == stamp) {
                 Some(e) => e.summary.clone(),
                 None => {
-                    let Some(head) = read_head(&path, 256 * 1024) else {
+                    // the first record (session_meta) is all the head needed
+                    let Some(head) = read_head(&path, 64 * 1024) else {
                         continue;
                     };
                     let Some(m) = head
@@ -1413,6 +1451,7 @@ impl Cache {
                     };
                     // what `codex resume` brings back: the CLI's own sessions
                     if m["payload"]["source"] != "cli" {
+                        self.codex_skip.insert(path.clone(), stamp);
                         continue;
                     }
                     let Some(tail) = read_tail(&path, TAIL) else {
@@ -1434,11 +1473,16 @@ impl Cache {
             let Some(cwd) = summary
                 .cwd
                 .clone()
-                .filter(|c| c.is_absolute() && c.is_dir() && !busy_dirs.contains(c))
+                .filter(|c| c.is_absolute() && c.is_dir())
                 .filter(|_| summary.last_reply.is_some())
             else {
+                self.codex_skip.insert(path.clone(), stamp);
                 continue;
             };
+            // a Codex running there that marina couldn't identify may be it
+            if busy_dirs.contains(&cwd) {
+                continue;
+            }
             out.push(Ended {
                 agent: "codex".into(),
                 id,
@@ -1447,6 +1491,7 @@ impl Cache {
                 summary,
             });
         }
+        self.codex_skip.retain(|p, _| seen.contains(p));
         out
     }
 }
