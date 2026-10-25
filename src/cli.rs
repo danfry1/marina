@@ -4,6 +4,7 @@
 //!   marina kill <sel>… [--json] SIGTERM → verified SIGKILL matching targets
 //!   marina restart <sel>…       restart matching targets (output captured)
 //!   marina url <sel>… [--json]  print matching targets' URLs
+//!   marina open [sel]… [--mine] open matching servers in the browser
 //!   marina who <port>… [--json] what is holding a port (dev target or not)
 //!   marina free <port>… [--json] stop whatever dev target holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
@@ -48,6 +49,8 @@ USAGE:
     marina kill <sel>... [--json] stop matching targets (SIGTERM -> SIGKILL)
     marina restart <sel>...      restart matching targets (output captured)
     marina url <sel>... [--json] print matching targets' URLs
+    marina open [sel]... [--mine]  open matching servers in the browser
+                                 (no selector: the ones running in this dir)
     marina who <port>... [--json]  what is holding a port
     marina free <port>... [--json] stop the dev target holding a port
     marina port [name] [--json]  stable free port for this project/worktree
@@ -161,6 +164,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "kill" => kill(&selectors, json, &scope),
         "restart" => restart(&selectors, &scope),
         "url" => url(&selectors, json, &scope),
+        "open" => open(&selectors, &scope),
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
@@ -769,6 +773,45 @@ fn url(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
         }
     }
     0
+}
+
+/// `marina open [sel]`: open matching servers' web URLs in the browser. With
+/// no selector or scope, the servers running in (or under) the current
+/// directory — what you mean from a project's terminal.
+fn open(selectors: &[&str], scope: &Scope) -> i32 {
+    let snap = snapshot(false);
+    let mut targets = pick(&snap, selectors, scope, false);
+    if selectors.is_empty() && !scope.active() {
+        let here = std::env::current_dir().ok();
+        targets.retain(|t| here.as_ref().is_some_and(|h| t.cwd.starts_with(h)));
+    }
+    let web: Vec<&Target> = targets
+        .iter()
+        .copied()
+        .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+        .collect();
+    if web.is_empty() {
+        eprintln!(
+            "{}",
+            match (selectors.is_empty(), scope.active()) {
+                (true, false) => "no web server running here — name one (marina open api, marina open 3000) or use --mine",
+                _ => "no web server matches",
+            }
+        );
+        return 1;
+    }
+    let mut failed = false;
+    for t in web {
+        let Some(u) = &t.url else { continue };
+        match verbs::open_url(&u.value) {
+            Ok(()) => println!("opened {}\t{}", t.project, u.value),
+            Err(e) => {
+                eprintln!("couldn't open {}: {e}", u.value);
+                failed = true;
+            }
+        }
+    }
+    i32::from(failed)
 }
 
 // --- ports: who / free ------------------------------------------------------

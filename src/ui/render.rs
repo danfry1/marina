@@ -1253,7 +1253,10 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Enter", "fold / unfold a group"),
         row("K · u", "kill · cancel the force-kill"),
         row("R · T", "restart (output to a log) · tail logs"),
-        row("Y · O", "copy URL · open in the browser"),
+        row(
+            "Y · O",
+            "copy URL · open in the browser (on a session: its server; again: the next)",
+        ),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
         row("v", "group by project / by agent session"),
         Line::from(""),

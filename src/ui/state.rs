@@ -125,6 +125,8 @@ pub(crate) struct PendingKill {
 pub struct App {
     /// `marina demo`: made-up sessions; verbs only say what they'd do.
     pub demo: bool,
+    /// `O`/`Y` on a session with several servers: (pid, which, when).
+    pub(crate) url_cycle: Option<(u32, usize, Instant)>,
     pub(crate) snapshot: Arc<Snapshot>,
     pub(crate) selected: Option<Entry>,
     /// Where the cursor last sat in `display` — the nearest-neighbor fallback
@@ -195,6 +197,7 @@ impl App {
     pub fn new() -> Self {
         App {
             demo: false,
+            url_cycle: None,
             snapshot: Arc::new(Snapshot::empty()),
             selected: None,
             last_index: 0,
@@ -253,9 +256,33 @@ impl App {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
             let new_keys: HashSet<&TargetKey> =
                 self.snapshot.targets.iter().map(|t| &t.key).collect();
+            let mut started: Option<String> = None;
             for t in &self.snapshot.targets {
                 if !old_keys.contains(&t.key) {
                     self.appeared.insert(t.key.clone(), now);
+                    // an agent just brought up a web server: say where
+                    let by_agent = t
+                        .launcher
+                        .as_ref()
+                        .is_some_and(|l| l.alive && l.kind == crate::launcher::LauncherKind::Agent);
+                    if let (true, Some(u)) =
+                        (by_agent, t.url.as_ref().filter(|u| u.scheme.is_web()))
+                    {
+                        let who = t
+                            .launcher
+                            .as_ref()
+                            .map(|l| l.name.clone())
+                            .unwrap_or_default();
+                        let hint = if self.ctl.inbox {
+                            "O on its session opens it"
+                        } else {
+                            "O opens it"
+                        };
+                        started = Some(format!(
+                            "{who}·{} started {} on {} — {hint}",
+                            t.project, t.command_label, u.value
+                        ));
+                    }
                 }
             }
             let mut crashed: Option<String> = None;
@@ -273,7 +300,8 @@ impl App {
                     crashed = Some(format!("⚠ {} ({what}) exited unexpectedly", t.project));
                 }
             }
-            if let Some(msg) = crashed {
+            // a crash outranks a server coming up
+            if let Some(msg) = crashed.or(started) {
                 self.set_status(msg);
             }
             // a target turning heavy (runaway test runner, leak): say so once
@@ -435,6 +463,31 @@ impl App {
     }
 
     /// Servers this agent session started (its live launcher is the agent).
+    /// The web URLs of the servers `a` started, by port.
+    pub(crate) fn agent_urls(&self, a: &Agent) -> Vec<String> {
+        let mut servers: Vec<&Target> = self
+            .agent_servers(a)
+            .into_iter()
+            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+            .collect();
+        servers.sort_by_key(|t| t.ports.first().copied());
+        servers
+            .iter()
+            .filter_map(|t| t.url.as_ref().map(|u| u.value.clone()))
+            .collect()
+    }
+
+    /// Which of `n` URLs `O`/`Y` on session `pid` take: the next one when
+    /// pressed again on the same session soon after, else the first.
+    pub(crate) fn next_url(&mut self, pid: u32, n: usize) -> usize {
+        let i = match self.url_cycle {
+            Some((p, i, at)) if p == pid && at.elapsed() < Duration::from_secs(10) => (i + 1) % n,
+            _ => 0,
+        };
+        self.url_cycle = Some((pid, i, Instant::now()));
+        i
+    }
+
     pub(crate) fn agent_servers(&self, a: &Agent) -> Vec<&Target> {
         self.snapshot
             .targets
@@ -1460,6 +1513,18 @@ pub(crate) fn is_agent_service(t: &Target) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_on_a_session_moves_through_its_servers() {
+        let mut app = App::new();
+        assert_eq!(app.next_url(7, 3), 0);
+        assert_eq!(app.next_url(7, 3), 1);
+        assert_eq!(app.next_url(7, 3), 2);
+        assert_eq!(app.next_url(7, 3), 0, "wraps round");
+        assert_eq!(app.next_url(8, 3), 0, "another session starts at its first");
+        app.url_cycle = Some((8, 1, Instant::now() - Duration::from_secs(60)));
+        assert_eq!(app.next_url(8, 3), 0, "a while later starts over");
+    }
     fn app_with_sample() -> App {
         let mut app = App::new();
         let mut snap = Snapshot::sample();

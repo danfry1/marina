@@ -710,9 +710,38 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
     app.set_status(format!("restarting {label}…"));
 }
 
+/// `O`/`Y` on a session: the URL of a web server it started (the next one
+/// on a repeat press), or why there's none.
+fn session_url(app: &mut ui::App) -> Option<Result<(String, String), String>> {
+    let a = app.selected_agent()?;
+    let (pid, label) = (a.pid, app.agent_label(a));
+    let urls = app.agent_urls(a);
+    if urls.is_empty() {
+        return Some(Err(format!("{label} hasn't started a web server")));
+    }
+    let i = app.next_url(pid, urls.len());
+    let more = if urls.len() > 1 {
+        format!(" ({} of {} — again for the next)", i + 1, urls.len())
+    } else {
+        String::new()
+    };
+    Some(Ok((urls[i].clone(), more)))
+}
+
 fn verb_copy(app: &mut ui::App) {
-    if on_agent_row(app, "URL") {
-        return;
+    match session_url(app) {
+        Some(Ok((url, more))) => {
+            match verbs::copy_url(&url) {
+                Ok(()) => app.set_status(format!("copied {url}{more}")),
+                Err(e) => app.set_status(format!("copy failed: {e}")),
+            }
+            return;
+        }
+        Some(Err(why)) => {
+            app.set_status(why);
+            return;
+        }
+        None => {}
     }
     if app.selected_target().is_none() {
         app.set_status("select a service (not a group) to copy a URL");
@@ -729,8 +758,17 @@ fn verb_copy(app: &mut ui::App) {
 }
 
 fn verb_open(app: &mut ui::App) {
-    if on_agent_row(app, "URL") {
-        return;
+    match session_url(app) {
+        Some(Ok((url, more))) => {
+            let _ = verbs::open_url(&url);
+            app.set_status(format!("opening {url}{more}"));
+            return;
+        }
+        Some(Err(why)) => {
+            app.set_status(why);
+            return;
+        }
+        None => {}
     }
     if app.selected_target().is_none() {
         app.set_status("select a service (not a group) to open");

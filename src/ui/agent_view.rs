@@ -738,8 +738,13 @@ fn header_lines(app: &App, a: &Agent, w: usize) -> Vec<Line<'static>> {
         .filter_map(|t| t.ports.first().map(|p| format!(":{p}")))
         .collect();
     if !servers.is_empty() {
+        let open = if app.agent_urls(a).is_empty() {
+            ""
+        } else {
+            " (O opens it)"
+        };
         meta.push(Span::styled(
-            format!(" · serving {}", servers.join(" ")),
+            format!(" · serving {}{open}", servers.join(" ")),
             DIM,
         ));
     }
