@@ -574,6 +574,7 @@ fn snapshot(seq: u64, sessions: &[Sess], gone: &[bool], ended: &[Ended], now: u6
 
 fn ended(now: u64) -> Vec<Ended> {
     vec![Ended {
+        agent: "claude".into(),
         id: "0e9c2b7a-demo-4000-8000-000000000001".into(),
         at: now - 5 * 3600,
         cwd: dir("billing"),
@@ -682,6 +683,7 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
                             ended.insert(
                                 0,
                                 Ended {
+                                    agent: s.agent.into(),
                                     id: a.session.unwrap_or_default(),
                                     at: now,
                                     cwd: a.cwd,

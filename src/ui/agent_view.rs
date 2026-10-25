@@ -353,11 +353,16 @@ pub(crate) fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 let Some(x) = app.snapshot.ended.iter().find(|x| &x.id == id) else {
                     continue;
                 };
-                let label = x
+                let dir = x
                     .cwd
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let label = if x.agent == "claude" {
+                    dir
+                } else {
+                    format!("{}·{dir}", x.agent)
+                };
                 let text = x
                     .summary
                     .title

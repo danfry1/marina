@@ -178,9 +178,11 @@ impl Summary {
     }
 }
 
-/// A Claude Code session that has exited but could be resumed.
+/// An agent session that has exited but could be resumed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ended {
+    /// `claude`, `codex` or `opencode`: how to resume it.
+    pub agent: String,
     pub id: String,
     /// When its transcript was last written: roughly when it ended.
     pub at: u64,
@@ -756,6 +758,110 @@ fn codex_sessions() -> Option<PathBuf> {
     )
 }
 
+/// Rollouts under Codex's sessions dir in the newest `days` day
+/// directories (`sessions/YYYY/MM/DD`).
+fn codex_recent_rollouts(days: usize) -> Vec<PathBuf> {
+    let Some(root) = codex_sessions() else {
+        return Vec::new();
+    };
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut dirs: Vec<PathBuf> = subdirs(&root)
+        .into_iter()
+        .rev()
+        .take(2)
+        .flat_map(|y| subdirs(&y).into_iter().rev().take(2))
+        .flat_map(|m| subdirs(&m).into_iter().rev().take(days))
+        .collect();
+    dirs.sort();
+    dirs.reverse();
+    dirs.truncate(days);
+    dirs.iter()
+        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect()
+}
+
+/// opencode's session database (`$XDG_DATA_HOME/opencode/opencode.db`).
+fn opencode_db() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("opencode/opencode.db")).filter(|p| p.is_file())
+}
+
+/// Top-level opencode sessions updated between a minute and two days ago,
+/// read from its database with the `sqlite3` CLI, read-only — opencode's
+/// own CLI lists one project at a time and may start its service. Without
+/// `sqlite3`, none.
+fn opencode_ended(live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
+    let Some(db) = opencode_db() else {
+        return Vec::new();
+    };
+    let now = mtime_secs(SystemTime::now());
+    let (from, to) = (
+        now.saturating_sub(ENDED_WITHIN) * 1000,
+        now.saturating_sub(60) * 1000,
+    );
+    // integers only in the query: nothing from outside is spliced in
+    let query = format!(
+        "select id, directory, title, time_updated from session \
+         where parent_id is null and time_archived is null \
+         and time_updated between {from} and {to} \
+         and exists (select 1 from message where message.session_id = session.id) \
+         order by time_updated desc limit {ENDED_MAX}"
+    );
+    let mut cmd = std::process::Command::new("sqlite3");
+    cmd.arg("-readonly").arg("-json").arg(&db).arg(&query);
+    let Some(json) = crate::exec::output(cmd, Duration::from_secs(2)) else {
+        return Vec::new();
+    };
+    parse_opencode_sessions(&json)
+        .into_iter()
+        .filter(|e| !live.contains(&e.id.as_str()))
+        .filter(|e| e.cwd.is_dir() && !busy_dirs.contains(&e.cwd))
+        .collect()
+}
+
+/// `sqlite3 -json` rows of opencode sessions. A session opencode never
+/// titled keeps "New session - <date>", which says nothing: no title then.
+pub fn parse_opencode_sessions(json: &str) -> Vec<Ended> {
+    let rows: Vec<Value> = serde_json::from_str(json).unwrap_or_default();
+    rows.iter()
+        .filter_map(|r| {
+            let id = r["id"]
+                .as_str()
+                .filter(|id| crate::launcher::is_session_id(id))?;
+            let title = text_of(&r["title"]).filter(|t| !t.starts_with("New session - "));
+            let at = r["time_updated"].as_u64()? / 1000;
+            let cwd = PathBuf::from(r["directory"].as_str()?);
+            cwd.is_absolute().then(|| Ended {
+                agent: "opencode".into(),
+                id: id.to_string(),
+                at,
+                cwd: cwd.clone(),
+                summary: Summary {
+                    title,
+                    updated: Some(at),
+                    cwd: Some(cwd),
+                    ..Default::default()
+                },
+            })
+        })
+        .collect()
+}
+
 /// Running first, then the most recently active.
 fn sort_subagents(v: &mut [Subagent]) {
     v.sort_by(|a, b| b.running.cmp(&a.running).then(b.updated.cmp(&a.updated)));
@@ -1252,14 +1358,96 @@ impl Cache {
                 continue;
             };
             found.push(Ended {
+                agent: "claude".into(),
                 id,
                 at,
                 cwd,
                 summary,
             });
         }
+        found.extend(self.codex_ended(live, busy_dirs));
+        found.extend(opencode_ended(live, busy_dirs));
+        found.sort_by_key(|e| std::cmp::Reverse(e.at));
+        found.truncate(ENDED_MAX);
         self.ended = Some((Instant::now(), found.clone()));
         found
+    }
+
+    /// Codex CLI sessions (not desktop-app threads, `exec` runs or
+    /// subagents) whose rollout was last written between a minute and two
+    /// days ago, and that said something.
+    fn codex_ended(&mut self, live: &[&str], busy_dirs: &[PathBuf]) -> Vec<Ended> {
+        let now = SystemTime::now();
+        let mut out = Vec::new();
+        for path in codex_recent_rollouts(3) {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else { continue };
+            let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+            if !(60..=ENDED_WITHIN).contains(&age) {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.get(n.len().saturating_sub(36)..))
+                .filter(|id| crate::launcher::is_session_id(id) && !live.contains(id))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let stamp = (mtime, meta.len());
+            let summary = match self.entries.get(&id).filter(|e| e.stamp == stamp) {
+                Some(e) => e.summary.clone(),
+                None => {
+                    let Some(head) = read_head(&path, 256 * 1024) else {
+                        continue;
+                    };
+                    let Some(m) = head
+                        .lines()
+                        .next()
+                        .and_then(|l| serde_json::from_str::<Value>(l).ok())
+                    else {
+                        continue;
+                    };
+                    // what `codex resume` brings back: the CLI's own sessions
+                    if m["payload"]["source"] != "cli" {
+                        continue;
+                    }
+                    let Some(tail) = read_tail(&path, TAIL) else {
+                        continue;
+                    };
+                    let s = parse_codex(&head, &tail);
+                    self.entries.insert(
+                        id.clone(),
+                        Entry {
+                            path: path.clone(),
+                            stamp,
+                            read_at: Instant::now(),
+                            summary: s.clone(),
+                        },
+                    );
+                    s
+                }
+            };
+            let Some(cwd) = summary
+                .cwd
+                .clone()
+                .filter(|c| c.is_absolute() && c.is_dir() && !busy_dirs.contains(c))
+                .filter(|_| summary.last_reply.is_some())
+            else {
+                continue;
+            };
+            out.push(Ended {
+                agent: "codex".into(),
+                id,
+                at: mtime_secs(mtime),
+                cwd,
+                summary,
+            });
+        }
+        out
     }
 }
 
@@ -1346,6 +1534,24 @@ mod tests {
         assert!(parse_claude_subagent("a", meta, &mid, None, at, at + 5).running);
         let stopped = r#"{"description":"x","stoppedByUser":true}"#;
         assert!(!parse_claude_subagent("a", stopped, &mid, None, at, at + 5).running);
+    }
+
+    #[test]
+    fn opencode_sessions_from_its_database() {
+        let rows = r#"[
+          {"id":"ses_1cf4f4cdaffeOcfwrwgHVCC6Ia","directory":"/Users/me/dev/api","title":"Rate limits","time_updated":1781213946819},
+          {"id":"ses_147675f2bffeVjtl8vMGbsPFci","directory":"/Users/me/dev/web","title":"New session - 2026-06-11T21:31:10.932Z","time_updated":1781213000000},
+          {"id":"$(rm -rf ~)","directory":"/x","title":"t","time_updated":1},
+          {"id":"ses_x","directory":"relative/dir","title":"t","time_updated":1}
+        ]"#;
+        let e = parse_opencode_sessions(rows);
+        assert_eq!(e.len(), 2, "bad ids and relative dirs dropped");
+        assert_eq!((e[0].agent.as_str(), e[0].at), ("opencode", 1_781_213_946));
+        assert_eq!(e[0].summary.title.as_deref(), Some("Rate limits"));
+        assert_eq!(
+            e[1].summary.title, None,
+            "opencode's placeholder title says nothing"
+        );
     }
 
     #[test]

@@ -897,16 +897,17 @@ impl App {
         let e = self.selected_ended()?;
         let req = crate::launch::Launch {
             dir: e.cwd.clone(),
-            agent: "claude".into(),
+            agent: e.agent.clone(),
             prompt: None,
             resume: Some(e.id.clone()),
             worktree: false,
         };
         let Some(place) = crate::launch::here() else {
+            let args = crate::launch::agent_args(&e.agent, None, Some(&e.id)).join(" ");
             self.set_status(format!(
-                "resume it with: cd {} && claude --resume {}",
+                "resume it with: cd {} && {} {args}",
                 req.dir.display(),
-                e.id
+                e.agent
             ));
             return None;
         };
