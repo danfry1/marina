@@ -459,13 +459,15 @@ marina is deliberately boring on this front:
   `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `AI_AGENT`, `AGENT`, … — the full
   list is `MARKERS` in [src/launcher.rs](src/launcher.rs)), used to attribute a
   server to its agent session. Of those, only pids and validated session ids
-  are kept; flag values are never read, and no other variable is kept,
+  are kept; flag values are never read, and besides those and the four
+  that name a Zellij pane or kitty window (below), no variable is kept,
   displayed, or serialized; for agent sessions, their terminal device's
   last-written / last-read timestamps (never the screen contents), their work
   tree's `git status` / `git diff --shortstat` (run with
   `GIT_OPTIONAL_LOCKS=0`, so marina never takes a lock an agent needs), and —
   only when herdr or tmux is running — those tools' own pane listings
-  (`herdr agent list`, `tmux list-panes`); the nearest project
+  (`herdr agent list`, `tmux list-panes`; a session whose dialog is
+  inferred has its tmux or Zellij screen read to confirm it); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
   and, only when you press `T` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.

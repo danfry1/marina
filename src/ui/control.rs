@@ -3,8 +3,9 @@
 //!
 //! marina only ever types into a session on an explicit keystroke on that
 //! session's row, and only where the pane can be addressed exactly and its
-//! screen read first: a multiplexer (herdr, tmux) or iTerm2, by tty. Other
-//! GUI terminals are never typed into.
+//! screen read first: herdr (by pid), tmux, iTerm2 and WezTerm (by tty),
+//! Zellij and kitty (by the pane their env names, under that very server
+//! or app). Other terminals are never typed into.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

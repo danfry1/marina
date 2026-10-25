@@ -36,6 +36,9 @@ pub struct TermEnv {
     /// `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON` when remote control
     /// listens on a socket.
     pub kitty: Option<(String, Option<String>)>,
+    /// Some `ZELLIJ_*` variable was set, usable or not: kitty's variables
+    /// then belong to the window Zellij was started in, not this pane.
+    pub in_zellij: bool,
 }
 
 impl TermEnv {
@@ -66,8 +69,10 @@ impl TermEnv {
         let t = TermEnv {
             zellij: val("ZELLIJ_SESSION_NAME").zip(val("ZELLIJ_PANE_ID")),
             kitty: val("KITTY_WINDOW_ID").map(|w| (w, val("KITTY_LISTEN_ON"))),
+            in_zellij: get.contains_key("ZELLIJ_SESSION_NAME")
+                || get.contains_key("ZELLIJ_PANE_ID"),
         };
-        (t.zellij.is_some() || t.kitty.is_some()).then_some(t)
+        (t.zellij.is_some() || t.kitty.is_some() || t.in_zellij).then_some(t)
     }
 }
 
@@ -391,13 +396,26 @@ impl Hosts {
             }
             // Zellij and kitty name the pane in its processes' env; tmux's
             // own pane listing wins over env inherited from outside it
-            None if term.zellij.is_some() => {
+            // env is inherited — by tmux on another socket, screen, a
+            // terminal started from that pane — so it only counts when the
+            // agent really runs under that Zellij session's server
+            None if term
+                .zellij
+                .as_ref()
+                .is_some_and(|(s, _)| under_zellij_server(procs, pid, s)) =>
+            {
                 let (s, p) = term.zellij.clone().unwrap_or_default();
-                let o = outer_of(procs, pid, "zellij");
-                outer = o.map(|o| o.0);
-                (HostKind::Zellij, format!("{s} {p}"), o.map(|o| o.1))
+                // the server is detached: which client shows it isn't known
+                (HostKind::Zellij, format!("{s} {p}"), None)
             }
-            None if term.kitty.as_ref().is_some_and(|k| k.1.is_some()) => {
+            // …and under that kitty: the nearest terminal app above it, the
+            // one whose pid the socket is named after
+            None if !term.in_zellij
+                && term.kitty.as_ref().is_some_and(|(_, sock)| {
+                    sock.as_deref()
+                        .is_some_and(|sock| under_kitty(procs, pid, sock))
+                }) =>
+            {
                 let (w, sock) = term.kitty.clone().unwrap_or_default();
                 let app = terminal_of(procs, pid).map(|t| t.1);
                 (
@@ -426,6 +444,45 @@ impl Hosts {
             app_pid,
             outer,
         })
+    }
+}
+
+/// `pid` runs under the Zellij server of `session` (`zellij --server
+/// <dir>/<session>`): an ancestor, since pane processes are its children.
+fn under_zellij_server(procs: &HashMap<u32, ProcInfo>, pid: u32, session: &str) -> bool {
+    let mut cur = procs.get(&pid).and_then(|p| p.ppid);
+    for _ in 0..64 {
+        let Some(p) = cur.and_then(|c| procs.get(&c)) else {
+            return false;
+        };
+        let server = p
+            .argv
+            .first()
+            .is_some_and(|a| a.rsplit('/').next() == Some("zellij"))
+            && p.argv.get(1).is_some_and(|a| a == "--server")
+            && p.argv
+                .get(2)
+                .is_some_and(|a| a.rsplit('/').next() == Some(session));
+        if server {
+            return true;
+        }
+        cur = p.ppid;
+    }
+    false
+}
+
+/// `pid`'s nearest terminal app is kitty — and, when the socket carries
+/// kitty's pid (`unix:/tmp/kitty-1234`), that very kitty.
+fn under_kitty(procs: &HashMap<u32, ProcInfo>, pid: u32, sock: &str) -> bool {
+    match terminal_of(procs, pid) {
+        Some((HostKind::Kitty, app)) => match sock
+            .rsplit_once('-')
+            .and_then(|(_, n)| n.parse::<u32>().ok())
+        {
+            Some(owner) => owner == app,
+            None => true,
+        },
+        _ => false,
     }
 }
 
@@ -646,28 +703,53 @@ fn two(target: &str) -> (&str, &str) {
     target.split_once(' ').unwrap_or((target, ""))
 }
 
-/// Run `program` with `input` on its stdin; `Some(stdout)` on success.
-fn run_stdin(program: &str, args: &[&str], input: &str) -> Option<String> {
+/// Run `program` with `input` on its stdin, with the same deadline as
+/// `run`: killed if it hasn't finished by then. `Some(())` on success.
+fn run_stdin(program: &str, args: &[&str], input: &str) -> Option<()> {
     use std::io::Write;
     let mut child = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    // write off-thread: a peer that never reads must not block us
+    let mut stdin = child.stdin.take()?;
+    let input = input.to_string();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// The `kitten` program: on PATH, else inside kitty.app (a DMG install
+/// doesn't link it).
+fn kitten_bin() -> String {
+    let bundled = "/Applications/kitty.app/Contents/MacOS/kitten";
+    if crate::verbs::which("kitten").is_none() && Path::new(bundled).is_file() {
+        bundled.to_string()
+    } else {
+        "kitten".to_string()
+    }
 }
 
 /// `kitten @ --to <socket> <args…>` for window `w`'s commands.
 fn kitten(sock: &str, args: &[&str]) -> Option<String> {
     let mut a = vec!["@", "--to", sock];
     a.extend_from_slice(args);
-    run("kitten", &a)
+    run(&kitten_bin(), &a)
 }
 
 /// Focus the session's pane. Returns a line for the status bar. `agent`
@@ -1000,10 +1082,11 @@ fn type_text(host: &HostInfo, text: &str) -> Option<String> {
             let (w, sock) = two(&host.target);
             let m = format!("id:{w}");
             run_stdin(
-                "kitten",
+                &kitten_bin(),
                 &["@", "--to", sock, "send-text", "--match", &m, "--stdin"],
                 text,
             )
+            .map(|()| String::new())
         }
         _ => None,
     }
@@ -1204,6 +1287,109 @@ mod tests {
         assert_eq!(k("wezterm-gui"), Some(HostKind::WezTerm));
         assert_eq!(k("/bin/zsh"), None);
         assert_eq!(k("login"), None);
+    }
+
+    #[test]
+    fn zellij_and_kitty_count_only_when_the_agent_runs_under_them() {
+        let p = |pid: u32, ppid: u32, argv: &[&str], term: Option<TermEnv>| ProcInfo {
+            pid,
+            ppid: Some(ppid),
+            name: argv[0].rsplit('/').next().unwrap().into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            cwd: None,
+            cpu_pct: 0.0,
+            mem_bytes: 0,
+            start_time: 0,
+            agent: None,
+            term,
+        };
+        let zj = |s: &str| TermEnv {
+            zellij: Some((s.into(), "2".into())),
+            ..Default::default()
+        };
+        let kt = |sock: &str| TermEnv {
+            kitty: Some(("7".into(), Some(sock.into()))),
+            ..Default::default()
+        };
+        let procs: HashMap<u32, ProcInfo> = [
+            // a Zellij pane's agent: under `zellij --server …/work`
+            p(
+                10,
+                1,
+                &[
+                    "/opt/homebrew/bin/zellij",
+                    "--server",
+                    "/tmp/zellij-501/v1/work",
+                ],
+                None,
+            ),
+            p(11, 10, &["-zsh"], None),
+            p(12, 11, &["claude"], Some(zj("work"))),
+            // tmux on its own socket, started from that pane: the env says
+            // Zellij, but its server is detached from it
+            p(20, 1, &["tmux", "-L", "other", "new"], None),
+            p(21, 20, &["-zsh"], None),
+            p(22, 21, &["claude"], Some(zj("work"))),
+            // a kitty window's agent, and the socket names that kitty
+            p(
+                30,
+                1,
+                &["/Applications/kitty.app/Contents/MacOS/kitty"],
+                None,
+            ),
+            p(31, 30, &["-zsh"], None),
+            p(32, 31, &["claude"], Some(kt("unix:/tmp/kitty-30"))),
+            // WezTerm started from that kitty window inherits its env
+            p(
+                40,
+                31,
+                &["/Applications/WezTerm.app/Contents/MacOS/wezterm-gui"],
+                None,
+            ),
+            p(41, 40, &["-zsh"], None),
+            p(42, 41, &["claude"], Some(kt("unix:/tmp/kitty-30"))),
+            // another kitty's socket
+            p(52, 31, &["claude"], Some(kt("unix:/tmp/kitty-999"))),
+            // Zellij inside kitty with a session name the filter dropped
+            p(
+                62,
+                31,
+                &["claude"],
+                Some(TermEnv {
+                    in_zellij: true,
+                    ..kt("unix:/tmp/kitty-30")
+                }),
+            ),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect();
+        let mut h = Hosts::default();
+        let tty = Path::new("/dev/ttys009");
+        let dir = Path::new("/w");
+        let kind = |h: &mut Hosts, pid| h.lookup(&procs, pid, Some(tty), dir).map(|h| h.kind);
+        assert_eq!(kind(&mut h, 12), Some(HostKind::Zellij));
+        assert_eq!(
+            kind(&mut h, 22),
+            None,
+            "inherited Zellij env, not under its server"
+        );
+        assert_eq!(kind(&mut h, 32), Some(HostKind::Kitty));
+        assert_eq!(
+            kind(&mut h, 42),
+            Some(HostKind::WezTerm),
+            "its own terminal, not kitty's window"
+        );
+        assert_eq!(
+            kind(&mut h, 52),
+            None,
+            "the socket belongs to another kitty"
+        );
+        assert_eq!(
+            kind(&mut h, 62),
+            None,
+            "kitty's variables belong to where Zellij started"
+        );
     }
 
     #[test]
