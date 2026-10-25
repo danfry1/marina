@@ -84,10 +84,13 @@ pub fn run() -> i32 {
     loop {
         app.apply(Arc::new(sampler.build()));
         app.tick(); // prunes per-row bookkeeping, as the TUI loop does
-        for n in app.take_notifications() {
-            eprintln!("{}", n.text);
-            if cfg.notify.desktop {
-                crate::verbs::notify("marina", &n.text, n.jump.as_deref());
+        let notices = app.take_notifications();
+        for n in &notices {
+            eprintln!("{}", n.text());
+        }
+        if cfg.notify.desktop {
+            for n in crate::ui::coalesce(notices) {
+                crate::verbs::notify(&n.title, &n.body, n.jump.as_deref());
             }
         }
         std::thread::sleep(EVERY);

@@ -330,8 +330,8 @@ fn run(
         let notices = app.take_notifications();
         // the background watcher, when running, sends these itself
         if desktop_notify && !notices.is_empty() && !watch::running() {
-            for n in notices {
-                verbs::notify("marina", &n.text, n.jump.as_deref());
+            for n in ui::coalesce(notices) {
+                verbs::notify(&n.title, &n.body, n.jump.as_deref());
             }
         }
 

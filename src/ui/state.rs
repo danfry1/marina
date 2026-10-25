@@ -318,15 +318,17 @@ impl App {
             // once, at the transition, and queue a desktop notification.
             for msg in orphan_notices(&old, &self.snapshot) {
                 self.notifications.push(Notice {
-                    text: msg.clone(),
+                    title: "servers left running".into(),
+                    body: msg.clone(),
                     jump: None,
+                    kind: NoticeKind::Other,
                 });
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
             }
             if self.notify_agents {
-                for (msg, jump) in self.agent_notices(unix_now()) {
-                    self.set_notice(format!("{msg} · Enter on its row jumps there"));
-                    self.notifications.push(Notice { text: msg, jump });
+                for n in self.agent_notices(unix_now()) {
+                    self.set_notice(format!("{} · Enter on its row jumps there", n.text()));
+                    self.notifications.push(n);
                 }
             }
         } else {
@@ -353,7 +355,7 @@ impl App {
     /// question, since the last snapshot: `claude·api finished after 12m`,
     /// `claude·api needs you`. Each transition is reported once.
     /// Agent notices: (text, the session to jump to when it's clicked).
-    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<(String, Option<String>)> {
+    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<Notice> {
         let mut out = Vec::new();
         // two sessions editing one work tree at once: say so as it starts
         let mut working: HashMap<&std::path::Path, Vec<&Agent>> = HashMap::new();
@@ -382,14 +384,16 @@ impl App {
                         .unwrap_or_else(|| a.name.clone())
                 })
                 .collect();
-            out.push((
-                format!(
+            out.push(Notice {
+                title: "same work tree".into(),
+                body: format!(
                     "{} are working in the same tree ({}) — their edits can collide",
                     who.join(" and "),
                     tildify(&t.display().to_string())
                 ),
-                None,
-            ));
+                jump: None,
+                kind: NoticeKind::Other,
+            });
         }
         let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
         self.agent_streaks.retain(|pid, _| live.contains(pid));
@@ -401,19 +405,26 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| a.name.clone());
             if a.is_blocked() {
+                let ask = a.summary.as_ref().and_then(|s| s.ask());
                 let what = a
                     .summary
                     .as_ref()
-                    .map(|s| format!("{:?}@{:?}", s.pending_tool, s.pending_since))
+                    .map(|s| format!("{:?}@{:?}/{ask:?}", s.pending_tool, s.pending_since))
                     .unwrap_or_default();
                 if self.agent_blocked.get(&a.pid) != Some(&what) {
                     self.agent_blocked.insert(a.pid, what);
                     // say what it wants, so the notification is actionable
-                    let text = match a.pending_tool() {
-                        Some(t) => format!("{label} needs you: wants to run {}", clip(&t, 90)),
-                        None => format!("{label} needs you"),
+                    let body = match (a.pending_tool(), ask) {
+                        (Some(t), _) => format!("wants to run {}", clip(&t, 90)),
+                        (None, Some(q)) => format!("asks: {}", clip(&q, 120)),
+                        (None, None) => String::new(),
                     };
-                    out.push((text, jump_key(a)));
+                    out.push(Notice {
+                        title: format!("{label} needs you"),
+                        body,
+                        jump: jump_key(a),
+                        kind: NoticeKind::NeedsYou,
+                    });
                 }
                 self.agent_streaks.remove(&a.pid); // the question says it all
                 continue;
@@ -428,21 +439,27 @@ impl App {
                 if now.saturating_sub(last) >= AGENT_QUIET {
                     self.agent_streaks.remove(&a.pid);
                     if last.saturating_sub(start) >= AGENT_WORK_MIN {
-                        let said = a
-                            .summary
-                            .as_ref()
-                            .and_then(|s| s.last_reply.as_deref())
-                            .map(|r| {
-                                format!(": {}", clip(&super::agent_view::first_sentence(r), 110))
-                            })
-                            .unwrap_or_default();
-                        out.push((
-                            format!(
-                                "{label} finished after {}{said}",
-                                super::format::fmt_age(last - start)
-                            ),
-                            jump_key(a),
-                        ));
+                        let s = a.summary.as_ref();
+                        let took = super::format::fmt_age(last - start);
+                        // ending on a question: it's your turn, say what's asked
+                        let notice = match s.and_then(|s| s.ask()) {
+                            Some(q) => Notice {
+                                title: format!("{label} finished after {took} · your turn"),
+                                body: format!("asks: {}", clip(&q, 120)),
+                                jump: jump_key(a),
+                                kind: NoticeKind::NeedsYou,
+                            },
+                            None => Notice {
+                                title: format!("{label} finished after {took}"),
+                                body: s
+                                    .and_then(|s| s.last_reply.as_deref())
+                                    .map(|r| clip(&super::agent_view::first_sentence(r), 110))
+                                    .unwrap_or_default(),
+                                jump: jump_key(a),
+                                kind: NoticeKind::Finished,
+                            },
+                        };
+                        out.push(notice);
                     }
                 }
             }
@@ -1518,8 +1535,58 @@ const BUSY_TREE_FORGET: u64 = 600;
 /// bring up when it's clicked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
-    pub text: String,
+    /// A desktop notification's title: who, and what (`claude·api needs you`).
+    pub title: String,
+    /// Its body: what it's asking, or what it said.
+    pub body: String,
+    /// What `marina jump` is given when it's clicked.
     pub jump: Option<String>,
+    pub kind: NoticeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    NeedsYou,
+    Finished,
+    Other,
+}
+
+impl Notice {
+    /// The one-line form, for marina's own status line and logs.
+    pub fn text(&self) -> String {
+        if self.body.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{}: {}", self.title, self.body)
+        }
+    }
+}
+
+/// Desktop notifications for one batch: sessions that finished together
+/// become one (`3 sessions finished`, naming them; clicking jumps to the
+/// first), so a burst isn't a stack of banners. Each that needs you stays
+/// its own: each is something to act on.
+pub fn coalesce(notices: Vec<Notice>) -> Vec<Notice> {
+    let (finished, mut out): (Vec<Notice>, Vec<Notice>) = notices
+        .into_iter()
+        .partition(|n| n.kind == NoticeKind::Finished);
+    match finished.len() {
+        0 => {}
+        1 => out.extend(finished),
+        n => {
+            let who: Vec<&str> = finished
+                .iter()
+                .map(|f| f.title.split(' ').next().unwrap_or_default())
+                .collect();
+            out.push(Notice {
+                title: format!("{n} sessions finished"),
+                body: who.join(", "),
+                jump: finished[0].jump.clone(),
+                kind: NoticeKind::Finished,
+            });
+        }
+    }
+    out
 }
 
 /// What `marina jump` is given to find `a` again: its session id, else
@@ -1673,11 +1740,11 @@ mod tests {
         let n = app.take_notifications();
         assert_eq!(n.len(), 1, "one notice per session, not per server: {n:?}");
         assert!(
-            n[0].text.starts_with(
+            n[0].body.starts_with(
                 "claude session in /Users/me/dev/portal ended — left 2 servers running"
             ),
             "{}",
-            n[0].text
+            n[0].body
         );
         assert!(app
             .status
@@ -1846,8 +1913,9 @@ mod tests {
         );
         let n = app.agent_notices(t0 + 135);
         assert_eq!(n.len(), 1);
-        assert_eq!(n[0].0, "claude·api finished after 2m");
-        assert!(n[0].1.is_some(), "clicking it jumps to the session");
+        assert_eq!(n[0].text(), "claude·api finished after 2m");
+        assert_eq!(n[0].kind, NoticeKind::Finished);
+        assert!(n[0].jump.is_some(), "clicking it jumps to the session");
         assert!(app.agent_notices(t0 + 200).is_empty(), "once");
 
         // a short burst isn't worth a ping
@@ -1860,8 +1928,38 @@ mod tests {
         app.snapshot = snap_with(6, false, Some(HostStatus::Blocked));
         let n = app.agent_notices(t0 + 400);
         assert_eq!(n.len(), 1);
-        assert_eq!(n[0].0, "claude·api needs you");
+        assert_eq!(n[0].text(), "claude·api needs you");
+        assert_eq!(n[0].kind, NoticeKind::NeedsYou);
         assert!(app.agent_notices(t0 + 410).is_empty());
+    }
+
+    #[test]
+    fn finished_sessions_arriving_together_are_one_notification() {
+        let n = |title: &str, kind| Notice {
+            title: title.into(),
+            body: "said something".into(),
+            jump: Some(format!("{title}-id")),
+            kind,
+        };
+        let out = coalesce(vec![
+            n("claude·docs finished after 4m", NoticeKind::Finished),
+            n("claude·api needs you", NoticeKind::NeedsYou),
+            n("codex·web finished after 12m", NoticeKind::Finished),
+        ]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].title, "claude·api needs you", "kept on its own");
+        assert_eq!(out[1].title, "2 sessions finished");
+        assert_eq!(out[1].body, "claude·docs, codex·web");
+        assert_eq!(
+            out[1].jump.as_deref(),
+            Some("claude·docs finished after 4m-id")
+        );
+        // one alone is left as it is
+        let one = coalesce(vec![n(
+            "claude·docs finished after 4m",
+            NoticeKind::Finished,
+        )]);
+        assert_eq!(one[0].body, "said something");
     }
 
     #[test]
