@@ -51,6 +51,31 @@ pub fn run() -> i32 {
             },
         );
     }
+    // kitty runs them, but without a remote-control socket marina can't
+    // read or type into its windows
+    let kitty_closed = {
+        use crate::sources::ProcSource;
+        let mut procs = crate::sources::SysinfoProcs::default();
+        procs.refresh();
+        let all = procs.procs();
+        snap.agents
+            .iter()
+            .filter(|a| a.host.is_none())
+            .filter(|a| {
+                all.get(&a.pid)
+                    .and_then(|p| p.term.as_ref())
+                    .and_then(|t| t.kitty.as_ref())
+                    .is_some_and(|k| k.1.is_none())
+            })
+            .count()
+    };
+    if kitty_closed > 0 {
+        line(
+            Some(false),
+            &format!("{kitty_closed} in kitty without remote control"),
+            "add `allow_remote_control socket-only` and `listen_on unix:/tmp/kitty` to kitty.conf, then restart kitty",
+        );
+    }
     for (name, found) in [("tmux", which("tmux")), ("herdr", which("herdr"))] {
         line(
             Some(found.is_some()),

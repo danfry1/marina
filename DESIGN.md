@@ -605,12 +605,20 @@ window.
   not a paste, then `write text ""` for the `\r`). Screen reads carry a generation bumped on every send, so a read
   in flight is dropped; the cached screen is dropped when the preview
   closes or the selection moves. Arguments go as argv, never through a
-  shell. Of the GUI terminals only iTerm2 is typed into: its sessions are
-  found by exact tty and its screen can be read, so the same checks hold.
+  shell. Beyond herdr and tmux, the hosts typed into are those that address
+  a session's pane exactly and can read its screen, so the same checks
+  hold: Zellij (`<session> <pane>` from the agent's `ZELLIJ_*` env;
+  `dump-screen` / `write-chars` / `write 13|27`, all `--pane-id`), kitty
+  (`<window> <socket>` from `KITTY_WINDOW_ID` / `KITTY_LISTEN_ON`; `kitten
+  @ --to` `get-text` / `send-key` / `send-text --stdin`, since its argument
+  form interprets escapes), WezTerm (tty → pane via `cli list`; `get-text`
+  / `send-text --no-paste`) and iTerm2 (by tty). `hosts::TermEnv` keeps
+  only those four variables, with values restricted to `[A-Za-z0-9-_.:/@]`.
+  A kitty without a listening socket gets no host (and a `doctor` hint).
   Ghostty can take input but its screen can't be read and its terminals
-  are matched by directory, so it stays jump-only. iTerm2 is scripted only
-  on a keystroke — the sampler's dialog check reads tmux screens alone —
-  so sampling never raises an automation prompt.
+  are matched by directory, so it stays jump-only. The sampler's dialog
+  check reads tmux, Zellij, WezTerm and kitty screens; iTerm2 is scripted
+  only on a keystroke, so sampling never raises an automation prompt.
 - *Waiting*, without a host status: `Agent::infer_waiting` — a turn under
   way (`in_turn`: the newest user/assistant/system record is a prompt, a
   tool result or a tool call, not the `system` record a turn ends with),

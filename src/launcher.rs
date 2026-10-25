@@ -475,6 +475,7 @@ pub fn agent_service(argv: &[String]) -> Option<&'static str> {
         mem_bytes: 0,
         start_time: 0,
         agent: None,
+        term: None,
     };
     match classify(&p) {
         Some((LauncherKind::Agent, name)) => plumbing(&p).map(|_| name),
@@ -663,6 +664,7 @@ mod tests {
             mem_bytes: 0,
             start_time: 100,
             agent: None,
+            term: None,
         }
     }
     fn map(ps: Vec<ProcInfo>) -> HashMap<u32, ProcInfo> {

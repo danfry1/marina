@@ -26,6 +26,51 @@ use serde::Deserialize;
 
 use crate::sources::ProcInfo;
 
+/// The terminal pane a process runs in, from its environment: the four
+/// variables below and nothing else. Zellij and kitty set them in every
+/// process they start, so they name the pane exactly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TermEnv {
+    /// `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID`.
+    pub zellij: Option<(String, String)>,
+    /// `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON` when remote control
+    /// listens on a socket.
+    pub kitty: Option<(String, Option<String>)>,
+}
+
+impl TermEnv {
+    pub fn from_environ(environ: &[std::ffi::OsString]) -> Option<TermEnv> {
+        let mut get = HashMap::new();
+        for kv in environ {
+            let kv = kv.to_string_lossy();
+            if let Some((k, v)) = kv.split_once('=') {
+                if matches!(
+                    k,
+                    "ZELLIJ_SESSION_NAME"
+                        | "ZELLIJ_PANE_ID"
+                        | "KITTY_WINDOW_ID"
+                        | "KITTY_LISTEN_ON"
+                ) {
+                    get.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        // short, plain values only: these go into command lines as argv
+        let ok = |v: &String| {
+            !v.is_empty()
+                && v.len() <= 200
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.:/@".contains(c))
+        };
+        let val = |k: &str| get.get(k).filter(|v| ok(v)).cloned();
+        let t = TermEnv {
+            zellij: val("ZELLIJ_SESSION_NAME").zip(val("ZELLIJ_PANE_ID")),
+            kitty: val("KITTY_WINDOW_ID").map(|w| (w, val("KITTY_LISTEN_ON"))),
+        };
+        (t.zellij.is_some() || t.kitty.is_some()).then_some(t)
+    }
+}
+
 const TTL: Duration = Duration::from_secs(3);
 const TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -37,6 +82,11 @@ pub enum HostKind {
     Terminal,
     Ghostty,
     WezTerm,
+    /// A Zellij pane: target `<session> <pane id>`.
+    Zellij,
+    /// A kitty window with remote control listening: target
+    /// `<window id> <socket>`.
+    Kitty,
 }
 
 impl HostKind {
@@ -48,6 +98,8 @@ impl HostKind {
             HostKind::Terminal => "terminal",
             HostKind::Ghostty => "ghostty",
             HostKind::WezTerm => "wezterm",
+            HostKind::Zellij => "zellij",
+            HostKind::Kitty => "kitty",
         }
     }
 
@@ -60,6 +112,8 @@ impl HostKind {
             HostKind::Terminal => "Terminal",
             HostKind::Ghostty => "Ghostty",
             HostKind::WezTerm => "WezTerm",
+            HostKind::Zellij => "Zellij",
+            HostKind::Kitty => "kitty",
         }
     }
 
@@ -74,6 +128,8 @@ impl HostKind {
             Some(HostKind::Ghostty)
         } else if base == "wezterm-gui" || base == "wezterm-mux-server" {
             Some(HostKind::WezTerm)
+        } else if argv0.contains("/kitty.app/") || base == "kitty" {
+            Some(HostKind::Kitty)
         } else {
             None
         }
@@ -140,6 +196,14 @@ impl HostInfo {
             HostKind::Terminal => format!("Terminal tab on {t}"),
             HostKind::Ghostty => format!("Ghostty terminal in {t}"),
             HostKind::WezTerm => format!("WezTerm pane on {t}"),
+            HostKind::Zellij => {
+                let (s, p) = t.split_once(' ').unwrap_or((t, ""));
+                format!("Zellij pane {p} in session {s}")
+            }
+            HostKind::Kitty => {
+                let w = t.split_once(' ').map(|x| x.0).unwrap_or(t);
+                format!("kitty window {w}")
+            }
         }
     }
 }
@@ -315,13 +379,36 @@ impl Hosts {
         }
         let tty = tty?;
         let mut outer = None;
+        let term = procs
+            .get(&pid)
+            .and_then(|p| p.term.clone())
+            .unwrap_or_default();
         let (kind, target, app_pid) = match self.tmux.get(tty) {
             Some(pane) => {
                 let o = outer_of(procs, pid, "tmux");
                 outer = o.map(|o| o.0);
                 (HostKind::Tmux, pane.clone(), o.map(|o| o.1))
             }
+            // Zellij and kitty name the pane in its processes' env; tmux's
+            // own pane listing wins over env inherited from outside it
+            None if term.zellij.is_some() => {
+                let (s, p) = term.zellij.clone().unwrap_or_default();
+                let o = outer_of(procs, pid, "zellij");
+                outer = o.map(|o| o.0);
+                (HostKind::Zellij, format!("{s} {p}"), o.map(|o| o.1))
+            }
+            None if term.kitty.as_ref().is_some_and(|k| k.1.is_some()) => {
+                let (w, sock) = term.kitty.clone().unwrap_or_default();
+                let app = terminal_of(procs, pid).map(|t| t.1);
+                (
+                    HostKind::Kitty,
+                    format!("{w} {}", sock.unwrap_or_default()),
+                    app,
+                )
+            }
             None => match terminal_of(procs, pid)? {
+                // kitty without a remote-control socket: nothing to drive
+                (HostKind::Kitty, _) => return None,
                 (HostKind::Ghostty, app) => {
                     (HostKind::Ghostty, cwd.display().to_string(), Some(app))
                 }
@@ -547,6 +634,42 @@ fn wezterm_pane(json: &str, tty: &str) -> Option<u64> {
         .map(|p| p.pane_id)
 }
 
+/// The WezTerm pane on `tty`, by id.
+fn wez_pane_of(tty: &str) -> Option<String> {
+    run("wezterm", &["cli", "list", "--format", "json"])
+        .and_then(|j| wezterm_pane(&j, tty))
+        .map(|id| id.to_string())
+}
+
+/// `<session> <pane>` / `<window> <socket>` targets, split.
+fn two(target: &str) -> (&str, &str) {
+    target.split_once(' ').unwrap_or((target, ""))
+}
+
+/// Run `program` with `input` on its stdin; `Some(stdout)` on success.
+fn run_stdin(program: &str, args: &[&str], input: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `kitten @ --to <socket> <args…>` for window `w`'s commands.
+fn kitten(sock: &str, args: &[&str]) -> Option<String> {
+    let mut a = vec!["@", "--to", sock];
+    a.extend_from_slice(args);
+    run("kitten", &a)
+}
+
 /// Focus the session's pane. Returns a line for the status bar. `agent`
 /// (`claude`, `opencode`) helps pick it where a host can only narrow down by
 /// directory.
@@ -633,6 +756,22 @@ pub fn jump(host: &HostInfo, agent: &str) -> Result<String, String> {
             }
             Ok(format!("focused WezTerm pane {id}"))
         }
+        HostKind::Zellij => {
+            let (s, p) = two(&host.target);
+            run("zellij", &["--session", s, "action", "focus-pane-id", p])
+                .map(|_| raise(host, format!("focused Zellij pane {p}")))
+                .ok_or_else(|| format!("zellij couldn't focus pane {p} in {s}"))
+        }
+        HostKind::Kitty => {
+            let (w, sock) = two(&host.target);
+            let m = format!("id:{w}");
+            kitten(sock, &["focus-window", "--match", &m])
+                .ok_or_else(|| format!("kitty couldn't focus window {w}"))?;
+            if let Some(app) = host.app_pid {
+                activate_pid(app);
+            }
+            Ok(format!("focused kitty window {w}"))
+        }
     }
 }
 
@@ -649,14 +788,22 @@ pub enum Send {
 }
 
 /// The hosts `interactive` names, for sentences.
-pub const TYPABLE: &str = "herdr, tmux and iTerm2";
+pub const TYPABLE: &str = "herdr, tmux, Zellij, iTerm2, WezTerm and kitty";
 
 impl HostKind {
     /// Hosts marina can read a session's screen from and type into. iTerm2
     /// is scripted only on a keystroke (preview, answer), never by the
     /// sampler, so sampling never raises an automation prompt.
     pub fn interactive(self) -> bool {
-        matches!(self, HostKind::Herdr | HostKind::Tmux | HostKind::ITerm)
+        matches!(
+            self,
+            HostKind::Herdr
+                | HostKind::Tmux
+                | HostKind::ITerm
+                | HostKind::WezTerm
+                | HostKind::Zellij
+                | HostKind::Kitty
+        )
     }
 }
 
@@ -688,6 +835,26 @@ pub fn read_screen_or_why(host: &HostInfo, lines: usize) -> Result<Vec<String>, 
             run("tmux", &["capture-pane", "-p", "-t", &host.target]).ok_or_else(failed)?
         }
         HostKind::ITerm => iterm_read(&host.target)?,
+        HostKind::WezTerm => {
+            let id = wez_pane_of(&host.target)
+                .ok_or_else(|| format!("no {} any more", host.describe()))?;
+            run("wezterm", &["cli", "get-text", "--pane-id", &id]).ok_or_else(failed)?
+        }
+        HostKind::Zellij => {
+            let (s, p) = two(&host.target);
+            run(
+                "zellij",
+                &["--session", s, "action", "dump-screen", "--pane-id", p],
+            )
+            .ok_or_else(failed)?
+        }
+        HostKind::Kitty => {
+            let (w, sock) = two(&host.target);
+            let m = format!("id:{w}");
+            kitten(sock, &["get-text", "--match", &m]).ok_or_else(|| {
+                "couldn't read the kitty window — is allow_remote_control on?".to_string()
+            })?
+        }
         _ => {
             return Err(format!(
                 "marina can read the screen of {TYPABLE} sessions only"
@@ -764,6 +931,84 @@ fn approvable(screen: &[String]) -> Result<(), String> {
     }
 }
 
+/// Press Enter (`enter`) or Esc (`esc`) in a WezTerm, Zellij or kitty pane.
+fn type_key(host: &HostInfo, key: &str) -> Option<String> {
+    let bytes = if key == "enter" { "\r" } else { "\x1b" };
+    match host.kind {
+        HostKind::WezTerm => {
+            let id = wez_pane_of(&host.target)?;
+            run(
+                "wezterm",
+                &["cli", "send-text", "--pane-id", &id, "--no-paste", bytes],
+            )
+        }
+        HostKind::Zellij => {
+            let (s, p) = two(&host.target);
+            let code = if key == "enter" { "13" } else { "27" };
+            run(
+                "zellij",
+                &["--session", s, "action", "write", "--pane-id", p, code],
+            )
+        }
+        HostKind::Kitty => {
+            let (w, sock) = two(&host.target);
+            let m = format!("id:{w}");
+            let k = if key == "enter" { "enter" } else { "escape" };
+            kitten(sock, &["send-key", "--match", &m, k])
+        }
+        _ => None,
+    }
+}
+
+/// Type `text` into a WezTerm, Zellij or kitty pane as keystrokes, not a
+/// paste — and never through anything that would interpret it.
+fn type_text(host: &HostInfo, text: &str) -> Option<String> {
+    match host.kind {
+        HostKind::WezTerm => {
+            let id = wez_pane_of(&host.target)?;
+            run(
+                "wezterm",
+                &[
+                    "cli",
+                    "send-text",
+                    "--pane-id",
+                    &id,
+                    "--no-paste",
+                    "--",
+                    text,
+                ],
+            )
+        }
+        HostKind::Zellij => {
+            let (s, p) = two(&host.target);
+            run(
+                "zellij",
+                &[
+                    "--session",
+                    s,
+                    "action",
+                    "write-chars",
+                    "--pane-id",
+                    p,
+                    "--",
+                    text,
+                ],
+            )
+        }
+        HostKind::Kitty => {
+            // send-text interprets escapes in its argument; stdin is taken as-is
+            let (w, sock) = two(&host.target);
+            let m = format!("id:{w}");
+            run_stdin(
+                "kitten",
+                &["@", "--to", sock, "send-text", "--match", &m, "--stdin"],
+                text,
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Send `what` to the session. Its screen is read again first, so nothing
 /// acts on a stale view: approve only when the highlighted choice is a yes,
 /// reject only when a dialog is up (or herdr says it's blocked), and a
@@ -833,6 +1078,23 @@ pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
                 .ok_or("tmux didn't take the text")?;
             ok(run("tmux", &["send-keys", "-t", t, "Enter"]), "sent")
         }
+        (HostKind::WezTerm | HostKind::Zellij | HostKind::Kitty, what) => {
+            let key = |k: &str| -> Option<String> { type_key(host, k) };
+            match what {
+                Send::Approve => ok(key("enter"), "approved"),
+                Send::Reject => ok(key("esc"), "rejected"),
+                Send::Reply(text) => {
+                    if dialog {
+                        key("esc")
+                            .ok_or(format!("{} couldn't dismiss the dialog", host.kind.name()))?;
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                    type_text(host, text)
+                        .ok_or(format!("{} didn't take the text", host.kind.name()))?;
+                    ok(key("enter"), "sent")
+                }
+            }
+        }
         (HostKind::ITerm, Send::Approve) => ok(iterm_write(t, "enter", ""), "approved"),
         (HostKind::ITerm, Send::Reject) => ok(iterm_write(t, "esc", ""), "rejected"),
         (HostKind::ITerm, Send::Reply(text)) => {
@@ -853,6 +1115,35 @@ pub fn send(host: &HostInfo, what: &Send) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_panes_from_the_env_and_nothing_else() {
+        let env =
+            |kvs: &[&str]| -> Vec<std::ffi::OsString> { kvs.iter().map(|s| s.into()).collect() };
+        let t = TermEnv::from_environ(&env(&[
+            "ZELLIJ_SESSION_NAME=quiet-otter",
+            "ZELLIJ_PANE_ID=3",
+            "KITTY_WINDOW_ID=7",
+            "KITTY_LISTEN_ON=unix:/tmp/kitty-123",
+            "KITTY_PUBLIC_KEY=1:secret",
+            "PATH=/bin",
+        ]))
+        .unwrap();
+        assert_eq!(t.zellij, Some(("quiet-otter".into(), "3".into())));
+        assert_eq!(
+            t.kitty,
+            Some(("7".into(), Some("unix:/tmp/kitty-123".into())))
+        );
+        // no socket: known window, nothing to drive it with
+        let t = TermEnv::from_environ(&env(&["KITTY_WINDOW_ID=2"])).unwrap();
+        assert_eq!(t.kitty, Some(("2".into(), None)));
+        // values that would be unsafe as argv are dropped
+        assert_eq!(
+            TermEnv::from_environ(&env(&["ZELLIJ_SESSION_NAME=a b; rm", "ZELLIJ_PANE_ID=1"])),
+            None
+        );
+        assert_eq!(TermEnv::from_environ(&env(&["HOME=/x"])), None);
+    }
 
     #[test]
     fn parses_herdr_agent_list() {
@@ -927,6 +1218,7 @@ mod tests {
             mem_bytes: 0,
             start_time: 0,
             agent: None,
+            term: None,
         };
         let procs: HashMap<u32, ProcInfo> = [
             p(10, 1, "/Applications/Ghostty.app/Contents/MacOS/ghostty"),

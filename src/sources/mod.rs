@@ -28,6 +28,8 @@ pub struct ProcInfo {
     pub start_time: u64,
     /// Allowlisted agent markers from the process env (never the raw env).
     pub agent: Option<crate::launcher::AgentEnv>,
+    /// The terminal pane it runs in, from the same env (Zellij, kitty).
+    pub term: Option<crate::hosts::TermEnv>,
 }
 
 /// Listening socket -> PID. macOS via `netstat2`; Linux impl later.
@@ -120,6 +122,7 @@ impl ProcSource for SysinfoProcs {
                     mem_bytes: p.memory(),
                     start_time: p.start_time(),
                     agent: crate::launcher::AgentEnv::from_environ(p.environ()),
+                    term: crate::hosts::TermEnv::from_environ(p.environ()),
                 },
             );
         }

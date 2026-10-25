@@ -399,14 +399,20 @@ impl Sampler {
                     .unwrap_or(0);
                 for a in &mut agents {
                     a.infer_waiting(now);
-                    // where its screen can be read (tmux), confirm the
+                    // where its screen can be read without a permission
+                    // prompt (not iTerm2's scripting), confirm the
                     // inference: there must be a dialog on it
                     if a.waiting {
-                        if let Some(h) = a
-                            .host
-                            .as_ref()
-                            .filter(|h| h.kind == crate::hosts::HostKind::Tmux)
-                        {
+                        use crate::hosts::HostKind;
+                        if let Some(h) = a.host.as_ref().filter(|h| {
+                            matches!(
+                                h.kind,
+                                HostKind::Tmux
+                                    | HostKind::Zellij
+                                    | HostKind::WezTerm
+                                    | HostKind::Kitty
+                            )
+                        }) {
                             if let Some(screen) = crate::hosts::read_screen(h, 30) {
                                 a.waiting = crate::hosts::shows_dialog(&screen);
                             }
@@ -977,6 +983,7 @@ mod tests {
             mem_bytes: 0,
             start_time: 0,
             agent: None,
+            term: None,
         }
     }
     fn map(ps: Vec<ProcInfo>) -> HashMap<u32, ProcInfo> {
