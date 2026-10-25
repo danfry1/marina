@@ -1220,11 +1220,11 @@ mod tests {
         // no socket: known window, nothing to drive it with
         let t = TermEnv::from_environ(&env(&["KITTY_WINDOW_ID=2"])).unwrap();
         assert_eq!(t.kitty, Some(("2".into(), None)));
-        // values that would be unsafe as argv are dropped
-        assert_eq!(
-            TermEnv::from_environ(&env(&["ZELLIJ_SESSION_NAME=a b; rm", "ZELLIJ_PANE_ID=1"])),
-            None
-        );
+        // values that would be unsafe as argv are dropped — but that Zellij
+        // was there is kept, so kitty's variables aren't trusted under it
+        let t = TermEnv::from_environ(&env(&["ZELLIJ_SESSION_NAME=a b; rm", "ZELLIJ_PANE_ID=1"]))
+            .unwrap();
+        assert_eq!((t.zellij, t.in_zellij), (None, true));
         assert_eq!(TermEnv::from_environ(&env(&["HOME=/x"])), None);
     }
 
