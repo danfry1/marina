@@ -677,25 +677,21 @@ fn server_url(app: &mut ui::App, verb: char) -> Option<crate::model::Url> {
 }
 
 fn verb_copy(app: &mut ui::App) {
-    match row_url(app, 'y') {
-        Some(Ok((url, more))) => {
-            match verbs::copy_url(&url) {
-                Ok(()) => app.set_status(format!("copied {url}{more}")),
-                Err(e) => app.set_status(format!("copy failed: {e}")),
-            }
-            return;
-        }
-        Some(Err(why)) => {
-            app.set_status(why);
-            return;
-        }
-        None => {}
+    let (url, more) = match row_url(app, 'y') {
+        Some(Ok(found)) => found,
+        Some(Err(why)) => return app.set_status(why),
+        None => match server_url(app, 'y') {
+            Some(u) => (u.value, String::new()),
+            None => return,
+        },
+    };
+    // the demo's URLs are made up — leave the real clipboard alone
+    if app.demo {
+        return app.set_status(format!("demo: y would copy {url}{more}"));
     }
-    if let Some(u) = server_url(app, 'y') {
-        match verbs::copy_url(&u.value) {
-            Ok(()) => app.set_status(format!("copied {}", u.value)),
-            Err(e) => app.set_status(format!("copy failed: {e}")),
-        }
+    match verbs::copy_url(&url) {
+        Ok(()) => app.set_status(format!("copied {url}{more}")),
+        Err(e) => app.set_status(format!("copy failed: {e}")),
     }
 }
 

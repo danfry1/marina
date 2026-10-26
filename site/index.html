@@ -494,7 +494,7 @@
   <section class="wrap" aria-labelledby="harbour-title">
     <div class="harbour-head">
       <h2 id="harbour-title">Every port, and <em>who's berthed there.</em></h2>
-      <p>Coding agents start dev servers and don't always stop them. marina names the session behind each one, flags what a finished session left behind and what's running away with your CPU, and cleans up with one command.</p>
+      <p>Coding agents start dev servers and don't always stop them. marina names the session behind each one, flags what a finished session left behind, shows what's eating your CPU, and cleans up with one command.</p>
     </div>
     <div class="quay">
       <div class="berths" id="berths">
@@ -514,7 +514,7 @@
     <div class="text">
       <h2 id="many-title">Ten agents, <em>no port fights.</em></h2>
       <p><code>marina port</code> gives each project and worktree its own stable port, so parallel agents stop colliding on <code>:3000</code>.</p>
-      <p>An agent can ask marina about its own servers with <code>--mine</code>, and stop exactly those when it's done. <code>--json</code> on every command keeps scripts and agents on a stable contract.</p>
+      <p>An agent can ask marina about its own servers with <code>--mine</code>, and stop exactly those when it's done. <code>--json</code> on <code>ls</code>, <code>kill</code>, <code>url</code>, <code>who</code>, <code>free</code>, <code>port</code> and <code>agents</code> keeps scripts and agents on a stable contract.</p>
       <p class="small">Enter on a session jumps to it in herdr, tmux, iTerm2, WezTerm, Ghostty or Terminal.</p>
     </div>
     <div>
@@ -523,11 +523,12 @@
         <pre><span class="dim">$</span> pnpm dev --port $(marina port)
   <span class="ok">➜</span>  Local:   http://localhost:3142/
 
-<span class="dim">$</span> marina ls --mine
-checkout  next dev  :3142  1.1%  380MB
+<span class="dim">$</span> marina url --mine
+checkout  http://localhost:3142
 
 <span class="dim">$</span> marina kill --mine
-killing checkout :3142 (3 pids)</pre>
+stopping checkout · next dev :3142
+stopped 1 server</pre>
       </div>
     </div>
   </section>
@@ -535,10 +536,10 @@ killing checkout :3142 (3 pids)</pre>
   <section class="wrap" aria-labelledby="more-title">
     <h2 id="more-title">And the small things.</h2>
     <div class="more-grid">
-      <div><h3>Logs, inline</h3><p><code>t</code> tails a server's output, and <code>R</code> restarts it with the output captured.</p></div>
+      <div><h3>Logs, inline</h3><p><code>t</code> tails a server's log file when it writes one. <code>R</code> restarts it with its output captured, so <code>t</code> always works after that.</p></div>
       <div><h3>LAN warnings</h3><p>A server bound to <code>0.0.0.0</code> shows <code>:3000!</code>, so you know it's reachable from the network.</p></div>
       <div><h3>Crash notices</h3><p>If a long-running server dies without you killing it, marina says so.</p></div>
-      <div><h3>Docker too</h3><p>Published container ports sit with their project; <code>X</code> and <code>R</code> use the docker CLI.</p></div>
+      <div><h3>Docker too</h3><p>Published container ports show up as rows, and a <code>[[group]]</code> rule files one with its app. <code>X</code>, <code>R</code> and <code>t</code> use the docker CLI.</p></div>
     </div>
   </section>
 
@@ -547,7 +548,7 @@ killing checkout :3142 (3 pids)</pre>
     <div class="cmd"><pre><span class="p" aria-hidden="true">$ </span>brew install danfry1/tap/marina
 <span class="p" aria-hidden="true">$ </span>marina demo <span class="c"># a made-up machine</span>
 <span class="p" aria-hidden="true">$ </span>marina      <span class="c"># then yours</span></pre><button class="copy" type="button" aria-label="Copy"><svg class="i-copy" viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="2"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg><svg class="i-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"/></svg><span class="copied" aria-hidden="true">Copied</span></button></div>
-    <p>macOS and Linux. No network code, no telemetry, no accounts: everything stays on your machine.</p>
+    <p>macOS and Linux. No telemetry, no accounts, no network calls: nothing leaves your machine.</p>
   </section>
 </main>
 
