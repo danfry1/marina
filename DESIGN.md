@@ -413,11 +413,17 @@ holder is reported and left alone (exit 1). It is idempotent (an already-free
 port exits 0, so `marina free 3000 && pnpm dev` re-runs safely) and waits until
 the port is actually released before returning. `who` exits 1 for a free port.
 
-**Scope flags** — `--mine` and `--ended` narrow `ls`/`kill`/`restart`/`url`/`open`
-by launcher (see *Launcher attribution*), with or without selectors. `--mine`
-is "started by the agent session running this command" (matched by session id,
-else agent pid; exit 2 outside an agent session), so an agent can clean up its
-own servers without touching the user's or another session's. `--ended` is
+**Scope flags** — `--mine`, `--session` and `--ended` narrow
+`ls`/`kill`/`restart`/`url`/`open` by launcher (see *Launcher attribution*),
+with or without selectors. `--session` is "started by the agent session running
+this command" (matched by session id, else agent pid; exit 2 outside an agent
+session), so an agent can clean up its own servers without touching the user's
+or another session's. `--mine` is `--session` limited to the caller's git
+worktree (nearest `.git`, so worktrees nested in the repo are their own):
+subagents inherit their parent's session markers unchanged, and the worktree is
+the only thing that tells an isolated subagent's servers from its siblings'.
+Outside a worktree `--mine` exits 2 (pointing at `--session`) rather than
+widening silently. `--ended` is
 "started by an agent session that has since ended" (named after the TUI's
 `claude·ended`; `--orphaned` is its old name and still accepted).
 

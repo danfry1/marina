@@ -22,8 +22,11 @@
 //! Docker targets are stopped/restarted via `docker stop`/`docker restart`.
 //!
 //! `--mine` narrows ls/kill/restart/url/open to servers started by the agent
-//! session running this command (so an agent can clean up after itself);
-//! `--ended` to servers whose launching agent session has ended.
+//! session running this command, in the git worktree it's run from (so an
+//! agent can clean up after itself, and subagents — which share their
+//! parent's session — in other worktrees are left alone); `--session` drops
+//! the worktree limit; `--ended` narrows to servers whose launching agent
+//! session has ended.
 //!
 //! `agents` is read-only by design: agent sessions are never targets, so no
 //! selector, scope or verb here can stop one.
@@ -75,7 +78,9 @@ SELECTOR:
     ahead). `who` and `free` take ports only.
 
 SCOPE (ls / kill / restart / url / open; usable instead of, or with, selectors):
-    --mine       only servers started by the agent session running marina
+    --mine       only servers started by the agent session running marina,
+                 in this git worktree (subagents share their parent's session)
+    --session    like --mine, in every worktree
     --ended      only servers whose launching agent session has ended
                  (`detached` servers, whose launcher is unknown, aren't included)
 
@@ -132,7 +137,14 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         !matches!(
             **f,
             // --orphaned: the old name for --ended
-            "--json" | "--mine" | "--ended" | "--orphaned" | "--all" | "--list" | "--release"
+            "--json"
+                | "--mine"
+                | "--session"
+                | "--ended"
+                | "--orphaned"
+                | "--all"
+                | "--list"
+                | "--release"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -143,19 +155,35 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     let all = flags.contains(&"--all");
     let mut scope = Scope {
         mine: None,
+        tree: None,
         ended: flags.contains(&"--ended") || flags.contains(&"--orphaned"),
     };
-    if flags.contains(&"--mine") {
+    let session = flags.contains(&"--session");
+    if session || flags.contains(&"--mine") {
+        let flag = if session { "--session" } else { "--mine" };
         match launcher::own_agent() {
             Some(own) => scope.mine = Some(own),
             None => {
-                eprintln!("marina: --mine: not running inside an agent session");
+                eprintln!("marina: {flag}: not running inside an agent session");
+                return Some(2);
+            }
+        }
+        // --session widens --mine, so both together mean --session. Without
+        // a worktree --mine can't tell this agent from its subagents, so it
+        // refuses rather than quietly reaching the whole session.
+        if !session {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            scope.tree = std::env::current_dir()
+                .ok()
+                .and_then(|d| crate::resolve::worktree_root(&d, home.as_deref()));
+            if scope.tree.is_none() {
+                eprintln!("marina: --mine: not inside a git worktree (--session for every server this session started)");
                 return Some(2);
             }
         }
     }
     if scope.active() && matches!(cmd, "who" | "free" | "port" | "agents") {
-        eprintln!("marina: {cmd} doesn't take --mine / --ended");
+        eprintln!("marina: {cmd} doesn't take --mine / --session / --ended");
         return Some(2);
     }
     if json && cmd == "open" {
@@ -240,10 +268,14 @@ fn scanned(cmd: &str, with_cpu: bool) -> Result<Snapshot, i32> {
     }
 }
 
-/// `--mine` / `--ended`: narrow by who launched a target.
+/// `--mine` / `--session` / `--ended`: narrow by who launched a target.
 struct Scope {
     /// The agent session running this command (pid, session id).
     mine: Option<(Option<u32>, Option<String>)>,
+    /// `--mine`: the caller's git worktree. Subagents share their parent's
+    /// session, so this is what keeps one worktree's agent off another's
+    /// servers. `None` for `--session` (`--mine` refuses to run without one).
+    tree: Option<std::path::PathBuf>,
     ended: bool,
 }
 
@@ -258,6 +290,12 @@ impl Scope {
             if !l.is_some_and(|l| launcher::same_session(l, own)) {
                 return false;
             }
+            if let Some(tree) = &self.tree {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                if crate::resolve::worktree_root(&t.cwd, home.as_deref()).as_ref() != Some(tree) {
+                    return false;
+                }
+            }
         }
         !self.ended || l.is_some_and(|l| l.is_orphaned())
     }
@@ -266,6 +304,7 @@ impl Scope {
     fn describe(&self) -> &'static str {
         match (self.mine.is_some(), self.ended) {
             (true, true) => "in that scope",
+            (true, false) if self.tree.is_some() => "started by this session in this worktree",
             (true, false) => "started by this session",
             _ => "left running by ended agent sessions",
         }
@@ -407,6 +446,7 @@ fn is_ambiguous(sel: &str, hits: &[&Target]) -> bool {
 fn select<'a>(snap: &'a Snapshot, selectors: &[&str]) -> Vec<&'a Target> {
     let scope = Scope {
         mine: None,
+        tree: None,
         ended: false,
     };
     Pick {
@@ -1704,6 +1744,55 @@ mod tests {
         assert!(select(&snap, &["nope-xyz"]).is_empty()); // no match
     }
 
+    #[test]
+    fn mine_is_this_worktree_and_session_is_every_worktree() {
+        // a repo with a subagent worktree nested inside it, as agent tools
+        // lay them out (.claude/worktrees/<name>)
+        let base = std::env::temp_dir().join(format!("marina-mine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let wt = repo.join(".claude/worktrees/a");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(wt.join("web")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let agent = |session: &str| launcher::Launcher {
+            kind: launcher::LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(20),
+            alive: true,
+            session: Some(session.into()),
+            cwd: None,
+            start_time: 0,
+        };
+        let t = Snapshot::sample().targets[0].clone();
+        let at = |cwd: &std::path::Path, l| Target {
+            cwd: cwd.to_path_buf(),
+            launcher: Some(l),
+            ..t.clone()
+        };
+        let parent = at(&repo, agent("s1"));
+        let sub = at(&wt.join("web"), agent("s1")); // subagent: same session
+        let other = at(&repo, agent("s2"));
+
+        let own = Some((None, Some("s1".to_string())));
+        let mine_in = |tree: &std::path::Path| Scope {
+            mine: own.clone(),
+            tree: crate::resolve::worktree_root(tree, None),
+            ended: false,
+        };
+        let keeps = |s: &Scope| [&parent, &sub, &other].map(|t| s.keep(t));
+        assert_eq!(keeps(&mine_in(&repo)), [true, false, false]);
+        assert_eq!(keeps(&mine_in(&wt)), [false, true, false]);
+        let session = Scope {
+            mine: own.clone(),
+            tree: None,
+            ended: false,
+        };
+        assert_eq!(keeps(&session), [true, true, false]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The sample plus `api` (:4000), `api-gateway` (:4001) and a project
     /// named `app-3000` (:4002).
     fn named_snapshot() -> Snapshot {
@@ -1722,6 +1811,7 @@ mod tests {
     fn pick_with<'a>(snap: &'a Snapshot, selectors: &'a [&'a str]) -> Picked<'a> {
         let scope = Scope {
             mine: None,
+            tree: None,
             ended: false,
         };
         Pick {
@@ -1868,6 +1958,7 @@ mod tests {
         assert_eq!(d(&["port", "a/b"]), Some(2)); // invalid name
         assert_eq!(d(&["port", "--list", "--release"]), Some(2));
         assert_eq!(d(&["port", "--mine"]), Some(2));
+        assert_eq!(d(&["port", "--session"]), Some(2));
         assert_eq!(d(&["ls", "--list"]), Some(2)); // port-only flags
         assert_eq!(d(&["kill", "x", "--release"]), Some(2));
     }
