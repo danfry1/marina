@@ -1,20 +1,23 @@
 //! View state lives only here and survives snapshot swaps. Targets are grouped
 //! by project (or, with `v`, by the agent session / launcher that started
-//! them): a group with several targets gets a collapsible header and a
-//! group-kill; a lone target renders as a plain row. In session view every
+//! them): a group with several targets gets a collapsible header that acts on
+//! its visible members (after a confirm); a lone target renders as a plain
+//! row. In session view every
 //! session gets a header, since the session *is* the information. Session
 //! view also lists the agent sessions themselves (`Entry::Agent`) — a live
 //! agent with servers heads its group; one without is a row of its own.
 //! Agents are never in `selected_targets`, so no verb can reach one.
 //! Selection is held by value
-//! (`Entry`), not index, so the cursor doesn't jump when data refreshes; if the
-//! selected row vanishes the cursor falls to its nearest neighbor (the same
-//! list position), never back to the top. Volatile sorts freeze briefly after a
+//! (`Entry`), not index, so the cursor doesn't jump when data refreshes. A row
+//! marina itself just stopped or restarted stays under the cursor as a
+//! placeholder (`Hold`), so a second keypress can't land on its neighbour;
+//! any other vanished row falls to its nearest neighbor (the same list
+//! position), never back to the top. Volatile sorts freeze briefly after a
 //! keystroke so rows don't slide out from under the cursor.
 //!
 //! `dirty` gates redraws: the main loop only draws when something changed (or a
-//! transient animation — kill countdown, new-row flash — is running), so an
-//! idle cockpit does no per-frame work.
+//! transient animation — a new-row flash — is running), so an idle cockpit
+//! does no per-frame work.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +93,16 @@ pub(crate) enum Entry {
     Agents,
 }
 
+/// What the pane below the table shows: a server's log (followed) or a work
+/// tree's diff (read from the top).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum PaneKind {
+    Log,
+    Diff,
+}
+
 pub(crate) struct LogView {
+    pub(crate) kind: PaneKind,
     pub(crate) title: String,
     pub(crate) lines: VecDeque<String>,
     pub(crate) rx: Receiver<String>,
@@ -105,20 +117,39 @@ impl LogView {
     }
 }
 
-/// A kill whose SIGKILL escalation can still be cancelled (`u`). The affected
-/// rows render in a "dying" style until the window closes.
-pub(crate) struct PendingKill {
-    pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) until: Instant,
+/// A verb that touches processes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Verb {
+    Kill,
+    Restart,
+}
+
+/// A verb on several servers waiting for its key again (or Enter); any
+/// other key cancels it.
+pub(crate) struct Confirm {
+    pub(crate) verb: Verb,
+    pub(crate) entry: Entry,
+    pub(crate) prompt: String,
+}
+
+/// The row a verb just stopped or restarted, kept under the cursor once it
+/// leaves the snapshot (`stopped`, `restarting…`).
+pub(crate) struct Hold {
+    pub(crate) entry: Entry,
     pub(crate) label: String,
-    pub(crate) keys: Vec<TargetKey>,
+    pub(crate) state: &'static str,
+    pub(crate) until: Instant,
+    /// It has left the snapshot; seeing it again (a restart came up) ends
+    /// the hold.
+    pub(crate) gone: bool,
 }
 
 pub struct App {
     /// `marina demo`: made-up servers; verbs act on them, not on processes.
     pub demo: bool,
-    /// `O`/`Y` on a session with several servers: (verb, pid, which, when).
-    pub(crate) url_cycle: Option<(char, u32, usize, Instant)>,
+    /// `o`/`y` on a session or group with several servers: (verb, which
+    /// row, which URL, when).
+    pub(crate) url_cycle: Option<(char, String, usize, Instant)>,
     /// When each server was last announced as started, so one that keeps
     /// restarting (a watch mode) is announced once.
     pub(crate) announced: HashMap<TargetKey, Instant>,
@@ -128,6 +159,8 @@ pub struct App {
     /// when the selected row vanishes (e.g. after a kill).
     pub(crate) last_index: usize,
     pub(crate) sort: SortMode,
+    /// `S` (or clicking the sorted column again) reverses the order.
+    pub(crate) sort_rev: bool,
     pub(crate) display: Vec<Entry>,
     pub(crate) collapsed: HashSet<String>,
     pub(crate) last_input: Instant,
@@ -146,10 +179,18 @@ pub struct App {
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
     pub(crate) log_height: u16,
-    /// A background log discovery is running (guards double-`T`).
+    /// A background log discovery is running (guards double-`t`).
     pub(crate) log_pending: bool,
-    pub(crate) pending_kill: Option<PendingKill>,
+    /// Servers `X` sent SIGTERM to that are still running, with the
+    /// fingerprints a second `X` force-kills.
+    pub(crate) stopping: HashMap<TargetKey, Vec<crate::verbs::PidStart>>,
+    pub(crate) hold: Option<Hold>,
+    pub(crate) confirm: Option<Confirm>,
+    /// `R` has been used this session (its environment note is shown once).
+    pub(crate) restart_noted: bool,
     pub(crate) filter: String,
+    /// The filter as it was before `/`, which Esc restores.
+    pub(crate) filter_before: String,
     pub(crate) filter_active: bool,
     pub(crate) show_help: bool,
     pub(crate) inspect: bool,
@@ -164,6 +205,9 @@ pub struct App {
     pub(crate) dirty: bool,
     // --- layout rects recorded by render for mouse hit-testing ---
     pub(crate) table_rect: Rect,
+    /// Rows the table showed at the last render (page size; 0 = squeezed out
+    /// by the panes, when `X`/`R` refuse).
+    pub(crate) page_rows: usize,
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
@@ -184,6 +228,7 @@ impl App {
             selected: None,
             last_index: 0,
             sort: SortMode::Port,
+            sort_rev: false,
             display: Vec::new(),
             collapsed: HashSet::new(),
             last_input: Instant::now(),
@@ -199,8 +244,12 @@ impl App {
             log: None,
             log_height: 12,
             log_pending: false,
-            pending_kill: None,
+            stopping: HashMap::new(),
+            hold: None,
+            confirm: None,
+            restart_noted: false,
             filter: String::new(),
+            filter_before: String::new(),
             filter_active: false,
             show_help: false,
             inspect: false,
@@ -209,6 +258,7 @@ impl App {
             data_warning: None,
             dirty: true,
             table_rect: Rect::default(),
+            page_rows: usize::MAX,
             log_rect: None,
             header_hits: Vec::new(),
             project_w: 22,
@@ -264,7 +314,7 @@ impl App {
             // once, at the transition, and queue a desktop notification.
             for msg in orphan_notices(&old, &self.snapshot) {
                 self.notifications.push(msg.clone());
-                self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
+                self.set_notice(format!("⚠ /ended to review, X to stop · {msg}"));
             }
         } else {
             let n = self
@@ -275,11 +325,14 @@ impl App {
                 .count();
             if n > 0 {
                 self.set_notice(format!(
-                    "⚠ {n} server{} left running by ended agent sessions · /ended to review",
+                    "⚠ /ended to review · {n} server{} left running by ended agent sessions",
                     if n == 1 { "" } else { "s" }
                 ));
             }
         }
+        // a server that has exited is no longer stopping
+        let live: HashSet<&TargetKey> = self.snapshot.targets.iter().map(|t| &t.key).collect();
+        self.stopping.retain(|k, _| live.contains(k));
         (self.session_of, self.agent_session_of) =
             session_groups(&self.snapshot.targets, &self.snapshot.agents);
         self.data_warning = self.snapshot.error.clone();
@@ -300,19 +353,33 @@ impl App {
             .collect()
     }
 
-    /// Which of `n` URLs `verb` (`O` or `Y`) on session `pid` takes: the
-    /// next one when the same key is pressed again on it soon after, else
-    /// the first.
-    pub(crate) fn next_url(&mut self, verb: char, pid: u32, n: usize) -> usize {
-        let i = match self.url_cycle {
-            Some((v, p, i, at))
-                if v == verb && p == pid && at.elapsed() < Duration::from_secs(10) =>
+    /// The web URLs of the servers in group `g` the filter shows, by port.
+    pub(crate) fn group_urls(&self, g: &str) -> Vec<String> {
+        let mut servers: Vec<&Target> = self
+            .visible_members(g)
+            .into_iter()
+            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+            .collect();
+        servers.sort_by_key(|t| t.ports.first().copied());
+        servers
+            .iter()
+            .filter_map(|t| t.url.as_ref().map(|u| u.value.clone()))
+            .collect()
+    }
+
+    /// Which of `n` URLs `verb` (`o` or `y`) on row `row` (a session or a
+    /// group) takes: the next one when the same key is pressed again on it
+    /// soon after, else the first.
+    pub(crate) fn next_url(&mut self, verb: char, row: &str, n: usize) -> usize {
+        let i = match &self.url_cycle {
+            Some((v, r, i, at))
+                if *v == verb && r == row && at.elapsed() < Duration::from_secs(10) =>
             {
                 (i + 1) % n
             }
             _ => 0,
         };
-        self.url_cycle = Some((verb, pid, i, Instant::now()));
+        self.url_cycle = Some((verb, row.to_string(), i, Instant::now()));
         i
     }
 
@@ -362,7 +429,7 @@ impl App {
                 n => format!(" (+{} more)", n - 1),
             };
             format!(
-                "{} started {} on {}{more} — O on its session opens it",
+                "{} started {} on {}{more} — o on its session opens it",
                 self.agent_label(a),
                 t.command_label,
                 t.url.as_ref().map(|u| u.value.as_str()).unwrap_or_default()
@@ -402,19 +469,19 @@ impl App {
         }
     }
 
-    /// Per-loop upkeep: expire the status line, the kill-undo window, and row
-    /// flashes. Sets `dirty` only when something actually changed.
+    /// Per-loop upkeep: expire the status line, a held placeholder row, and
+    /// row flashes. Sets `dirty` only when something actually changed.
     pub fn tick(&mut self) {
         if self.status.is_some() && self.status_at.elapsed() > self.status_ttl {
             self.status = None;
             self.dirty = true;
         }
         if self
-            .pending_kill
+            .hold
             .as_ref()
-            .is_some_and(|pk| Instant::now() >= pk.until)
+            .is_some_and(|h| Instant::now() >= h.until)
         {
-            self.pending_kill = None;
+            self.hold = None;
             self.dirty = true;
         }
         let n = self.appeared.len();
@@ -426,10 +493,10 @@ impl App {
             .retain(|_, at| at.elapsed() < SUPPRESS_TTL);
     }
 
-    /// A transient animation (kill countdown / row flash) is on screen — the
-    /// main loop keeps drawing while this holds even without new input/data.
+    /// A transient animation (a row flash) is on screen — the main loop
+    /// keeps drawing while this holds even without new input/data.
     pub fn has_transient(&self) -> bool {
-        self.pending_kill.is_some() || !self.appeared.is_empty()
+        !self.appeared.is_empty()
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -457,9 +524,13 @@ impl App {
             GroupBy::Project => GroupBy::Session,
             GroupBy::Session => GroupBy::Project,
         };
+        // a row that isn't in the other view lands on the first row, not on
+        // whatever sits at its old position
+        self.last_index = 0;
+        self.hold = None;
         self.set_status(match self.group_by {
             GroupBy::Project => "grouped by project",
-            GroupBy::Session => "grouped by agent session / launcher",
+            GroupBy::Session => "grouped by who started them",
         });
     }
 
@@ -471,7 +542,7 @@ impl App {
                 .session_of
                 .get(&t.key)
                 .map(String::as_str)
-                .unwrap_or("unattributed"),
+                .unwrap_or("unknown"),
         }
     }
 
@@ -480,6 +551,17 @@ impl App {
             .targets
             .iter()
             .filter(|t| self.group_key(t) == g)
+            .collect()
+    }
+
+    /// The members of group `g` its header shows: what the filter lets
+    /// through (the project view lists agents' services elsewhere). Its
+    /// count, and what `X`/`R`/`o`/`y` on it act on — never a hidden server.
+    pub(crate) fn visible_members(&self, g: &str) -> Vec<&Target> {
+        self.group_members(g)
+            .into_iter()
+            .filter(|t| self.matches(t))
+            .filter(|t| self.group_by == GroupBy::Session || !is_agent_service(t))
             .collect()
     }
 
@@ -528,8 +610,14 @@ impl App {
         self.set_sort(self.sort.next());
     }
 
+    /// Sort by `m`; asking for the active sort again reverses it.
     pub(crate) fn set_sort(&mut self, m: SortMode) {
-        self.sort = m;
+        if m == self.sort {
+            self.sort_rev = !self.sort_rev;
+        } else {
+            self.sort = m;
+            self.sort_rev = false;
+        }
         // An explicit sort change means "reorder now" — push the navigation
         // freeze into the past so the new order applies immediately.
         self.last_input = self
@@ -537,6 +625,10 @@ impl App {
             .checked_sub(FREEZE)
             .unwrap_or(self.last_input);
         self.dirty = true;
+    }
+
+    pub fn reverse_sort(&mut self) {
+        self.set_sort(self.sort);
     }
 
     // --- selection ----------------------------------------------------------
@@ -547,6 +639,17 @@ impl App {
     pub fn select_prev(&mut self) {
         self.move_selection(-1);
     }
+    /// `Ctrl-d` / `Ctrl-u`.
+    pub fn half_page(&mut self, down: bool) {
+        let n = (self.page_rows / 2).max(1) as isize;
+        self.move_selection(if down { n } else { -n });
+    }
+    /// `PgDn` / `PgUp`.
+    pub fn page(&mut self, down: bool) {
+        let n = self.page_rows.max(1) as isize;
+        self.move_selection(if down { n } else { -n });
+    }
+    /// Move by `delta` rows, stopping at either end.
     fn move_selection(&mut self, delta: isize) {
         self.last_input = Instant::now();
         self.dirty = true;
@@ -557,42 +660,95 @@ impl App {
             .selected
             .as_ref()
             .and_then(|s| self.display.iter().position(|e| same_entry(e, s)))
-            .unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(self.display.len() as isize) as usize;
-        self.last_index = next;
-        self.selected = Some(self.display[next].clone());
+            .unwrap_or(self.last_index) as isize;
+        let last = self.display.len() as isize - 1;
+        self.select_index(cur.saturating_add(delta).clamp(0, last) as usize);
     }
     pub fn jump_top(&mut self) {
         self.last_input = Instant::now();
-        self.last_index = 0;
-        self.selected = self.display.first().cloned();
-        self.dirty = true;
+        self.select_index(0);
     }
     pub fn jump_bottom(&mut self) {
         self.last_input = Instant::now();
-        self.last_index = self.display.len().saturating_sub(1);
-        self.selected = self.display.last().cloned();
+        self.select_index(self.display.len().saturating_sub(1));
+    }
+    /// Put the cursor on row `i` — the user moved, so a held row is let go.
+    fn select_index(&mut self, i: usize) {
         self.dirty = true;
+        self.hold = None;
+        let Some(e) = self.display.get(i) else {
+            return;
+        };
+        self.last_index = i;
+        self.selected = Some(e.clone());
     }
 
     pub fn toggle_collapse(&mut self) {
-        if self.selected == Some(Entry::Agents) {
-            self.agents_open = !self.agents_open;
-            self.dirty = true;
+        let open = match &self.selected {
+            Some(Entry::Agents) => !self.agents_open,
+            Some(Entry::Group(p)) => self.collapsed.contains(p),
+            _ => return,
+        };
+        self.set_fold(open);
+    }
+
+    /// `l`/`→` unfold, `h`/`←` fold the selected header.
+    pub fn set_fold(&mut self, open: bool) {
+        match &self.selected {
+            Some(Entry::Agents) => self.agents_open = open,
+            Some(Entry::Group(p)) if open => {
+                self.collapsed.remove(p);
+            }
+            Some(Entry::Group(p)) => {
+                self.collapsed.insert(p.clone());
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
+    /// `h`/`←`: fold a header; on a row under one, go up to it.
+    pub fn fold_or_parent(&mut self) {
+        if matches!(self.selected, Some(Entry::Group(_) | Entry::Agents)) {
+            self.set_fold(false);
             return;
         }
-        if let Some(Entry::Group(p)) = &self.selected {
-            let p = p.clone();
-            if !self.collapsed.remove(&p) {
-                self.collapsed.insert(p);
-            }
-            self.dirty = true;
+        let parent = match &self.selected {
+            Some(Entry::Member(k)) => self
+                .snapshot
+                .targets
+                .iter()
+                .find(|t| &t.key == k)
+                .map(|t| Entry::Group(self.group_key(t).to_string())),
+            Some(Entry::Agent(pid)) => match self.group_by {
+                GroupBy::Project => Some(Entry::Agents),
+                GroupBy::Session => self.agent_session_of.get(pid).cloned().map(Entry::Group),
+            },
+            _ => None,
+        };
+        if let Some(i) = parent.and_then(|p| self.display.iter().position(|e| *e == p)) {
+            self.last_input = Instant::now();
+            self.select_index(i);
         }
     }
 
     pub fn toggle_inspect(&mut self) {
         self.inspect = !self.inspect;
         self.dirty = true;
+    }
+
+    /// `q` with a pane open closes it (log or diff first, then inspect)
+    /// instead of quitting. False when there's nothing to close.
+    pub fn close_top(&mut self) -> bool {
+        if self.log.is_some() {
+            self.close_log();
+        } else if self.inspect {
+            self.inspect = false;
+            self.dirty = true;
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The single target under the cursor (a member or standalone) — `None` on
@@ -614,11 +770,11 @@ impl App {
         }
     }
 
-    /// All targets the selection acts on: a whole group, or one target.
-    /// Never an agent session — on an agent row this is empty.
+    /// All targets the selection acts on: a group's visible members, or one
+    /// target. Never an agent session — on an agent row this is empty.
     pub fn selected_targets(&self) -> Vec<&Target> {
         match &self.selected {
-            Some(Entry::Group(p)) => self.group_members(p),
+            Some(Entry::Group(p)) => self.visible_members(p),
             Some(Entry::Member(k)) | Some(Entry::Target(k)) => self
                 .snapshot
                 .targets
@@ -637,7 +793,7 @@ impl App {
                 .targets
                 .iter()
                 .find(|t| &t.key == k)
-                .map(|t| t.project.clone())
+                .map(target_label)
                 .unwrap_or_default(),
             Some(Entry::Agent(_)) => self
                 .selected_agent()
@@ -649,14 +805,35 @@ impl App {
     }
 
     /// Recompute visible entries and re-anchor the selection: by key when the
-    /// row still exists, else the nearest neighbor (same list position), never
-    /// a jump back to the top. Called by render before drawing.
+    /// row still exists; a held row (one a verb just stopped or restarted)
+    /// as a placeholder where it was; else the nearest neighbor (same list
+    /// position), never a jump back to the top. Called by render before
+    /// drawing.
     pub(crate) fn reconcile(&mut self) {
         self.display = self.compute_entries();
-        let idx = self
+        let mut idx = self
             .selected
             .as_ref()
             .and_then(|s| self.display.iter().position(|e| same_entry(e, s)));
+        let held = self.hold.as_ref().is_some_and(|h| {
+            self.selected
+                .as_ref()
+                .is_some_and(|s| same_entry(s, &h.entry))
+        });
+        if !held {
+            self.hold = None;
+        } else if let Some(h) = self.hold.as_mut() {
+            match idx {
+                Some(_) if h.gone => self.hold = None, // back: a restart came up
+                Some(_) => {}
+                None => {
+                    h.gone = true;
+                    let at = self.last_index.min(self.display.len());
+                    self.display.insert(at, h.entry.clone());
+                    idx = Some(at);
+                }
+            }
+        }
         let idx = match idx {
             Some(i) => Some(i),
             None if self.display.is_empty() => None,
@@ -669,21 +846,44 @@ impl App {
         self.table_state.select(idx);
     }
 
+    /// The selection is a placeholder for a row marina just stopped or
+    /// restarted: verbs have nothing to act on.
+    pub(crate) fn held_placeholder(&self) -> Option<&Hold> {
+        self.hold.as_ref().filter(|h| {
+            h.gone
+                && self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| same_entry(s, &h.entry))
+        })
+    }
+
     // --- kill / restart bookkeeping -----------------------------------------
 
-    pub fn note_pending_kill(
-        &mut self,
-        cancel: Arc<AtomicBool>,
-        label: &str,
-        keys: Vec<TargetKey>,
-    ) {
-        self.mark_marina_action(&keys);
-        self.pending_kill = Some(PendingKill {
-            cancel,
-            until: Instant::now() + crate::verbs::GRACE,
-            label: label.to_string(),
-            keys,
+    /// Keep the selected row under the cursor while `verb` takes it away.
+    pub fn hold_selection(&mut self, verb: Verb) {
+        let Some(entry) = self.selected.clone() else {
+            return;
+        };
+        let (state, ttl) = match verb {
+            Verb::Kill => ("stopped", Duration::from_secs(10)),
+            Verb::Restart => ("restarting…", SUPPRESS_TTL),
+        };
+        self.hold = Some(Hold {
+            label: self.selection_label(),
+            entry,
+            state,
+            until: Instant::now() + ttl,
+            gone: false,
         });
+    }
+
+    /// `X` sent these servers SIGTERM: they render as `stopping…` until they
+    /// exit, and `X` again force-kills them.
+    pub fn note_stopping(&mut self, targets: Vec<(TargetKey, Vec<crate::verbs::PidStart>)>) {
+        let keys: Vec<TargetKey> = targets.iter().map(|(k, _)| k.clone()).collect();
+        self.mark_marina_action(&keys);
+        self.stopping.extend(targets);
         self.dirty = true;
     }
 
@@ -696,25 +896,30 @@ impl App {
         }
     }
 
-    pub fn undo_kill(&mut self) {
-        match self.pending_kill.take() {
-            Some(pk) if Instant::now() < pk.until => {
-                pk.cancel.store(true, Ordering::SeqCst);
-                self.set_status(format!(
-                    "cancelled force-kill for {} — note: SIGTERM was already sent",
-                    pk.label
-                ));
-            }
-            _ => self.set_status("nothing to undo"),
-        }
+    /// Ask before `verb` acts on several servers.
+    pub fn ask(&mut self, verb: Verb, prompt: String) {
+        let Some(entry) = self.selected.clone() else {
+            return;
+        };
+        self.confirm = Some(Confirm {
+            verb,
+            entry,
+            prompt,
+        });
         self.dirty = true;
     }
 
-    /// Is this row inside an active kill grace window? (Rendered as dying.)
+    /// The pending question, if the cursor is still where it was asked.
+    pub fn take_confirm(&mut self) -> Option<Verb> {
+        let c = self.confirm.take()?;
+        self.dirty = true;
+        (self.selected.as_ref() == Some(&c.entry)).then_some(c.verb)
+    }
+
+    /// Is this server stopping (SIGTERM sent, not exited yet)? Rendered as
+    /// `stopping…`.
     pub(crate) fn is_dying(&self, key: &TargetKey) -> bool {
-        self.pending_kill
-            .as_ref()
-            .is_some_and(|pk| pk.keys.contains(key))
+        self.stopping.contains_key(key)
     }
 
     /// Did this row appear within the flash window?
@@ -730,6 +935,7 @@ impl App {
         self.filter_active
     }
     pub fn start_filter(&mut self) {
+        self.filter_before = self.filter.clone();
         self.filter_active = true;
         self.last_input = Instant::now();
         self.dirty = true;
@@ -748,9 +954,16 @@ impl App {
         self.filter_active = false;
         self.dirty = true;
     }
+    /// Esc while typing: back to the filter as it was before `/`.
     pub fn filter_cancel(&mut self) {
         self.filter_active = false;
+        self.filter = std::mem::take(&mut self.filter_before);
+        self.dirty = true;
+    }
+    /// `Ctrl-U` while typing.
+    pub fn filter_clear_input(&mut self) {
         self.filter.clear();
+        self.last_input = Instant::now();
         self.dirty = true;
     }
     fn matches(&self, t: &Target) -> bool {
@@ -765,9 +978,10 @@ impl App {
             || t.git_branch
                 .as_deref()
                 .is_some_and(|b| b.to_lowercase().contains(&q))
-            // `/claude`, `/agent`, `/ended` (orphans), `/detached`
+            // `/claude`, `/ended` (orphans), `/detached`, `/agent` (the
+            // launcher kind, whole word only: `/en` mustn't match every one)
             || t.launcher.as_ref().is_some_and(|l| {
-                l.short().to_lowercase().contains(&q) || l.kind.as_str().contains(&q)
+                l.short().to_lowercase().contains(&q) || l.kind.as_str() == q
             })
     }
 
@@ -776,8 +990,9 @@ impl App {
             return true;
         }
         let q = self.filter.to_lowercase();
-        // `/agent` lists every session; `/claude`, `/cargo` (a shell), a dir, …
-        "agent".contains(&q)
+        // `/agent` lists every session (whole word: `/a`, `/en` don't);
+        // `/claude`, `/cargo` (a shell), a dir, …
+        q == "agent"
             || a.name.to_lowercase().contains(&q)
             || a.project.to_lowercase().contains(&q)
             || a.cwd.to_string_lossy().to_lowercase().contains(&q)
@@ -804,18 +1019,42 @@ impl App {
         }
     }
 
-    // --- log pane (`T`) -----------------------------------------------------
+    // --- log / diff pane (`t`, `d`) ----------------------------------------
 
     pub fn log_open(&self) -> bool {
         self.log.is_some()
     }
 
+    /// What the open pane shows, if one is open.
+    pub fn pane_kind(&self) -> Option<PaneKind> {
+        self.log.as_ref().map(|l| l.kind)
+    }
+
     pub fn open_log(&mut self, title: String, rx: Receiver<String>, stop: Arc<AtomicBool>) {
+        self.set_status(format!("tailing {title}"));
+        self.open_pane(PaneKind::Log, title, rx, stop);
+    }
+
+    /// The diff pane, read from the top.
+    pub fn open_diff(&mut self, title: String, rx: Receiver<String>, stop: Arc<AtomicBool>) {
+        self.open_pane(PaneKind::Diff, title, rx, stop);
+        if let Some(l) = &mut self.log {
+            l.scroll = Some(0);
+        }
+    }
+
+    fn open_pane(
+        &mut self,
+        kind: PaneKind,
+        title: String,
+        rx: Receiver<String>,
+        stop: Arc<AtomicBool>,
+    ) {
         if let Some(old) = self.log.take() {
             old.close();
         }
-        self.set_status(format!("tailing {title}"));
         self.log = Some(LogView {
+            kind,
             title,
             lines: VecDeque::new(),
             rx,
@@ -825,18 +1064,13 @@ impl App {
         self.dirty = true;
     }
 
-    /// Read from the top instead of following the tail (a diff, not a log).
-    pub fn log_from_top(&mut self) {
-        if let Some(l) = &mut self.log {
-            l.scroll = Some(0);
-            self.dirty = true;
-        }
-    }
-
     pub fn close_log(&mut self) {
         if let Some(old) = self.log.take() {
+            self.set_status(match old.kind {
+                PaneKind::Log => "closed the log",
+                PaneKind::Diff => "closed the diff",
+            });
             old.close();
-            self.set_status("closed logs");
         }
     }
 
@@ -861,7 +1095,19 @@ impl App {
     }
 
     fn log_visible_lines(&self) -> usize {
-        self.log_height.saturating_sub(2) as usize
+        self.log_rect
+            .map_or(self.log_height, |r| r.height)
+            .saturating_sub(2) as usize
+    }
+
+    /// `PgUp` / `PgDn` with the pane open: a pane's height at a time.
+    pub fn log_page(&mut self, down: bool) {
+        let n = self.log_visible_lines().max(1);
+        if down {
+            self.log_scroll_down(n);
+        } else {
+            self.log_scroll_up(n);
+        }
     }
 
     pub fn log_scroll_up(&mut self, n: usize) {
@@ -900,20 +1146,24 @@ impl App {
 
     // --- mouse --------------------------------------------------------------
 
-    /// Click to select (click a selected group header again to fold it), click
-    /// a PORT/CPU/MEM header cell to sort, wheel to move (or scroll the log
-    /// pane when hovering it).
-    pub fn on_mouse(&mut self, ev: MouseEvent) {
+    /// Click to select (clicking the selected row again does what Enter does
+    /// — returns true, for the caller to run it), click a PORT/CPU/MEM header
+    /// cell to sort (again: reverse), wheel to move (or scroll the log pane
+    /// when hovering it).
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
         let (x, y) = (ev.column, ev.row);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.show_help {
                     self.close_help();
-                    return;
+                    return false;
+                }
+                if self.confirm.take().is_some() {
+                    self.set_status("cancelled");
                 }
                 let t = self.table_rect;
                 if !rect_contains(t, x, y) {
-                    return;
+                    return false;
                 }
                 if y == t.y.saturating_add(1) {
                     // header row: sortable column?
@@ -928,18 +1178,12 @@ impl App {
                 } else if y >= t.y + 2 && y + 1 < t.y + t.height {
                     let idx = (y - t.y - 2) as usize + self.table_state.offset();
                     if idx < self.display.len() {
-                        let e = self.display[idx].clone();
-                        let already = self.selected.as_ref().is_some_and(|s| same_entry(s, &e));
-                        if already {
-                            if matches!(e, Entry::Group(_) | Entry::Agents) {
-                                self.toggle_collapse();
-                            }
-                        } else {
-                            self.last_input = Instant::now();
-                            self.last_index = idx;
-                            self.selected = Some(e);
+                        let e = &self.display[idx];
+                        if self.selected.as_ref().is_some_and(|s| same_entry(s, e)) {
+                            return true;
                         }
-                        self.dirty = true;
+                        self.last_input = Instant::now();
+                        self.select_index(idx);
                     }
                 }
             }
@@ -959,6 +1203,7 @@ impl App {
             }
             _ => {}
         }
+        false
     }
 
     /// Append this snapshot's cpu/mem to each row's history; forget rows
@@ -1073,6 +1318,9 @@ impl App {
             .map(|p| {
                 let mut m = groups.remove(&p).unwrap_or_default();
                 sort_members(&mut m);
+                if self.sort_rev {
+                    m.reverse();
+                }
                 (p, m)
             })
             .collect();
@@ -1113,6 +1361,9 @@ impl App {
                 };
                 s(b).cmp(&s(a))
             }),
+        }
+        if self.sort_rev {
+            grouped.reverse();
         }
 
         let mut entries = Vec::new();
@@ -1185,6 +1436,11 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// How status lines name one server: `client-portal · next dev`.
+pub(crate) fn target_label(t: &Target) -> String {
+    format!("{} · {}", t.project, t.command_label)
+}
+
 /// The target key behind an entry (`None` for a group header).
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
@@ -1194,7 +1450,7 @@ fn key_of(e: &Entry) -> Option<&TargetKey> {
 }
 
 /// Session-view group label per target and per agent pid: `claude·fal-app`,
-/// `claude·ended`, `tmux`, `detached`, `unattributed`. A live agent and the
+/// `claude·ended`, `tmux`, `detached`, `unknown`. A live agent and the
 /// servers it launched share a label. Distinct sessions that would share a
 /// label get a short id suffix (`claude·fal-app #219a`).
 pub(crate) fn session_groups(
@@ -1205,7 +1461,7 @@ pub(crate) fn session_groups(
     let agent_launchers: Vec<Launcher> = agents.iter().map(Agent::as_launcher).collect();
     let base_and_id = |l: Option<&Launcher>| -> (String, String) {
         let Some(l) = l else {
-            return ("unattributed".into(), String::new());
+            return ("unknown".into(), String::new());
         };
         let id = l
             .session
@@ -1345,18 +1601,31 @@ mod tests {
     #[test]
     fn open_on_a_session_moves_through_its_servers() {
         let mut app = App::new();
-        assert_eq!(app.next_url('O', 7, 3), 0);
-        assert_eq!(app.next_url('O', 7, 3), 1);
-        assert_eq!(app.next_url('O', 7, 3), 2);
-        assert_eq!(app.next_url('O', 7, 3), 0, "wraps round");
+        assert_eq!(app.next_url('o', "agent:7", 3), 0);
+        assert_eq!(app.next_url('o', "agent:7", 3), 1);
+        assert_eq!(app.next_url('o', "agent:7", 3), 2);
+        assert_eq!(app.next_url('o', "agent:7", 3), 0, "wraps round");
         assert_eq!(
-            app.next_url('O', 8, 3),
+            app.next_url('o', "agent:8", 3),
             0,
             "another session starts at its first"
         );
-        assert_eq!(app.next_url('Y', 8, 3), 0, "Y after O copies what O opened");
-        app.url_cycle = Some(('O', 8, 1, Instant::now() - Duration::from_secs(60)));
-        assert_eq!(app.next_url('O', 8, 3), 0, "a while later starts over");
+        assert_eq!(
+            app.next_url('y', "agent:8", 3),
+            0,
+            "y after o copies what o opened"
+        );
+        app.url_cycle = Some((
+            'o',
+            "agent:8".into(),
+            1,
+            Instant::now() - Duration::from_secs(60),
+        ));
+        assert_eq!(
+            app.next_url('o', "agent:8", 3),
+            0,
+            "a while later starts over"
+        );
     }
     fn app_with_sample() -> App {
         let mut app = App::new();
@@ -1409,7 +1678,7 @@ mod tests {
         assert_eq!(g[&TargetKey::Port(8000)], "claude·portal"); // same session
         assert_eq!(g[&TargetKey::Port(5555)], "claude·worker");
         assert_eq!(g[&TargetKey::Port(5432)], "tmux");
-        assert_eq!(g[&snap.targets[4].key], "unattributed");
+        assert_eq!(g[&snap.targets[4].key], "unknown");
 
         // two different sessions in same-named dirs get a short id suffix
         let mut snap = sessions_snapshot(1, true);
@@ -1544,7 +1813,7 @@ mod tests {
         app.selected = Some(Entry::Agents);
         assert!(
             app.selected_targets().is_empty(),
-            "K on the section: nothing"
+            "X on the section: nothing"
         );
         app.toggle_collapse();
         let e = app.compute_entries();
@@ -1571,7 +1840,7 @@ mod tests {
             .any(|e| matches!(e, Entry::Group(g) if g == "claude·notes")));
         assert_eq!(app.group_agents("claude·portal").len(), 1);
 
-        // K on the header: its servers, never the agent
+        // X on the header: its servers, never the agent
         app.selected = Some(Entry::Group("claude·portal".into()));
         let pids: Vec<u32> = app
             .selected_targets()
@@ -1640,13 +1909,53 @@ mod tests {
     }
 
     #[test]
-    fn move_selection_wraps_around() {
+    fn move_selection_stops_at_the_ends() {
         let mut app = app_with_sample();
         app.reconcile();
         assert!(app.display.len() > 1);
         app.selected = Some(app.display[0].clone());
-        app.select_prev(); // wraps to last
+        app.select_prev(); // already at the top
+        assert_eq!(app.selected.as_ref(), app.display.first());
+        app.jump_bottom();
+        app.select_next();
         assert_eq!(app.selected.as_ref(), app.display.last());
+        app.page_rows = 2;
+        app.page(false);
+        assert_eq!(app.last_index, app.display.len() - 3);
+        app.half_page(true); // a half page of 2 rows is one row
+        assert_eq!(app.last_index, app.display.len() - 2);
+    }
+
+    #[test]
+    fn h_folds_a_header_or_goes_up_to_it() {
+        let mut app = app_with_sample();
+        app.reconcile();
+        let member = app
+            .display
+            .iter()
+            .position(|e| matches!(e, Entry::Member(_)))
+            .unwrap();
+        app.selected = Some(app.display[member].clone());
+        app.fold_or_parent();
+        assert_eq!(app.selected, Some(Entry::Group("client-portal".into())));
+        app.fold_or_parent();
+        assert!(
+            app.collapsed.contains("client-portal"),
+            "h on a header folds"
+        );
+        app.set_fold(true);
+        assert!(!app.collapsed.contains("client-portal"), "l unfolds");
+    }
+
+    #[test]
+    fn q_closes_the_topmost_pane_before_quitting() {
+        let mut app = app_with_sample();
+        app.inspect = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.open_diff("d".into(), rx, Arc::new(AtomicBool::new(false)));
+        assert!(app.close_top() && app.log.is_none() && app.inspect);
+        assert!(app.close_top() && !app.inspect);
+        assert!(!app.close_top(), "nothing left: q quits");
     }
 
     #[test]
@@ -1737,15 +2046,140 @@ mod tests {
     }
 
     #[test]
-    fn undo_cancels_a_pending_kill() {
+    fn a_stopping_server_is_dying_until_it_exits() {
+        let mut app = app_with_sample();
+        app.note_stopping(vec![(TargetKey::Port(8000), vec![(1, 1)])]);
+        assert!(app.is_dying(&TargetKey::Port(8000)));
+        let mut snap = Snapshot::sample();
+        snap.seq = 2;
+        app.apply(Arc::new(snap));
+        assert!(app.is_dying(&TargetKey::Port(8000)), "still running");
+        app.apply(without_8000(3));
+        assert!(app.stopping.is_empty(), "exited: no longer stopping");
+    }
+
+    /// The sample without billing-api (:8000), as the next snapshot.
+    fn without_8000(seq: u64) -> Arc<Snapshot> {
+        let mut snap = Snapshot::sample();
+        snap.seq = seq;
+        snap.targets.retain(|t| t.key != TargetKey::Port(8000));
+        Arc::new(snap)
+    }
+
+    #[test]
+    fn a_stopped_row_stays_under_the_cursor_as_a_placeholder() {
+        let mut app = app_with_sample();
+        app.reconcile();
+        let at = app
+            .display
+            .iter()
+            .position(|e| e == &Entry::Target(TargetKey::Port(8000)))
+            .unwrap();
+        app.select_index(at);
+        app.hold_selection(Verb::Kill);
+        app.apply(without_8000(2));
+        app.reconcile();
+        // not the neighbour that slid into its place: a second X is safe
+        assert_eq!(app.selected, Some(Entry::Target(TargetKey::Port(8000))));
+        assert_eq!(app.table_state.selected(), Some(at));
+        assert!(app.held_placeholder().is_some());
+        assert!(
+            app.selected_targets().is_empty(),
+            "verbs have nothing to act on"
+        );
+        // moving lets it go
+        app.select_next();
+        app.reconcile();
+        assert!(app.hold.is_none());
+        assert!(!app.display.contains(&Entry::Target(TargetKey::Port(8000))));
+    }
+
+    #[test]
+    fn a_restarted_row_comes_back_under_the_cursor() {
+        let mut app = app_with_sample();
+        app.reconcile();
+        app.selected = Some(Entry::Target(TargetKey::Port(8000)));
+        app.reconcile();
+        app.hold_selection(Verb::Restart);
+        app.apply(without_8000(2));
+        app.reconcile();
+        assert_eq!(app.held_placeholder().map(|h| h.state), Some("restarting…"));
+        let mut back = Snapshot::sample();
+        back.seq = 3;
+        app.apply(Arc::new(back));
+        app.reconcile();
+        assert_eq!(app.selected, Some(Entry::Target(TargetKey::Port(8000))));
+        assert!(app.hold.is_none(), "it's back: the hold is done");
+        assert_eq!(app.selected_targets().len(), 1);
+    }
+
+    #[test]
+    fn a_confirm_only_goes_ahead_where_it_was_asked() {
+        let mut app = app_with_sample();
+        app.selected = Some(Entry::Group("client-portal".into()));
+        app.ask(Verb::Kill, "kill 2 servers in client-portal?".into());
+        assert_eq!(app.take_confirm(), Some(Verb::Kill));
+        assert!(app.confirm.is_none());
+        app.ask(Verb::Restart, "restart?".into());
+        app.selected = Some(Entry::Target(TargetKey::Port(8000)));
+        assert_eq!(app.take_confirm(), None, "the cursor moved: no restart");
+    }
+
+    #[test]
+    fn a_header_acts_only_on_the_members_the_filter_shows() {
+        let mut app = app_with_sample();
+        // client-portal: next dev :3000 and postgres :5432
+        app.filter = "postgres".into();
+        app.selected = Some(Entry::Group("client-portal".into()));
+        let ts = app.selected_targets();
+        assert_eq!(ts.len(), 1, "the hidden next dev isn't touched");
+        assert_eq!(ts[0].command_label, "postgres");
+        assert_eq!(app.group_members("client-portal").len(), 2);
+    }
+
+    #[test]
+    fn switching_views_lands_on_the_first_row_when_the_row_is_gone() {
         let mut app = App::new();
-        let flag = Arc::new(AtomicBool::new(false));
-        app.note_pending_kill(Arc::clone(&flag), "web", vec![TargetKey::Port(1)]);
-        assert!(app.is_dying(&TargetKey::Port(1)));
-        app.undo_kill();
-        assert!(flag.load(Ordering::SeqCst)); // escalation cancelled
-        app.undo_kill(); // nothing left
-        assert_eq!(app.status.as_deref(), Some("nothing to undo"));
+        let mut snap = sessions_snapshot(1, true);
+        snap.agents = vec![Agent::sample(300, "dddd4444", "notes")];
+        app.apply(Arc::new(snap));
+        app.reconcile();
+        app.jump_bottom();
+        assert_eq!(app.selected, Some(Entry::Agents));
+        app.toggle_group_by();
+        app.reconcile();
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn s_reverses_the_sort_and_a_header_click_again_does_too() {
+        let mut app = app_with_sample();
+        let first = app.compute_entries()[0].clone();
+        app.reverse_sort();
+        assert!(app.sort_rev);
+        assert_ne!(app.compute_entries()[0], first);
+        app.set_sort(SortMode::Port); // the active sort again
+        assert!(!app.sort_rev);
+        app.set_sort(SortMode::Mem);
+        assert!(!app.sort_rev, "a new sort starts unreversed");
+    }
+
+    #[test]
+    fn esc_while_typing_restores_the_filter_and_agent_matches_whole_word() {
+        let mut app = app_with_sample();
+        app.filter = "billing".into();
+        app.start_filter();
+        app.filter_push('x');
+        app.filter_clear_input();
+        assert!(app.filter.is_empty());
+        app.filter_cancel();
+        assert_eq!(app.filter, "billing", "Esc puts the old filter back");
+
+        let a = Agent::sample(7, "aaaa1111", "marina");
+        app.filter = "agent".into();
+        assert!(app.matches_agent(&a));
+        app.filter = "en".into();
+        assert!(!app.matches_agent(&a), "/en isn't /agent");
     }
 
     #[test]

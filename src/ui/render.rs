@@ -14,33 +14,47 @@ use ratatui::{
 };
 
 use super::format::{centered_rect, fmt_age, fmt_mem, fmt_uptime, tildify, unix_now};
-use super::state::{App, Entry, GroupBy, HistKey, SortMode};
+use super::state::{is_agent_service, App, Entry, GroupBy, HistKey, PaneKind, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
 
 /// Column widths (PROJECT, COMMAND, PORT, CPU, MEM, VIA, UP, BRANCH).
-const COLW: [u16; 8] = [22, 16, 7, 7, 9, 14, 6, 15];
+const COLW: [u16; 8] = [18, 16, 7, 7, 7, 14, 6, 15];
 /// How far PROJECT and BRANCH grow into spare width.
 const PROJECT_MAX: u16 = 36;
 const BRANCH_MAX: u16 = 40;
+const BRANCH: usize = 7;
+/// The table keeps at least this many lines (3 rows, header, borders)
+/// when panes open below it; with fewer rows it counts as hidden.
+const TABLE_MIN: u16 = 6;
+const TABLE_MIN_ROWS: u16 = 3;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
 
     let log_open = app.log.is_some();
     let inspect_open = app.inspect;
+    // an agent lists its shells/helpers below the usual five lines
+    let mut inspect_h = match (inspect_open, app.selected_agent().is_some()) {
+        (false, _) => 0,
+        (true, true) => 13,
+        (true, false) => 10,
+    };
+    let mut log_h = if log_open { app.log_height } else { 0 };
+    // keep the table visible: shrink the log first, then inspect
+    let room = frame.area().height.saturating_sub(2); // detail + footer
+    let mut over = (inspect_h + log_h + TABLE_MIN).saturating_sub(room);
+    let cut = over.min(log_h.saturating_sub(3));
+    log_h -= cut;
+    over -= cut;
+    inspect_h -= over.min(inspect_h.saturating_sub(3));
+
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
     if inspect_open {
-        // an agent lists its shells/helpers below the usual five lines
-        let h = if app.selected_agent().is_some() {
-            13
-        } else {
-            10
-        };
-        constraints.push(Constraint::Length(h));
+        constraints.push(Constraint::Length(inspect_h));
     }
     if log_open {
-        constraints.push(Constraint::Length(app.log_height));
+        constraints.push(Constraint::Length(log_h));
     }
     constraints.push(Constraint::Length(1)); // detail
     constraints.push(Constraint::Length(1)); // footer
@@ -62,51 +76,86 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let detail_area = chunks[i];
     let footer_area = chunks[i + 1];
 
-    // record layout for mouse hit-testing
+    // record layout for mouse hit-testing and paging
     app.table_rect = table_area;
     app.log_rect = log_area;
+    let rows = table_area.height.saturating_sub(3);
+    app.page_rows = if rows < TABLE_MIN_ROWS {
+        0
+    } else {
+        rows as usize
+    };
 
     let agents = match (app.snapshot.agents.len(), app.group_by) {
         (0, _) => String::new(),
         (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
+    let n = app.snapshot.targets.len();
     let title = format!(
-        " {}marina · {} targets{agents} · sort:{}{} ",
+        " {}marina · {n} server{}{agents} · sort:{}{}{}{} ",
         if app.demo { "DEMO · " } else { "" },
-        app.snapshot.targets.len(),
+        if n == 1 { "" } else { "s" },
         app.sort.label(),
+        if app.sort_rev { " ▴" } else { "" },
         match app.group_by {
             GroupBy::Project => "",
             GroupBy::Session => " · by:session",
+        },
+        // the filter stays named here, whatever the footer is showing
+        if app.filter.is_empty() {
+            String::new()
+        } else {
+            format!(" · filter:{}", app.filter)
         }
     );
     let block = Block::bordered().title(title);
 
-    if app.display.is_empty() {
+    if app.page_rows == 0 && !app.display.is_empty() {
+        app.header_hits.clear();
+        let hint = Paragraph::new(Line::styled(
+            "table hidden — Esc closes panes",
+            Style::new().fg(Color::DarkGray),
+        ))
+        .block(block);
+        frame.render_widget(hint, table_area);
+    } else if app.display.is_empty() {
         app.header_hits.clear();
         let dim = Style::new().fg(Color::DarkGray);
-        let msg = if app.snapshot.targets.is_empty() && app.group_by == GroupBy::Project {
-            "No dev processes detected."
-        } else if app.snapshot.targets.is_empty() && app.snapshot.agents.is_empty() {
-            "No dev processes or agent sessions detected."
+        let (msg, hint) = if app.snapshot.seq == 0 {
+            (Line::from("scanning…"), "")
+        } else if let Some(e) = &app.snapshot.error {
+            (
+                Line::styled(format!("⚠ {e}"), Style::new().fg(Color::Red)),
+                "Servers can't be listed until the port scan works.",
+            )
+        } else if !app.filter.is_empty() {
+            (Line::from("No servers match the filter."), "Esc clears it.")
+        } else if app.snapshot.targets.is_empty() && app.group_by == GroupBy::Project {
+            (
+                Line::from("No dev servers detected."),
+                "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here.",
+            )
         } else {
-            "No targets match the filter."
+            (
+                Line::from("No dev servers or agent sessions detected."),
+                "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here.",
+            )
         };
         let hint = Paragraph::new(vec![
             Line::from(""),
-            Line::from(msg).centered(),
-            Line::styled(
-                "Start a dev server (npm run dev · cargo run · uvicorn · rails s) and it'll appear here.",
-                dim,
-            )
-            .centered(),
+            msg.centered(),
+            Line::styled(hint, dim).centered(),
         ])
         .block(block);
         frame.render_widget(hint, table_area);
     } else {
-        // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
+        // Drop columns on narrow panes: UP, then BRANCH, then VIA.
         let cols = visible_columns(table_area.width);
-        let arrow = |m: SortMode| if app.sort == m { " ▾" } else { "" };
+        let arrow = |m: SortMode| match (app.sort == m, app.sort_rev) {
+            (false, _) => "",
+            (true, false) => " ▾",
+            (true, true) => " ▴",
+        };
         let head = [
             "PROJECT".to_string(),
             "COMMAND".to_string(),
@@ -117,23 +166,25 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             "UP".to_string(),
             "BRANCH".to_string(),
         ];
-        let header = Row::new(
-            head[..cols]
-                .iter()
-                .cloned()
-                .map(Cell::from)
-                .collect::<Vec<_>>(),
-        )
-        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-        let colw = column_widths(table_area.width, cols);
+        let header = Row::new(cols.iter().map(|&c| Cell::from(head[c].clone())))
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        let colw = column_widths(table_area.width, &cols);
         app.project_w = colw[0];
-        app.header_hits = header_hits(table_area, &colw);
+        app.header_hits = header_hits(table_area, &cols, &colw);
         let by_key: HashMap<&TargetKey, &Target> =
             app.snapshot.targets.iter().map(|t| (&t.key, t)).collect();
         let rows: Vec<Row> = app
             .display
             .iter()
-            .map(|e| entry_row(e, app, &by_key))
+            .map(|e| {
+                let (cells, style) = entry_row(e, app, &by_key);
+                let mut cells: Vec<Option<Cell>> = cells.into_iter().map(Some).collect();
+                Row::new(
+                    cols.iter()
+                        .filter_map(|&c| cells.get_mut(c).and_then(Option::take)),
+                )
+                .style(style)
+            })
             .collect();
         let widths: Vec<Constraint> = colw.iter().map(|&w| Constraint::Length(w)).collect();
         let table = Table::new(rows, widths)
@@ -168,12 +219,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .take(inner_h)
             .map(|s| Line::from(s.clone()))
             .collect();
-        let hint = if l.scroll.is_some() {
-            "scrolled · ] follow · Esc close"
-        } else {
-            "[ ] scroll · +/- size · Esc close"
+        let title = match (l.kind, l.scroll.is_some()) {
+            (PaneKind::Diff, _) => format!(" diff: {} — [ ] scroll · q close ", l.title),
+            (PaneKind::Log, true) => {
+                format!(" log: {} — scrolled · ] follow · q close ", l.title)
+            }
+            (PaneKind::Log, false) => {
+                format!(" log: {} — [ ] scroll · +/- size · q close ", l.title)
+            }
         };
-        let title = format!(" logs: {} — {hint} ", l.title);
         let para = Paragraph::new(text).block(Block::bordered().title(title));
         frame.render_widget(para, area);
     }
@@ -183,7 +237,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         let lines = help_lines();
-        let area = centered_rect(72, lines.len() as u16 + 2, frame.area());
+        let area = centered_rect(HELP_W, lines.len() as u16 + 2, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" keys ")),
@@ -195,10 +249,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// Clickable header cells: (x_start, x_end, sort mode) for PORT/CPU/MEM.
 /// Accounts for the block border (1) and the always-reserved highlight
 /// symbol "▌ " (2), plus the default column spacing of 1.
-fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
+fn header_hits(area: Rect, cols: &[usize], colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
     let mut hits = Vec::new();
     let mut x = area.x + 1 + 2;
-    for (i, &w) in colw.iter().enumerate() {
+    for (&i, &w) in cols.iter().zip(colw) {
         let mode = match i {
             2 => Some(SortMode::Port),
             3 => Some(SortMode::Cpu),
@@ -216,8 +270,16 @@ fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
 fn footer_line(app: &App) -> Line<'static> {
     if app.is_filtering() {
         Line::styled(
-            format!("  /{}▏  (Enter: apply · Esc: clear)", app.filter),
+            format!(
+                "  /{}▏  Enter apply · Esc cancel · ↑↓ move · Ctrl-U clear",
+                app.filter
+            ),
             Style::new().fg(Color::Yellow),
+        )
+    } else if let Some(c) = &app.confirm {
+        Line::styled(
+            format!("  {}", c.prompt),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )
     } else if let Some(s) = &app.status {
         Line::styled(format!("  {s}"), Style::new().fg(Color::Yellow))
@@ -226,41 +288,80 @@ fn footer_line(app: &App) -> Line<'static> {
             format!("  ⚠ {w}"),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
-    } else if !app.filter.is_empty() {
-        Line::styled(
-            format!("  [filter: {}] · / edit · Esc clear · q quit", app.filter),
-            Style::new().fg(Color::DarkGray),
-        )
     } else {
         Line::styled(
-            "  j/k move · / filter · s sort · v by session · i inspect · K kill · ? help · q quit",
+            format!("  {}", key_hints(app)),
             Style::new().fg(Color::DarkGray),
         )
     }
 }
 
+/// The keys that do something on the selected row, most useful first.
+fn key_hints(app: &App) -> String {
+    let close = if app.log.is_some() || app.inspect {
+        "q close · "
+    } else {
+        ""
+    };
+    let keys = match &app.selected {
+        _ if app.held_placeholder().is_some() => "j/k move · ? help".to_string(),
+        Some(Entry::Group(g)) => {
+            let n = app.visible_members(g).len();
+            let fold = if app.collapsed.contains(g) {
+                "unfold"
+            } else {
+                "fold"
+            };
+            format!("Enter {fold} · X kill {n} · R restart {n} · o open · ? help")
+        }
+        Some(Entry::Agents) => "Enter fold/unfold · v by session · ? help".into(),
+        Some(Entry::Agent(_)) => {
+            "Enter jump · d diff · o open its server · i inspect · ? help".into()
+        }
+        Some(Entry::Member(_) | Entry::Target(_)) => {
+            "Enter inspect · o open · y copy · t logs · R restart · X kill · ? help".into()
+        }
+        None => "/ filter · v by session · ? help · q quit".into(),
+    };
+    format!("{close}{keys}")
+}
+
 fn detail_line(app: &App) -> Line<'static> {
+    if let Some(h) = app.held_placeholder() {
+        return Line::styled(
+            format!("  {} · {} · j/k to move on", h.label, h.state),
+            Style::new().fg(Color::Gray),
+        );
+    }
     match &app.selected {
         Some(Entry::Group(p)) => {
-            let members: Vec<&Target> = app.group_members(p);
+            let shown = app.visible_members(p).len();
+            let total = app
+                .group_members(p)
+                .into_iter()
+                .filter(|t| app.group_by == GroupBy::Session || !is_agent_service(t))
+                .count();
             let (cpu, mem) = group_usage(app, p);
             // In session view, name the session itself, not just its label.
             let who = match (app.group_by, app.group_launcher(p)) {
                 (GroupBy::Session, Some(l)) => format!("{} · ", l.describe()),
                 _ => String::new(),
             };
-            // The agent itself is never part of a kill.
-            let kill = if app.group_agents(p).is_empty() {
-                "K kills all"
+            // A filter narrows what the header acts on; the agent itself is
+            // never part of a kill.
+            let (count, kill) = if shown < total {
+                (
+                    format!("{shown} of {total} shown"),
+                    format!("X kills the {shown} shown"),
+                )
+            } else if app.group_agents(p).is_empty() {
+                (plural(shown, "server"), "X kills all".into())
             } else {
-                "K stops its servers"
+                (plural(shown, "server"), "X stops its servers".into())
             };
             Line::styled(
                 format!(
-                    "  {who}{} · {} services · {:.1}% · {} · {kill}",
-                    p,
-                    members.len(),
-                    cpu,
+                    "  {who}{p} · {count} · {cpu:.1}% · {} · {kill}",
                     fmt_mem(mem)
                 ),
                 Style::new().fg(Color::Gray),
@@ -508,7 +609,7 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
                 }
                 lines.push(Line::from(spans));
             }
-            for t in app.group_members(p).into_iter().take(5) {
+            for t in app.visible_members(p).into_iter().take(5) {
                 let port = t
                     .ports
                     .first()
@@ -520,12 +621,13 @@ fn inspect_panel(app: &App) -> Paragraph<'static> {
         }
         _ => vec![Line::from(" nothing selected")],
     };
-    Paragraph::new(lines).block(Block::bordered().title(" inspect — i / Esc to close "))
+    Paragraph::new(lines).block(Block::bordered().title(" inspect — i or q closes "))
 }
 
-/// A group's cpu/mem: its measurable targets plus (session view) its agent.
+/// A group's cpu/mem: its visible, measurable targets plus (session view)
+/// its agent.
 fn group_usage(app: &App, g: &str) -> (f32, u64) {
-    let members = app.group_members(g);
+    let members = app.visible_members(g);
     let measured = members.iter().filter(|t| !t.pids.is_empty());
     let agents = app.group_agents(g);
     (
@@ -536,10 +638,25 @@ fn group_usage(app: &App, g: &str) -> (f32, u64) {
     )
 }
 
-fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) -> Row<'static> {
+/// `3 servers`, `1 server`.
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A row's cells (all eight columns; the caller keeps the visible ones) and
+/// its style.
+fn entry_row(
+    entry: &Entry,
+    app: &App,
+    by_key: &HashMap<&TargetKey, &Target>,
+) -> (Vec<Cell<'static>>, Style) {
+    let none = Style::new();
     match entry {
         Entry::Group(p) => {
-            let n = app.group_members(p).len() + app.group_agents(p).len();
+            let n = app.visible_members(p).len() + app.group_agents(p).len();
+            if n == 0 {
+                return held_row(app);
+            }
             let (cpu, mem) = group_usage(app, p);
             let arrow = if app.collapsed.contains(p) {
                 "▸"
@@ -550,31 +667,46 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
                 (GroupBy::Session, Some(l)) => launcher_style(&l).add_modifier(Modifier::BOLD),
                 _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             };
-            Row::new(vec![
-                Cell::from(group_header_text(arrow, p, n, app.project_w)),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(format!("{cpu:.1}%")),
-                Cell::from(fmt_mem(mem)),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-            ])
-            .style(header_style)
+            (
+                vec![
+                    Cell::from(group_header_text(arrow, p, n, app.project_w)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(format!("{cpu:.1}%")),
+                    Cell::from(fmt_mem(mem)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ],
+                header_style,
+            )
         }
-        Entry::Member(k) => match by_key.get(k) {
-            Some(t) => target_row(t, true, app),
-            None => Row::new(Vec::<Cell>::new()),
-        },
-        Entry::Target(k) => match by_key.get(k) {
-            Some(t) => target_row(t, false, app),
-            None => Row::new(Vec::<Cell>::new()),
+        Entry::Member(k) | Entry::Target(k) => match by_key.get(k) {
+            Some(t) => target_row(t, matches!(entry, Entry::Member(_)), app),
+            None => held_row(app),
         },
         Entry::Agent(pid) => match app.snapshot.agents.iter().find(|a| a.pid == *pid) {
             Some(a) => agent_row(a, app),
-            None => Row::new(Vec::<Cell>::new()),
+            None => (Vec::new(), none),
         },
         Entry::Agents => agents_section_row(app),
+    }
+}
+
+/// The placeholder for a row marina just stopped or restarted:
+/// `client-portal · next dev   stopped`.
+fn held_row(app: &App) -> (Vec<Cell<'static>>, Style) {
+    let dim = Style::new().fg(Color::DarkGray);
+    match app.held_placeholder() {
+        Some(h) => (
+            vec![
+                Cell::from(ellipsize(&h.label, app.project_w as usize)),
+                Cell::from(h.state),
+                Cell::from("—"),
+            ],
+            dim.add_modifier(Modifier::ITALIC),
+        ),
+        None => (Vec::new(), dim),
     }
 }
 
@@ -591,7 +723,7 @@ fn agents_summary(app: &App) -> (usize, usize, f32, u64) {
 }
 
 /// `▸ agents (21)  2 working  …  14 stale` — the folded section header.
-fn agents_section_row(app: &App) -> Row<'static> {
+fn agents_section_row(app: &App) -> (Vec<Cell<'static>>, Style) {
     let (working, stale, cpu, mem) = agents_summary(app);
     let arrow = if app.agents_open { "▾" } else { "▸" };
     let n = app.snapshot.agents.len();
@@ -616,22 +748,26 @@ fn agents_section_row(app: &App) -> Row<'static> {
     } else {
         Span::raw("")
     };
-    Row::new(vec![
-        Cell::from(group_header_text(arrow, "agents", n, app.project_w)),
-        Cell::from(busy),
-        Cell::from(""),
-        Cell::from(format!("{cpu:.1}%")),
-        Cell::from(fmt_mem(mem)),
-        Cell::from(stale),
-        Cell::from(""),
-        Cell::from(""),
-    ])
-    .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+    (
+        vec![
+            Cell::from(group_header_text(arrow, "agents", n, app.project_w)),
+            Cell::from(busy),
+            Cell::from(""),
+            Cell::from(format!("{cpu:.1}%")),
+            Cell::from(fmt_mem(mem)),
+            Cell::from(stale),
+            Cell::from(""),
+            Cell::from(""),
+        ],
+        Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+    )
 }
 
 /// An agent session: under its group header when it has servers, else a row
-/// of its own named by its session label. COMMAND counts its live shells.
-fn agent_row(a: &Agent, app: &App) -> Row<'static> {
+/// of its own named by its session label. COMMAND says what it's doing; VIA
+/// stays "who started it", so where it lives (Enter's target) is in the
+/// detail line.
+fn agent_row(a: &Agent, app: &App) -> (Vec<Cell<'static>>, Style) {
     let label = app
         .agent_session_of
         .get(&a.pid)
@@ -646,8 +782,12 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
         launcher_style(&l)
     };
     let project = match app.group_by {
-        // under its session header, which already names it
-        GroupBy::Session if !app.group_members(&label).is_empty() => Cell::from("  ↳"),
+        // under its session header: the agent itself, marked apart from
+        // the servers beside it
+        GroupBy::Session if !app.visible_members(&label).is_empty() => Cell::from(Span::styled(
+            format!("  ◆ {}", a.name),
+            style.add_modifier(Modifier::BOLD),
+        )),
         GroupBy::Session => Cell::from(Span::styled(
             ellipsize(&label, app.project_w as usize),
             style,
@@ -677,26 +817,22 @@ fn agent_row(a: &Agent, app: &App) -> Row<'static> {
     } else {
         Span::styled(activity, Style::new().fg(Color::DarkGray))
     };
-    let row = Row::new(vec![
+    let dash = || Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray)));
+    let cells = vec![
         project,
         Cell::from(command),
-        Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
+        dash(),
         Cell::from(format!("{:.1}%", a.cpu_pct)),
         Cell::from(fmt_mem(a.mem_bytes)),
-        // where it lives, i.e. where Enter goes (the session id is in the
-        // detail line and `i`)
-        Cell::from(match &a.host {
-            Some(h) => Span::raw(h.short()),
-            None => Span::styled("—", Style::new().fg(Color::DarkGray)),
-        }),
+        dash(),
         Cell::from(fmt_uptime(a.start_time)),
         branch_cell(a),
-    ]);
+    ];
     // idle for days: dim the whole row, it's the one to go close
     if stale {
-        row.style(Style::new().fg(Color::DarkGray))
+        (cells, Style::new().fg(Color::DarkGray))
     } else {
-        row
+        (cells, Style::new())
     }
 }
 
@@ -793,7 +929,7 @@ fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'stat
         a.git_branch.as_deref().unwrap_or("—")
     );
     if let Some(g) = &a.git {
-        cwd.push_str(&format!(" · {} · D shows the diff", g.describe()));
+        cwd.push_str(&format!(" · {} · d shows the diff", g.describe()));
     }
     let state = match a.tty {
         Some(t) => format!(
@@ -859,7 +995,7 @@ fn agent_inspect(a: &Agent, app: &App, key: Style, val: Style) -> Vec<Line<'stat
     lines
 }
 
-fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
+fn target_row(t: &Target, indent: bool, app: &App) -> (Vec<Cell<'static>>, Style) {
     let dying = app.is_dying(&t.key);
     let flashing = app.is_flashing(&t.key);
     let port = match t.ports.first() {
@@ -870,6 +1006,12 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
     let project_text = if let Some(agent) = service.filter(|_| !indent) {
         // beside the agents section: whose server it is
         format!("{agent} server")
+    } else if indent && app.group_by == GroupBy::Session {
+        // a session spans projects: say whose server each one is
+        format!(
+            "  {}",
+            ellipsize(&t.project, (app.project_w as usize).saturating_sub(2))
+        )
     } else if indent {
         "  ↳".to_string()
     } else {
@@ -896,6 +1038,7 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
     // row — categorize it without making it look dead. Containers likewise.
     let tag = infra_tag(&t.command_label).or(t.container.is_some().then_some("docker"));
     let command = match tag {
+        _ if dying => Cell::from("stopping…"),
         Some(tag) => Cell::from(Line::from(vec![
             Span::raw(t.command_label.clone()),
             Span::styled(format!(" ·{tag}"), Style::new().fg(Color::DarkGray)),
@@ -911,7 +1054,7 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
     } else {
         Cell::from(port)
     };
-    let row = Row::new(vec![
+    let cells = vec![
         project,
         command,
         port_cell,
@@ -923,15 +1066,14 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
         },
         Cell::from(fmt_uptime(t.anchor.start_time)),
         Cell::from(t.git_branch.clone().unwrap_or_else(|| "—".into())),
-    ]);
+    ];
     if dying {
-        row.style(
-            Style::new()
-                .fg(Color::Red)
-                .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+        (
+            cells,
+            Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
         )
     } else {
-        row
+        (cells, Style::new())
     }
 }
 
@@ -945,7 +1087,6 @@ fn infra_tag(label: &str) -> Option<&'static str> {
     }
 }
 
-/// How many columns fit: full set, or drop BRANCH (then UP) on narrow panes.
 /// `▾ label (n)` sized to the PROJECT column: a long label is cut with `…`
 /// so the member count always stays visible.
 fn group_header_text(arrow: &str, label: &str, n: usize, width: u16) -> String {
@@ -963,21 +1104,25 @@ fn ellipsize(s: &str, room: usize) -> String {
     format!("{cut}…")
 }
 
-/// Column widths for a table `width` wide showing `cols` columns: the
+/// Column widths for a table `width` wide showing columns `cols`: the
 /// minimums in `COLW`, with spare room going to PROJECT (long session
 /// labels) and then BRANCH, so a wide terminal doesn't cut names short.
-fn column_widths(width: u16, cols: usize) -> Vec<u16> {
-    let mut w = COLW[..cols].to_vec();
-    // borders (2), highlight symbol (2), one space between columns
-    let used = 4 + w.iter().sum::<u16>() + cols.saturating_sub(1) as u16;
-    let mut spare = width.saturating_sub(used);
+fn column_widths(width: u16, cols: &[usize]) -> Vec<u16> {
+    let mut w: Vec<u16> = cols.iter().map(|&c| COLW[c]).collect();
+    let mut spare = width.saturating_sub(table_width(cols));
     let grow = spare.min(PROJECT_MAX - COLW[0]);
     w[0] += grow;
     spare -= grow;
-    if cols == COLW.len() {
-        w[cols - 1] += spare.min(BRANCH_MAX - COLW[cols - 1]);
+    if let Some(b) = cols.iter().position(|&c| c == BRANCH) {
+        w[b] += spare.min(BRANCH_MAX - COLW[BRANCH]);
     }
     w
+}
+
+/// The width columns `cols` need at their minimums: borders (2), the
+/// highlight gutter (2), and one space between columns.
+fn table_width(cols: &[usize]) -> u16 {
+    4 + cols.iter().map(|&c| COLW[c]).sum::<u16>() + cols.len().saturating_sub(1) as u16
 }
 
 /// Agents stand out (an orphan — its session ended — in yellow); editors and
@@ -991,53 +1136,60 @@ fn launcher_style(l: &Launcher) -> Style {
     }
 }
 
-/// Columns that fit: each needs its width + 1 spacing, plus borders and the
-/// highlight gutter (4).
-fn visible_columns(width: u16) -> usize {
-    if width >= 107 {
-        8
-    } else if width >= 91 {
-        7
-    } else if width >= 84 {
-        6
-    } else {
-        5
-    }
+/// The columns that fit, by index: all of them, or without UP, then
+/// BRANCH, then VIA — so who started a server is the last thing to go.
+fn visible_columns(width: u16) -> Vec<usize> {
+    const SETS: [&[usize]; 4] = [
+        &[0, 1, 2, 3, 4, 5, 6, 7],
+        &[0, 1, 2, 3, 4, 5, 7],
+        &[0, 1, 2, 3, 4, 5],
+        &[0, 1, 2, 3, 4],
+    ];
+    SETS.iter()
+        .find(|cols| table_width(cols) <= width)
+        .unwrap_or(&SETS[3])
+        .to_vec()
 }
+
+/// The help overlay's width: it fits a 60-column terminal.
+const HELP_W: u16 = 58;
 
 fn help_lines() -> Vec<Line<'static>> {
     let key = Style::new().fg(Color::Cyan);
     let dim = Style::new().fg(Color::DarkGray);
     let row = |k: &str, d: &str| {
         Line::from(vec![
-            Span::styled(format!("  {k:<11}"), key),
+            Span::styled(format!(" {k:<13}"), key),
             Span::styled(d.to_string(), dim),
         ])
     };
     vec![
         Line::from(""),
-        row("j / k", "move (mouse: click, wheel)"),
-        row("g / G", "top / bottom"),
-        row("Enter", "fold / unfold group · on an agent: jump to it"),
-        row("D", "uncommitted diff of the agent / server's tree"),
-        row("i", "inspect selection"),
-        row("s", "cycle sort (port/cpu/mem) — or click a header"),
-        row(
-            "/",
-            "filter (project · command · port · cwd · branch · via)",
-        ),
-        row("v", "group by project / agent session (lists agents)"),
-        row("K · u", "kill · cancel force-kill"),
-        row("R", "restart (output captured to a log)"),
-        row("T", "tail logs"),
-        row("[ · ]", "scroll logs · +/- resize"),
-        row("Y · O", "copy URL · open (on a session: its server)"),
-        row("Esc", "close pane / clear filter"),
-        row("? · q", "this help · quit (also Ctrl+C)"),
+        row("j k ↑ ↓", "move (mouse: click, wheel)"),
+        row("g G Home End", "top · bottom"),
+        row("^d ^u PgDn", "half a page · a page"),
+        row("h l ← →", "fold · unfold · h: up to the header"),
+        row("Enter", "fold · inspect a server · jump to"),
+        row("", "an agent's pane (click again: same)"),
+        row("i", "inspect"),
+        row("t · d", "log · uncommitted diff, in a pane"),
+        row("[ ] + -", "scroll · resize the pane"),
+        row("y · o", "copy URL · open it (on a session or"),
+        row("", "group: its servers in turn)"),
+        row("X", "kill (again: force-kill)"),
+        row("R", "restart, output captured to a log"),
+        row("", "X and R on a group ask first"),
+        row("/", "filter: name, command, port, dir,"),
+        row("", "branch, who started it (/claude, /ended)"),
+        row("s · S", "sort port/cpu/mem · reverse"),
+        row("v", "group by project ↔ who started them"),
+        row("Esc", "close pane · inspect · clear filter"),
+        row("q · ^C", "close pane, else quit · quit"),
+        row("Shift-drag", "select text (Option-drag: iTerm2)"),
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                "  marina v{} · config: {}",
+                " marina v{} · config: {}",
                 env!("CARGO_PKG_VERSION"),
                 crate::config::config_path()
                     .map(|p| tildify(&p.display().to_string()))
@@ -1052,7 +1204,7 @@ fn help_lines() -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Snapshot;
+    use crate::model::{Snapshot, TargetKey};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::Arc;
 
@@ -1084,7 +1236,68 @@ mod tests {
     #[test]
     fn render_empty_shows_hint() {
         let out = render_to_string(&mut App::new(), 100, 12);
-        assert!(out.contains("No dev processes detected"));
+        assert!(
+            out.contains("scanning…"),
+            "before the first snapshot: {out}"
+        );
+        let mut app = App::new();
+        let mut snap = Snapshot::empty();
+        snap.seq = 1;
+        app.apply(Arc::new(snap));
+        assert!(render_to_string(&mut app, 100, 12).contains("No dev servers detected"));
+    }
+
+    #[test]
+    fn a_filter_with_no_matches_says_how_to_clear_it() {
+        let mut app = app_with_sample();
+        app.filter = "zz".into();
+        let out = render_to_string(&mut app, 100, 12);
+        assert!(out.contains("No servers match the filter") && out.contains("Esc clears it"));
+        assert!(
+            out.contains("filter:zz"),
+            "the title names the filter: {out}"
+        );
+    }
+
+    #[test]
+    fn a_failed_scan_shows_in_the_body() {
+        let mut app = App::new();
+        let mut snap = Snapshot::empty();
+        snap.seq = 1;
+        snap.error = Some("port scan failed: boom".into());
+        app.apply(Arc::new(snap));
+        let out = render_to_string(&mut app, 100, 12);
+        assert!(out.contains("⚠ port scan failed: boom"), "{out}");
+    }
+
+    #[test]
+    fn panes_never_squeeze_the_table_out_on_a_normal_terminal() {
+        let mut app = app_with_sample();
+        app.inspect = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.open_log(
+            "x".into(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let _ = render_to_string(&mut app, 80, 24);
+        assert!(app.page_rows >= 3, "{}", app.page_rows);
+        let out = render_to_string(&mut app, 80, 12);
+        assert_eq!(app.page_rows, 0);
+        assert!(out.contains("table hidden"), "{out}");
+    }
+
+    #[test]
+    fn the_footer_offers_the_keys_for_the_row() {
+        let mut app = app_with_sample();
+        app.selected = Some(Entry::Group("client-portal".into()));
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(out.contains("X kill 2 · R restart 2"), "{out}");
+        app.selected = Some(Entry::Target(TargetKey::Port(8000)));
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(out.contains("Enter inspect · o open"), "{out}");
+        app.ask(super::super::state::Verb::Kill, "kill 2 servers?".into());
+        assert!(render_to_string(&mut app, 120, 20).contains("kill 2 servers?"));
     }
 
     #[test]
@@ -1094,7 +1307,7 @@ mod tests {
         assert!(out.contains("next dev") && out.contains("postgres")); // members
         assert!(out.contains("billing-api") && out.contains(":3000")); // a single + a port
         assert!(out.contains("PROJECT") && out.contains("COMMAND")); // header row
-        assert!(out.contains("j/k move")); // footer keymap
+        assert!(out.contains("? help")); // footer keymap
         assert!(out.contains('▾')); // expanded-group arrow
     }
 
@@ -1136,21 +1349,32 @@ mod tests {
 
     #[test]
     fn spare_width_goes_to_project_then_branch() {
-        assert_eq!(column_widths(107, 8), COLW.to_vec(), "no spare room");
-        let w = column_widths(140, 8);
-        assert_eq!((w[0], w[7]), (36, 34));
-        let w = column_widths(300, 8);
+        let all: Vec<usize> = (0..8).collect();
+        assert_eq!(column_widths(101, &all), COLW.to_vec(), "no spare room");
+        let w = column_widths(140, &all);
+        assert_eq!((w[0], w[7]), (36, 36));
+        let w = column_widths(300, &all);
         assert_eq!((w[0], w[7]), (PROJECT_MAX, BRANCH_MAX));
-        assert_eq!(column_widths(91, 7)[0], 22);
-        assert_eq!(column_widths(97, 7)[0], 28, "narrow panes grow PROJECT too");
+        let no_up = [0, 1, 2, 3, 4, 5, 7];
+        assert_eq!(column_widths(94, &no_up)[0], 18);
+        assert_eq!(
+            column_widths(100, &no_up)[0],
+            24,
+            "narrow panes grow PROJECT too"
+        );
     }
 
     #[test]
-    fn visible_columns_drop_from_the_right_when_narrow() {
-        assert_eq!(visible_columns(120), 8);
-        assert_eq!(visible_columns(95), 7);
-        assert_eq!(visible_columns(85), 6);
-        assert_eq!(visible_columns(60), 5);
+    fn narrow_panes_drop_up_then_branch_then_via() {
+        assert_eq!(visible_columns(120).len(), 8);
+        assert!(!visible_columns(96).contains(&6), "UP goes first");
+        assert!(visible_columns(96).contains(&BRANCH));
+        assert_eq!(
+            visible_columns(80),
+            vec![0, 1, 2, 3, 4, 5],
+            "VIA fits 80 columns"
+        );
+        assert_eq!(visible_columns(60).len(), 5);
     }
 
     #[test]
@@ -1159,8 +1383,8 @@ mod tests {
         app.toggle_help();
         let out = render_to_string(&mut app, 120, 28);
         assert!(out.contains("keys"));
-        assert!(out.contains("fold / unfold"));
-        assert!(out.contains("tail logs"));
+        assert!(out.contains("force-kill"));
+        assert!(out.contains("Shift-drag"));
         assert!(out.contains(env!("CARGO_PKG_VERSION")));
         assert!(out.contains("config:"));
     }
@@ -1298,12 +1522,15 @@ mod tests {
         );
         assert!(out.contains("3 files +40 −2 · 1 untracked · 2 unpushed"));
         assert!(out.contains("Enter jumps (herdr·ghostty)"), "{out}");
-        assert!(out.contains("herdr·ghostty"), "where it lives, in VIA");
+        assert!(
+            !out.contains("VIA") || out.contains("—"),
+            "VIA is who started it"
+        );
 
         app.toggle_inspect();
         let out = render_to_string(&mut app, 160, 30);
         assert!(out.contains("herdr pane w2S:p1 in Ghostty · Enter jumps there"));
-        assert!(out.contains("D shows the diff"));
+        assert!(out.contains("d shows the diff"));
     }
 
     #[test]
@@ -1312,7 +1539,7 @@ mod tests {
         assert_eq!(t.chars().count(), COLW[0] as usize);
         assert!(t.ends_with("… (3)"), "{t}");
         assert_eq!(
-            group_header_text("▾", "client-portal", 2, COLW[0]),
+            group_header_text("▾", "client-portal", 2, 22),
             "▾ client-portal (2)"
         );
     }
@@ -1321,7 +1548,8 @@ mod tests {
     fn narrow_pane_drops_the_branch_column() {
         let mut app = app_with_sample();
         assert!(render_to_string(&mut app, 120, 20).contains("BRANCH"));
-        assert!(!render_to_string(&mut app, 64, 20).contains("BRANCH"));
+        let out = render_to_string(&mut app, 80, 20);
+        assert!(!out.contains("BRANCH") && out.contains("VIA"), "{out}");
     }
 
     #[test]
@@ -1410,7 +1638,7 @@ mod tests {
         let mut app = app_with_sample();
         app.open_log("test.log".into(), rx, Arc::new(AtomicBool::new(false)));
         let out = render_to_string(&mut app, 120, 30);
-        assert!(out.contains("logs: test.log"));
+        assert!(out.contains("log: test.log"));
         assert!(out.contains("[ ] scroll"));
     }
 }

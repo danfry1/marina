@@ -95,7 +95,7 @@
   var runs = {
     ls: function () {
       var rows = here();
-      if (!rows.length) return line("marina ls", ["no dev targets running"]);
+      if (!rows.length) return line("marina ls", ["no dev servers running"]);
       line("marina ls", ['<span class="o">' + pad("PROJECT", 9) + pad("COMMAND", 10) + pad("PORT", 8) + pad("CPU", 6) + pad("MEM", 7) + "VIA</span>"]
         .concat(rows.map(function (s) {
           var t = pad(s.project, 9) + pad(s.cmd, 10) + pad(":" + s.port + (s.lan ? "!" : ""), 8) + pad(s.cpu, 6) + pad(s.mem, 7) + s.via;
@@ -107,10 +107,11 @@
       flash(s);
       line("marina who 3000", [esc(":3000  checkout · next dev · pid " + s.pid + " · up 2h · saved-cards · ~/dev/checkout")]);
     },
-    orphaned: function () {
+    ended: function () {
       var lost = here().filter(function (s) { return s.orphan; });
-      if (!lost.length) return line("marina kill --orphaned", ["no dev targets match"]);
-      line("marina kill --orphaned", lost.map(function (s) { return "killing " + s.project + " :" + s.port + " (3 pids)"; }));
+      if (!lost.length) return line("marina kill --ended", ["nothing to kill (no servers left running by ended agent sessions)"]);
+      line("marina kill --ended", lost.map(function (s) { return "stopping " + s.project + " · " + s.cmd + " :" + s.port; })
+        .concat(["stopped " + lost.length + " server" + (lost.length === 1 ? "" : "s")]));
       lost.forEach(sink);
     },
     free: function () {

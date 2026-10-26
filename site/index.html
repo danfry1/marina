@@ -470,7 +470,7 @@
       </div>
       <div class="window">
         <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i><span>~ marina demo</span><span class="demo-tag">live demo, try the keys</span><span class="live-hint">keys go to marina</span></div>
-        <div id="demo" class="demo" tabindex="0" role="application" aria-label="marina demo: click, then use j and k to move, K to kill, R to restart, T for logs, v to group by agent session and Enter to fold or jump">
+        <div id="demo" class="demo" tabindex="0" role="application" aria-label="marina demo: click, then use j and k to move, X to kill, R to restart, t for logs, v to group by agent session and Enter to fold or jump">
           <textarea id="demo-keys" class="demo-keys" tabindex="-1" aria-label="marina demo keys" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
           <div id="demo-screen" class="demo-screen"></div>
         </div>
@@ -480,9 +480,9 @@
         <div class="keycaps">
           <button type="button" data-key="j"><b>j</b><i>down</i></button>
           <button type="button" data-key="k"><b>k</b><i>up</i></button>
-          <button type="button" data-key="K"><b>K</b><i>kill</i></button>
+          <button type="button" data-key="X"><b>X</b><i>kill</i></button>
           <button type="button" data-key="R"><b>R</b><i>restart</i></button>
-          <button type="button" data-key="T"><b>T</b><i>logs</i></button>
+          <button type="button" data-key="t"><b>t</b><i>logs</i></button>
           <button type="button" data-key="v"><b>v</b><i>by session</i></button>
           <button type="button" data-key="Enter"><b>Enter</b><i>fold · jump</i></button>
           <button type="button" data-key="?"><b>?</b><i>keys</i></button>
@@ -502,7 +502,7 @@
       </div>
       <div class="harbour-ctl run">
         <button type="button" data-run="ls">marina ls</button>
-        <button type="button" data-run="orphaned">marina kill --orphaned</button>
+        <button type="button" data-run="ended">marina kill --ended</button>
         <button type="button" data-run="free">marina free 6006</button>
         <button type="button" class="reset" data-run="reset">Reset</button>
         <pre id="harbour-out" aria-live="polite"></pre>
@@ -535,10 +535,10 @@ killing checkout :3142 (3 pids)</pre>
   <section class="wrap" aria-labelledby="more-title">
     <h2 id="more-title">And the small things.</h2>
     <div class="more-grid">
-      <div><h3>Logs, inline</h3><p><code>T</code> tails a server's output, and <code>R</code> restarts it with the output captured.</p></div>
+      <div><h3>Logs, inline</h3><p><code>t</code> tails a server's output, and <code>R</code> restarts it with the output captured.</p></div>
       <div><h3>LAN warnings</h3><p>A server bound to <code>0.0.0.0</code> shows <code>:3000!</code>, so you know it's reachable from the network.</p></div>
       <div><h3>Crash notices</h3><p>If a long-running server dies without you killing it, marina says so.</p></div>
-      <div><h3>Docker too</h3><p>Published container ports sit with their project; <code>K</code> and <code>R</code> use the docker CLI.</p></div>
+      <div><h3>Docker too</h3><p>Published container ports sit with their project; <code>X</code> and <code>R</code> use the docker CLI.</p></div>
     </div>
   </section>
 

@@ -1,9 +1,11 @@
 //! First-class verbs on the selected target. See DESIGN.md "Verbs".
 //!
-//! kill: fingerprint-verified SIGTERM now, SIGKILL escalation after a grace
-//! period (`u` cancels the escalation — the SIGTERM itself is already gone,
-//! and the UI wording says so honestly). Signals go through `libc::kill`
-//! directly, so EPERM ("not your process") is reported instead of vanishing.
+//! kill: fingerprint-verified SIGTERM. In the TUI escalation is explicit —
+//! a server still running after [`GRACE`] is reported, and `X` again sends
+//! SIGKILL — so a slow, clean shutdown (postgres waiting on clients) is never
+//! cut short. The one-shot CLI escalates by itself after `--grace`. Signals
+//! go through `libc::kill` directly, so EPERM ("not your process") is
+//! reported instead of vanishing.
 //! restart: verified kill → wait for the port to actually free → re-exec with
 //! stdout/stderr captured to a marina log file, and an early-exit watchdog.
 //! Docker targets: `docker stop` / `docker restart` (see `docker.rs`).
@@ -13,9 +15,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,7 @@ use crate::msg::{SamplerCtl, UiEvent};
 /// `(pid, start_time)` — the identity fingerprint carried on every Target.
 pub type PidStart = (u32, u64);
 
-/// How long SIGTERM gets before the SIGKILL escalation.
+/// How long SIGTERM gets before the TUI says a server is still running.
 pub const GRACE: Duration = Duration::from_secs(4);
 
 // --- signalling -------------------------------------------------------------
@@ -97,53 +97,89 @@ fn start_times(pids: &[u32]) -> HashMap<u32, u64> {
 
 // --- kill -------------------------------------------------------------------
 
-/// Verified SIGTERM now; SIGKILL escalation after [`GRACE`] unless the returned
-/// cancel flag is set first (`u`). Runs entirely off the UI thread except the
-/// initial signal burst. Errs when every pid already exited or was recycled.
+/// Verified SIGTERM now. If anything is still running after [`GRACE`], the
+/// status line says so and names the key that force-kills it; nothing is
+/// escalated on its own. Errs when every pid already exited or was recycled.
 pub fn kill(
     pid_starts: Vec<PidStart>,
+    label: String,
     events: Sender<UiEvent>,
     ctl: Sender<SamplerCtl>,
-) -> Result<Arc<AtomicBool>, String> {
+) -> Result<(), String> {
     let fresh = verified(&pid_starts);
     if fresh.is_empty() {
         return Err("already exited".into());
     }
     report_denied(&signal_tree(&fresh, libc::SIGTERM), &events);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&cancel);
     thread::spawn(move || {
         thread::sleep(GRACE);
-        if !flag.load(Ordering::SeqCst) {
-            let stragglers = verified(&pid_starts);
-            if !stragglers.is_empty() {
-                signal_tree(&stragglers, libc::SIGKILL);
-                let n = stragglers.len();
-                let _ = events.send(UiEvent::Status(format!(
-                    "force-killed {n} straggler{}",
-                    if n == 1 { "" } else { "s" }
-                )));
-            }
+        if !verified(&pid_starts).is_empty() {
+            let _ = events.send(UiEvent::Status(format!(
+                "X again to force-kill {label} (still running after {}s)",
+                GRACE.as_secs()
+            )));
         }
         let _ = ctl.send(SamplerCtl::Refresh);
     });
-    Ok(cancel)
+    Ok(())
+}
+
+/// `X` on a server that's still stopping: verified SIGKILL now.
+pub fn force_kill(
+    pid_starts: Vec<PidStart>,
+    label: String,
+    events: Sender<UiEvent>,
+    ctl: Sender<SamplerCtl>,
+) {
+    thread::spawn(move || {
+        let out = signal_tree(&verified(&pid_starts), libc::SIGKILL);
+        report_denied(&out, &events);
+        if out.denied.is_empty() {
+            let _ = events.send(UiEvent::Status(format!("force-killed {label}")));
+        }
+        let _ = ctl.send(SamplerCtl::Refresh);
+    });
+}
+
+/// What [`kill_blocking`] did, per pid.
+#[derive(Default, Debug)]
+pub struct KillReport {
+    /// Not ours to signal (EPERM).
+    pub denied: Vec<u32>,
+    /// Still running after the grace period, so sent SIGKILL.
+    pub forced: Vec<u32>,
+    /// Still running even after SIGKILL.
+    pub survivors: Vec<u32>,
 }
 
 /// Synchronous verified SIGTERM → wait → verified SIGKILL, for the one-shot
 /// CLI. Returns as soon as everything has exited; only processes still alive
-/// after `grace` are force-killed. Returns (terminated, force-killed) counts.
-pub fn kill_blocking(pid_starts: &[PidStart], grace: Duration) -> (usize, usize) {
+/// after `grace` are force-killed.
+pub fn kill_blocking(pid_starts: &[PidStart], grace: Duration) -> KillReport {
     let fresh = verified(pid_starts);
-    signal_tree(&fresh, libc::SIGTERM);
+    let mut denied = signal_tree(&fresh, libc::SIGTERM).denied;
     let deadline = Instant::now() + grace;
     let mut stragglers = verified(pid_starts);
     while !stragglers.is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
         stragglers = verified(pid_starts);
     }
-    signal_tree(&stragglers, libc::SIGKILL);
-    (fresh.len(), stragglers.len())
+    stragglers.retain(|p| !denied.contains(p));
+    let out = signal_tree(&stragglers, libc::SIGKILL);
+    denied.extend(out.denied);
+    // SIGKILL can't be ignored, but it isn't instant
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut survivors = verified(pid_starts);
+    while !survivors.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        survivors = verified(pid_starts);
+    }
+    survivors.retain(|p| !denied.contains(p));
+    KillReport {
+        denied,
+        forced: stragglers,
+        survivors,
+    }
 }
 
 fn report_denied(out: &SignalOutcome, events: &Sender<UiEvent>) {
@@ -163,11 +199,13 @@ pub struct RestartPlan {
     pub cwd: std::path::PathBuf,
     pub ports: Vec<u16>,
     pub pid_starts: Vec<PidStart>,
+    /// Say, once, that the new process doesn't get the old one's environment.
+    pub note_env: bool,
 }
 
 /// Kill the subtree (verified), wait until the ports actually free (escalating
 /// to SIGKILL if SIGTERM is ignored), then re-exec the captured command in its
-/// cwd with stdout/stderr captured to marina's log file — so `T` always works
+/// cwd with stdout/stderr captured to marina's log file — so `t` always works
 /// on anything marina has restarted. An immediate crash is reported instead of
 /// vanishing silently. Runs off the UI thread.
 pub fn restart(plan: RestartPlan, events: Sender<UiEvent>, ctl: Sender<SamplerCtl>) {
@@ -192,10 +230,14 @@ pub fn restart(plan: RestartPlan, events: Sender<UiEvent>, ctl: Sender<SamplerCt
         let log = crate::logs::state_log_path(&plan.project);
         match respawn(&plan.argv, &plan.cwd, log.as_deref()) {
             Ok(child) => {
-                let _ = events.send(UiEvent::Status(format!(
-                    "restarted {} — output captured (T to tail)",
-                    plan.project
-                )));
+                let _ = events.send(UiEvent::Status(if plan.note_env {
+                    format!(
+                        "t shows its output · restarted {} without its original environment",
+                        plan.project
+                    )
+                } else {
+                    format!("t shows its output · restarted {}", plan.project)
+                }));
                 let _ = ctl.send(SamplerCtl::Refresh);
                 watch_child(child, plan.project, events);
             }
@@ -237,13 +279,13 @@ fn watch_child(mut child: Child, project: String, events: Sender<UiEvent>) {
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "unknown".into());
         let _ = events.send(UiEvent::Status(format!(
-            "restart {project} crashed on startup ({what}) — T for its log"
+            "t for its log · restart {project} crashed on startup ({what})"
         )));
     }
 }
 
 /// Spawn a captured command, detached, in its cwd. With a `log` path, stdout
-/// and stderr are appended there (the marina-capture file `T` discovers).
+/// and stderr are appended there (the marina-capture file `t` discovers).
 pub fn respawn(argv: &[String], cwd: &Path, log: Option<&Path>) -> std::io::Result<Child> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(cwd).stdin(Stdio::null());

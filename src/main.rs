@@ -30,25 +30,25 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
+use crate::model::TargetKey;
 use crate::msg::{SamplerCtl, SamplerMsg, UiEvent};
+use crate::ui::{Entry, Verb};
 
 fn main() -> io::Result<()> {
-    // Headless smoke test: build a couple of snapshots and print them. Useful
-    // for verifying the data layer without a TTY.
-    if std::env::args().any(|a| a == "--dump") {
-        return dump();
-    }
-    if let Some(pos) = std::env::args().position(|a| a == "--logtest") {
-        let pids: Vec<u32> = std::env::args()
-            .skip(pos + 1)
-            .filter_map(|a| a.parse().ok())
-            .collect();
-        return logtest(pids);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Hidden debug commands, only in first position — anywhere else they're
+    // unknown flags like any other. `--dump`: build a couple of snapshots and
+    // print them, to check the data layer without a TTY.
+    match args.first().map(String::as_str) {
+        Some("--dump") => return dump(),
+        Some("--logtest") => {
+            return logtest(args[1..].iter().filter_map(|a| a.parse().ok()).collect());
+        }
+        _ => {}
     }
 
-    // CLI subcommands (ls/kill/restart/url/version/help). Unknown args error
+    // CLI subcommands (ls, kill, …, demo, version, help). Unknown args error
     // there rather than falling through; only a bare `marina` reaches the TUI.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let demo = args.first().is_some_and(|a| a == "demo");
     if demo && args.len() > 1 {
         eprintln!("marina: demo takes no arguments");
@@ -115,60 +115,84 @@ fn run(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     // Ctrl+C always quits, whatever mode we're in.
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
+                    if ctrl && key.code == KeyCode::Char('c') {
                         return Ok(());
                     }
                     if app.help_open() {
                         // Any key dismisses the help overlay.
                         app.close_help();
+                    } else if app.confirm.is_some() {
+                        on_confirm_key(app, key.code, &ev_tx, &ctl);
                     } else if app.is_filtering() {
-                        // Filter input mode captures keystrokes.
+                        // Filter input mode captures keystrokes; the arrows
+                        // move through what it leaves.
                         match key.code {
                             KeyCode::Esc => app.filter_cancel(),
                             KeyCode::Enter => app.filter_commit(),
                             KeyCode::Backspace => app.filter_backspace(),
-                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.filter_push(c)
-                            }
+                            KeyCode::Up => app.select_prev(),
+                            KeyCode::Down => app.select_next(),
+                            KeyCode::Char('u') if ctrl => app.filter_clear_input(),
+                            KeyCode::Char(c) if !ctrl => app.filter_push(c),
+                            _ => {}
+                        }
+                    } else if ctrl {
+                        match key.code {
+                            KeyCode::Char('d') => app.half_page(true),
+                            KeyCode::Char('u') => app.half_page(false),
                             _ => {}
                         }
                     } else {
                         match key.code {
+                            // a pane open: q closes it, like less or a pager
+                            KeyCode::Char('q') if app.close_top() => {}
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                            KeyCode::Char('g') => app.jump_top(),
-                            KeyCode::Char('G') => app.jump_bottom(),
-                            KeyCode::Enter if app.selected_agent().is_some() => {
-                                verb_jump(app, &ev_tx)
-                            }
-                            KeyCode::Enter => app.toggle_collapse(),
-                            KeyCode::Char('D') => verb_diff(app),
+                            KeyCode::Char('g') | KeyCode::Home => app.jump_top(),
+                            KeyCode::Char('G') | KeyCode::End => app.jump_bottom(),
+                            KeyCode::PageDown if app.log_open() => app.log_page(true),
+                            KeyCode::PageUp if app.log_open() => app.log_page(false),
+                            KeyCode::PageDown => app.page(true),
+                            KeyCode::PageUp => app.page(false),
+                            KeyCode::Char('h') | KeyCode::Left => app.fold_or_parent(),
+                            KeyCode::Char('l') | KeyCode::Right => app.set_fold(true),
+                            KeyCode::Enter => on_enter(app, &ev_tx),
+                            KeyCode::Char('d') => verb_diff(app),
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
+                            KeyCode::Char('S') => app.reverse_sort(),
                             KeyCode::Char('i') => app.toggle_inspect(),
                             KeyCode::Char('v') => app.toggle_group_by(),
                             KeyCode::Char('?') => app.toggle_help(),
-                            KeyCode::Char('K') => verb_kill(app, &ev_tx, &ctl),
-                            KeyCode::Char('u') => app.undo_kill(),
-                            KeyCode::Char('R') => verb_restart(app, &ev_tx, &ctl),
-                            KeyCode::Char('Y') => verb_copy(app),
-                            KeyCode::Char('O') => verb_open(app),
-                            KeyCode::Char('T') => verb_tail(app, &ev_tx),
+                            KeyCode::Char('X') => verb_kill(app, &ev_tx, &ctl, false),
+                            KeyCode::Char('R') => verb_restart(app, &ev_tx, &ctl, false),
+                            KeyCode::Char('y') => verb_copy(app),
+                            KeyCode::Char('o') => verb_open(app),
+                            KeyCode::Char('t') => verb_tail(app, &ev_tx),
                             KeyCode::Char('[') => app.log_scroll_up(5),
                             KeyCode::Char(']') => app.log_scroll_down(5),
                             KeyCode::Char('+') | KeyCode::Char('=') => app.log_grow(),
                             KeyCode::Char('-') => app.log_shrink(),
                             // Esc: close log pane → inspect → clear filter.
                             KeyCode::Esc => app.escape(),
+                            // a habit from another tool shouldn't do nothing
+                            // silently
+                            KeyCode::Char(c @ ('K' | 'x')) => app.set_status(format!(
+                                "{c} isn't a key here — X (Shift-x) kills · ? lists them"
+                            )),
+                            KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                                app.set_status(format!("{c} isn't a key here · ? lists them"))
+                            }
                             _ => {}
                         }
                     }
                 }
-                Event::Mouse(m) => app.on_mouse(m),
+                // clicking the selected row again does what Enter does
+                Event::Mouse(m) if app.on_mouse(m) => on_enter(app, &ev_tx),
+                Event::Mouse(_) => {}
                 Event::Resize(_, _) => app.dirty = true,
                 _ => {}
             }
@@ -202,7 +226,7 @@ fn run(
             }
         }
 
-        // New log lines; expire status / kill-undo window / row flashes.
+        // New log lines; expire status / held rows / row flashes.
         app.pump_log();
         app.tick();
     }
@@ -279,21 +303,91 @@ fn logtest(pids: Vec<u32>) -> io::Result<()> {
 
 // --- verbs (orchestrated here; the work runs off the UI thread) --------------
 
-/// Verbs act on targets only. On an agent-session row, say why nothing
-/// happens instead of a bare "nothing to kill": marina never stops an agent.
+/// Verbs act on servers only. On an agent row or the agents section, say
+/// why nothing happens instead of a bare "nothing to kill": marina never
+/// stops an agent.
 fn on_agent_row(app: &mut ui::App, verb: &str) -> bool {
-    let Some(a) = app.selected_agent() else {
-        return false;
-    };
-    let msg = match verb {
-        "kill" | "restart" => format!(
-            "marina doesn't {verb} agent sessions — exit {} (pid {}) from its terminal; its servers are listed under it",
+    let stops = matches!(verb, "kill" | "restart");
+    let msg = match (app.selected_agent(), &app.selected) {
+        (Some(a), _) if stops => format!(
+            "exit {} (pid {}) from its terminal — marina doesn't {verb} agent sessions; its servers are listed under it",
             a.name, a.pid
         ),
-        _ => format!("{} session has no {verb} — select one of its servers", a.name),
+        (Some(a), _) => format!("select one of its servers — a {} session has no {verb}", a.name),
+        (None, Some(Entry::Agents)) if stops => {
+            format!("select a server — marina doesn't {verb} agent sessions")
+        }
+        (None, Some(Entry::Agents)) => format!("select a server — the agents section has no {verb}"),
+        _ => return false,
     };
     app.set_status(msg);
     true
+}
+
+/// On the placeholder for a row marina just stopped or restarted, say what
+/// became of it rather than act on whatever slid into its place.
+fn on_held_row(app: &mut ui::App) -> bool {
+    let Some(h) = app.held_placeholder() else {
+        return false;
+    };
+    let msg = format!("{} is {}", h.label, h.state.trim_end_matches('…'));
+    app.set_status(msg);
+    true
+}
+
+/// The panes have squeezed the table out: don't act on a cursor nobody can
+/// see.
+fn table_hidden(app: &mut ui::App) -> bool {
+    if app.page_rows > 0 {
+        return false;
+    }
+    app.set_status("table hidden — Esc closes panes");
+    true
+}
+
+/// Enter, or clicking the selected row: fold a header, jump to an agent
+/// session, inspect a server.
+fn on_enter(app: &mut ui::App, ev: &Sender<UiEvent>) {
+    match app.selected {
+        Some(Entry::Agent(_)) => verb_jump(app, ev),
+        Some(Entry::Group(_) | Entry::Agents) => app.toggle_collapse(),
+        Some(Entry::Member(_) | Entry::Target(_)) => app.toggle_inspect(),
+        None => {}
+    }
+}
+
+/// A key while `X`/`R` on a header waits for confirmation: its key again or
+/// Enter goes ahead, anything else cancels.
+fn on_confirm_key(
+    app: &mut ui::App,
+    code: KeyCode,
+    ev: &Sender<UiEvent>,
+    ctl: &Sender<SamplerCtl>,
+) {
+    let again = match app.confirm.as_ref().map(|c| c.verb) {
+        Some(Verb::Kill) => code == KeyCode::Char('X'),
+        Some(Verb::Restart) => code == KeyCode::Char('R'),
+        None => false,
+    };
+    if !(again || code == KeyCode::Enter) {
+        app.confirm = None;
+        app.set_status("cancelled");
+        return;
+    }
+    match app.take_confirm() {
+        Some(Verb::Kill) => verb_kill(app, ev, ctl, true),
+        Some(Verb::Restart) => verb_restart(app, ev, ctl, true),
+        None => app.set_status("cancelled — the selection moved"),
+    }
+}
+
+/// `2 servers in client-portal`, or the one server's name.
+fn servers_label(app: &ui::App, n: usize) -> String {
+    let label = app.selection_label();
+    match app.selected {
+        Some(Entry::Group(_)) => format!("{n} server{} in {label}", if n == 1 { "" } else { "s" }),
+        _ => label,
+    }
 }
 
 /// Enter on an agent row: focus its pane in the multiplexer that hosts it
@@ -331,11 +425,12 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
                 "cd {} && {resume}",
                 shell_quote(&a.cwd.display().to_string())
             );
+            // long enough to read and paste
             match verbs::copy_url(&cmd) {
-                Ok(()) => app.set_status(format!(
-                    "no terminal marina can drive — copied `{cmd}`; paste it in a terminal"
+                Ok(()) => app.set_notice(format!(
+                    "paste it in a terminal — copied `{cmd}` (no terminal marina can drive)"
                 )),
-                Err(e) => app.set_status(format!("no pane to jump to ({e}) — run: {cmd}")),
+                Err(e) => app.set_notice(format!("run: {cmd} — no pane to jump to ({e})")),
             }
         }
     }
@@ -352,9 +447,13 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// `D`: the uncommitted diff of the selected agent's (or target's) work tree,
-/// in the log pane.
+/// `d`: the uncommitted diff of the selected agent's (or server's) work
+/// tree, in the pane below; again closes it.
 fn verb_diff(app: &mut ui::App) {
+    if app.pane_kind() == Some(ui::PaneKind::Diff) {
+        app.close_log();
+        return;
+    }
     let dir = match (app.selected_agent(), app.selected_target()) {
         (Some(a), _) => a.cwd.clone(),
         (None, Some(t)) if !t.cwd.as_os_str().is_empty() => t.cwd.clone(),
@@ -366,6 +465,7 @@ fn verb_diff(app: &mut ui::App) {
     let (tx, rx) = mpsc::channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let demo = app.demo;
+    let title = ui::tildify(&dir.display().to_string());
     std::thread::spawn(move || {
         let lines = if demo {
             let project = dir.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -379,78 +479,94 @@ fn verb_diff(app: &mut ui::App) {
             }
         }
     });
-    let title = format!("diff {}", ui::tildify(&app_dir_label(app)));
-    app.open_log(title, rx, stop);
-    app.log_from_top();
+    app.open_diff(title, rx, stop);
 }
 
-fn app_dir_label(app: &ui::App) -> String {
-    app.selected_agent()
-        .map(|a| a.cwd.display().to_string())
-        .or_else(|| app.selected_target().map(|t| t.cwd.display().to_string()))
-        .unwrap_or_default()
-}
-
-fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) {
-    if on_agent_row(app, "kill") {
+/// `X`: SIGTERM the selection; on a server that's still stopping, SIGKILL.
+/// A header asks first when it would touch more than one server.
+fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>, confirmed: bool) {
+    if on_agent_row(app, "kill") || on_held_row(app) || table_hidden(app) {
         return;
     }
-    let (pid_starts, containers, keys) = {
+    let group = matches!(app.selected, Some(Entry::Group(_)));
+    // (key, fingerprints, container) of each server it touches
+    let (plan, force) = {
         let ts = app.selected_targets();
-        let mut ps: Vec<verbs::PidStart> = Vec::new();
-        let mut cs: Vec<String> = Vec::new();
-        let mut keys = Vec::new();
-        for t in &ts {
-            keys.push(t.key.clone());
-            match &t.container {
-                Some(c) => cs.push(c.clone()),
-                None => ps.extend(&t.pid_starts),
-            }
-        }
-        (ps, cs, keys)
+        // all of them got SIGTERM already: this press escalates
+        let force = !ts.is_empty() && ts.iter().all(|t| app.is_dying(&t.key));
+        let plan: Vec<(TargetKey, Vec<verbs::PidStart>, Option<String>)> = ts
+            .iter()
+            .filter(|t| force || !app.is_dying(&t.key))
+            .map(|t| (t.key.clone(), t.pid_starts.clone(), t.container.clone()))
+            .collect();
+        (plan, force)
     };
-    let label = app.selection_label();
-    // the demo's servers have no processes to signal
-    if app.demo && !keys.is_empty() {
-        app.mark_marina_action(&keys);
-        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Stop(keys)));
-        app.set_status(format!("stopped {label} (demo: nothing was signalled)"));
-        return;
-    }
-    if pid_starts.is_empty() && containers.is_empty() {
+    let n = plan.len();
+    if n == 0 {
         app.set_status("nothing to kill");
         return;
     }
-    app.mark_marina_action(&keys);
-    if !containers.is_empty() {
-        let n = containers.len();
-        verbs::docker("stop", containers, ev.clone(), ctl.clone());
-        app.set_status(format!(
-            "stopping {n} container{}…",
-            if n == 1 { "" } else { "s" }
-        ));
+    let what = servers_label(app, n);
+    if group && n > 1 && !confirmed {
+        let verb = if force { "force-kill" } else { "kill" };
+        app.ask(
+            Verb::Kill,
+            format!("{verb} {what}? X again or Enter · any other key cancels"),
+        );
+        return;
     }
-    if !pid_starts.is_empty() {
-        let n = pid_starts.len();
-        match verbs::kill(pid_starts, ev.clone(), ctl.clone()) {
-            Ok(cancel) => {
-                app.note_pending_kill(cancel, &label, keys);
-                app.set_status(format!(
-                    "killing {label} ({n} processes) — SIGTERM sent, SIGKILL in 4s · u cancels the SIGKILL"
-                ));
-            }
-            Err(e) => app.set_status(format!("kill {label}: {e}")),
+    let keys: Vec<TargetKey> = plan.iter().map(|p| p.0.clone()).collect();
+    // the demo's servers have no processes to signal
+    if app.demo {
+        app.mark_marina_action(&keys);
+        app.hold_selection(Verb::Kill);
+        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Stop(keys)));
+        app.set_status(format!("stopped {what} (demo: nothing was signalled)"));
+        return;
+    }
+    if force {
+        let pids: Vec<verbs::PidStart> = plan.iter().flat_map(|p| p.1.clone()).collect();
+        if pids.is_empty() {
+            app.set_status(format!("docker stop is still running for {what}"));
+        } else {
+            app.set_status(format!("force-killing {what}…"));
+            verbs::force_kill(pids, what, ev.clone(), ctl.clone());
+        }
+        return;
+    }
+    let containers: Vec<String> = plan.iter().filter_map(|p| p.2.clone()).collect();
+    let pids: Vec<verbs::PidStart> = plan
+        .iter()
+        .filter(|p| p.2.is_none())
+        .flat_map(|p| p.1.clone())
+        .collect();
+    if !pids.is_empty() {
+        if let Err(e) = verbs::kill(pids, what.clone(), ev.clone(), ctl.clone()) {
+            app.set_status(format!("kill {what}: {e}"));
+            return;
         }
     }
+    if !containers.is_empty() {
+        verbs::docker("stop", containers, ev.clone(), ctl.clone());
+    }
+    app.hold_selection(Verb::Kill);
+    app.note_stopping(plan.into_iter().map(|(k, p, _)| (k, p)).collect());
+    app.set_status(format!("stopping {what} — SIGTERM sent"));
     let _ = ctl.send(SamplerCtl::Refresh);
 }
 
-fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) {
-    if on_agent_row(app, "restart") {
+fn verb_restart(
+    app: &mut ui::App,
+    ev: &Sender<UiEvent>,
+    ctl: &Sender<SamplerCtl>,
+    confirmed: bool,
+) {
+    if on_agent_row(app, "restart") || on_held_row(app) || table_hidden(app) {
         return;
     }
-    let label = app.selection_label();
-    let (plans, containers, keys) = {
+    let group = matches!(app.selected, Some(Entry::Group(_)));
+    let first = !app.restart_noted;
+    let (mut plans, containers, keys) = {
         let ts = app.selected_targets();
         let mut plans = Vec::new();
         let mut cs = Vec::new();
@@ -465,42 +581,71 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
                     cwd: t.cwd.clone(),
                     ports: t.ports.clone(),
                     pid_starts: t.pid_starts.clone(),
+                    note_env: false,
                 }),
                 None => {}
             }
         }
         (plans, cs, keys)
     };
+    let n = keys.len();
+    if n == 0 {
+        app.set_status("nothing to restart");
+        return;
+    }
+    let what = servers_label(app, n);
+    if group && n > 1 && !confirmed {
+        app.ask(
+            Verb::Restart,
+            format!("restart {what}? R again or Enter · any other key cancels"),
+        );
+        return;
+    }
     if app.demo {
         app.mark_marina_action(&keys);
         let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Restart(keys)));
-        app.set_status(format!("restarted {label} (demo: nothing was run)"));
+        app.set_status(format!("restarted {what} (demo: nothing was run)"));
         return;
     }
     if plans.is_empty() && containers.is_empty() {
-        app.set_status(format!("can't restart {label}: command not captured"));
+        app.set_status(format!("can't restart {what}: its command wasn't captured"));
         return;
     }
     app.mark_marina_action(&keys);
+    app.hold_selection(Verb::Restart);
     if !containers.is_empty() {
         verbs::docker("restart", containers, ev.clone(), ctl.clone());
+    }
+    // marina can't capture a running process's environment: say so once
+    if let Some(p) = plans.first_mut().filter(|_| first) {
+        p.note_env = true;
+        app.restart_noted = true;
     }
     for plan in plans {
         verbs::restart(plan, ev.clone(), ctl.clone());
     }
-    app.set_status(format!("restarting {label}…"));
+    app.set_status(format!("restarting {what}…"));
 }
 
-/// `O`/`Y` on a session: the URL of a web server it started (the next one
-/// on a repeat press), or why there's none.
-fn session_url(app: &mut ui::App, verb: char) -> Option<Result<(String, String), String>> {
-    let a = app.selected_agent()?;
-    let (pid, label) = (a.pid, app.agent_label(a));
-    let urls = app.agent_urls(a);
+/// `o`/`y` on a session or a group header: the URL of one of its web
+/// servers (the next on a repeat press), or why there's none.
+fn row_url(app: &mut ui::App, verb: char) -> Option<Result<(String, String), String>> {
+    let (row, label, urls) = match (app.selected_agent(), &app.selected) {
+        (Some(a), _) => (
+            format!("agent:{}", a.pid),
+            app.agent_label(a),
+            app.agent_urls(a),
+        ),
+        (None, Some(Entry::Group(g))) => (format!("group:{g}"), g.clone(), app.group_urls(g)),
+        _ => return None,
+    };
     if urls.is_empty() {
-        return Some(Err(format!("{label} hasn't started a web server")));
+        return Some(Err(match app.selected_agent() {
+            Some(_) => format!("{label} hasn't started a web server"),
+            None => format!("{label} has no web server"),
+        }));
     }
-    let i = app.next_url(verb, pid, urls.len());
+    let i = app.next_url(verb, &row, urls.len());
     let more = if urls.len() > 1 {
         format!(" ({} of {} — again for the next)", i + 1, urls.len())
     } else {
@@ -509,8 +654,30 @@ fn session_url(app: &mut ui::App, verb: char) -> Option<Result<(String, String),
     Some(Ok((urls[i].clone(), more)))
 }
 
+/// `o`/`y` on a server: its URL, or why there's none.
+fn server_url(app: &mut ui::App, verb: char) -> Option<crate::model::Url> {
+    if app.selected == Some(Entry::Agents) {
+        app.set_status("the agents section has no URL — select a session or a server");
+        return None;
+    }
+    if on_held_row(app) {
+        return None;
+    }
+    let Some(t) = app.selected_target() else {
+        let doing = if verb == 'y' { "copy" } else { "open" };
+        app.set_status(format!("select a server to {doing} its URL"));
+        return None;
+    };
+    let url = t.url.clone();
+    if url.is_none() {
+        let label = app.selection_label();
+        app.set_status(format!("{label} has no URL"));
+    }
+    url
+}
+
 fn verb_copy(app: &mut ui::App) {
-    match session_url(app, 'Y') {
+    match row_url(app, 'y') {
         Some(Ok((url, more))) => {
             match verbs::copy_url(&url) {
                 Ok(()) => app.set_status(format!("copied {url}{more}")),
@@ -524,25 +691,19 @@ fn verb_copy(app: &mut ui::App) {
         }
         None => {}
     }
-    if app.selected_target().is_none() {
-        app.set_status("select a service (not a group) to copy a URL");
-        return;
-    }
-    let url = app.selected_target().and_then(|t| t.url.clone());
-    match url {
-        Some(u) => match verbs::copy_url(&u.value) {
+    if let Some(u) = server_url(app, 'y') {
+        match verbs::copy_url(&u.value) {
             Ok(()) => app.set_status(format!("copied {}", u.value)),
             Err(e) => app.set_status(format!("copy failed: {e}")),
-        },
-        None => app.set_status("no URL for this target"),
+        }
     }
 }
 
 fn verb_open(app: &mut ui::App) {
-    match session_url(app, 'O') {
+    match row_url(app, 'o') {
         Some(Ok((url, more))) => {
             if app.demo {
-                app.set_status(format!("demo: O would open {url}{more}"));
+                app.set_status(format!("demo: o would open {url}{more}"));
                 return;
             }
             let _ = verbs::open_url(&url);
@@ -555,37 +716,33 @@ fn verb_open(app: &mut ui::App) {
         }
         None => {}
     }
-    if app.selected_target().is_none() {
-        app.set_status("select a service (not a group) to open");
-        return;
-    }
-    let url = app.selected_target().and_then(|t| t.url.clone());
-    match url {
+    match server_url(app, 'o') {
         Some(u) if u.scheme.is_web() && app.demo => {
-            app.set_status(format!("demo: O would open {}", u.value));
+            app.set_status(format!("demo: o would open {}", u.value));
         }
         Some(u) if u.scheme.is_web() => {
             let _ = verbs::open_url(&u.value);
             app.set_status(format!("opening {}", u.value));
         }
         Some(u) => app.set_status(format!("{} is not a web URL", u.value)),
-        None => app.set_status("no URL for this target"),
+        None => {}
     }
 }
 
-/// `T`: docker targets tail `docker logs -f` directly; native targets get an
+/// `t`: the selected server's log in the pane below; again closes it.
+/// Docker targets tail `docker logs -f` directly; native targets get an
 /// off-thread discovery (`lsof` can stall) whose result comes back as a
 /// `UiEvent::LogReady`.
 fn verb_tail(app: &mut ui::App, ev: &Sender<UiEvent>) {
-    if app.log_open() {
+    if app.pane_kind() == Some(ui::PaneKind::Log) {
         app.close_log();
         return;
     }
-    if on_agent_row(app, "log") {
+    if on_agent_row(app, "log") || on_held_row(app) {
         return;
     }
     let Some(t) = app.selected_target() else {
-        app.set_status("select a service (not a group) to tail");
+        app.set_status("select a server to see its log");
         return;
     };
     if app.demo {
@@ -621,8 +778,8 @@ fn verb_tail(app: &mut ui::App, ev: &Sender<UiEvent>) {
 
 fn on_log_ready(app: &mut ui::App, project: String, path: Option<std::path::PathBuf>) {
     app.log_pending = false;
-    if app.log_open() {
-        return; // something else opened meanwhile (e.g. a docker tail)
+    if app.pane_kind() == Some(ui::PaneKind::Log) {
+        return; // another log opened meanwhile (e.g. a docker tail)
     }
     match path {
         Some(p) => {
@@ -632,7 +789,7 @@ fn on_log_ready(app: &mut ui::App, project: String, path: Option<std::path::Path
             app.open_log(title, rx, stop);
         }
         None => app.set_status(format!(
-            "no log file found for {project} — logs may go to stdout (R restarts with capture)"
+            "R restarts {project} with its output captured — no log file found (it may log to stdout)"
         )),
     }
 }
