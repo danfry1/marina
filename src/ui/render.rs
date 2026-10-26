@@ -1031,10 +1031,7 @@ fn help_lines() -> Vec<Line<'static>> {
         row("R", "restart (output captured to a log)"),
         row("T", "tail logs"),
         row("[ · ]", "scroll logs · +/- resize"),
-        row(
-            "Y · O",
-            "copy URL · open (on a session: its server; again: the next)",
-        ),
+        row("Y · O", "copy URL · open (on a session: its server)"),
         row("Esc", "close pane / clear filter"),
         row("? · q", "this help · quit (also Ctrl+C)"),
         Line::from(""),
