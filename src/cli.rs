@@ -162,6 +162,10 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         eprintln!("marina: open doesn't take --json (marina url --json prints the URLs)");
         return Some(2);
     }
+    if json && matches!(cmd, "restart" | "version") {
+        eprintln!("marina: {cmd} doesn't take --json");
+        return Some(2);
+    }
     if all && !matches!(cmd, "kill" | "restart" | "open") {
         eprintln!("marina: --all only applies to kill, restart and open");
         return Some(2);
@@ -1773,6 +1777,9 @@ mod tests {
             "--grace needs seconds"
         );
         assert_eq!(d(&["kill", "x", "--grace=soon"]), Some(2));
+        assert_eq!(d(&["open", "x", "--json"]), Some(2), "open has no JSON");
+        assert_eq!(d(&["restart", "x", "--json"]), Some(2), "nor restart");
+        assert_eq!(d(&["version", "--json"]), Some(2), "nor version");
         assert_eq!(
             d(&["ls", "--dump"]),
             Some(2),

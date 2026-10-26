@@ -56,17 +56,17 @@
   // ---- The harbour: servers berthed at their ports -------------------------
 
   var ships = [
-    { port: 3000, project: "checkout", cmd: "next dev", via: "claude·checkout", cpu: "1.2%", mem: "380MB", up: "2h", branch: "saved-cards", pid: 48213 },
-    { port: 5432, project: "checkout", cmd: "postgres", via: "docker", cpu: "0.1%", mem: "64MB", up: "6d", container: "checkout-db-1" },
-    { port: 8080, project: "api", cmd: "cargo run", via: "codex·api", cpu: "0.4%", mem: "42MB", up: "40m", lan: true },
-    { port: 5173, project: "web", cmd: "vite", via: "claude·web", cpu: "0.8%", mem: "210MB", up: "5h" },
-    { port: 4321, project: "docs", cmd: "astro dev", via: "claude·ended", cpu: "0.2%", mem: "120MB", up: "1d", orphan: true },
-    { port: 6006, project: "search", cmd: "storybook", via: "codex·search", cpu: "164%", mem: "2.9GB", up: "3d", heavy: true },
+    { port: 3000, project: "checkout", cmd: "next dev", via: "claude·checkout", ls: "claude", url: "http://localhost:3000", cpu: "1.2%", mem: "380MB", up: "2h" },
+    { port: 5432, project: "checkout", cmd: "postgres", via: "docker", ls: "—", url: "postgres://localhost:5432", cpu: "—", mem: "—", up: "6d", container: "checkout-db-1" },
+    { port: 8080, project: "api", cmd: "cargo run", via: "codex·api", ls: "codex", url: "http://localhost:8080", cpu: "0.4%", mem: "42MB", up: "40m", lan: true },
+    { port: 5173, project: "web", cmd: "vite", via: "claude·web", ls: "claude", url: "http://localhost:5173", cpu: "0.8%", mem: "210MB", up: "5h" },
+    { port: 4321, project: "docs", cmd: "astro", via: "claude·ended", ls: "claude·ended", url: "http://localhost:4321", cpu: "0.2%", mem: "120MB", up: "1d", orphan: true },
+    { port: 6006, project: "search", cmd: "storybook", via: "codex·search", ls: "codex", url: "http://localhost:6006", cpu: "164.0%", mem: "2970MB", up: "3d", heavy: true },
   ];
   var berths = document.getElementById("berths");
   var out = document.getElementById("harbour-out");
   ships.forEach(function (s, i) {
-    var flag = s.heavy ? '<span class="flag">⚠ 164% cpu</span>'
+    var flag = s.heavy ? '<span class="flag">164% cpu</span>'
       : s.orphan ? '<span class="flag">session ended</span>' : "";
     var b = document.createElement("div");
     b.className = "berth" + (s.orphan ? " adrift" : "");
@@ -81,31 +81,25 @@
   });
 
   function pad(s, n) { s = String(s); return s.length >= n ? s + " " : s + " ".repeat(n - s.length); }
+  function lpad(s, n) { s = String(s); return s.length >= n ? " " + s : " ".repeat(n - s.length) + s; }
   function here() { return ships.filter(function (s) { return !s.gone; }); }
   function line(cmd, lines) {
     var html = '<span class="p">$</span> <span class="o">' + esc(cmd) + "</span>\n" + lines.join("\n");
     out.innerHTML = (out.innerHTML ? out.innerHTML + "\n" : "") + html;
     out.scrollTop = out.scrollHeight;
   }
-  function flash(s) {
-    s.el.classList.remove("hit"); void s.el.offsetWidth; s.el.classList.add("hit");
-    setTimeout(function () { s.el.classList.remove("hit"); }, 1600);
-  }
   function sink(s) { s.gone = true; s.el.classList.add("gone"); }
   var runs = {
     ls: function () {
       var rows = here();
       if (!rows.length) return line("marina ls", ["no dev servers running"]);
-      line("marina ls", ['<span class="o">' + pad("PROJECT", 9) + pad("COMMAND", 10) + pad("PORT", 8) + pad("CPU", 6) + pad("MEM", 7) + "VIA</span>"]
+      // like the real table: sorted by port, CPU and MEM right-aligned
+      rows = rows.slice().sort(function (a, b) { return a.port - b.port; });
+      line("marina ls", ['<span class="o">' + pad("PROJECT", 9) + pad("COMMAND", 10) + pad("PORT", 7) + lpad("CPU", 7) + lpad("MEM", 8) + "  " + pad("VIA", 13) + "URL</span>"]
         .concat(rows.map(function (s) {
-          var t = pad(s.project, 9) + pad(s.cmd, 10) + pad(":" + s.port + (s.lan ? "!" : ""), 8) + pad(s.cpu, 6) + pad(s.mem, 7) + s.via;
-          return s.heavy ? '<span class="r">' + esc(t) + "</span>" : esc(t);
+          var t = pad(s.project, 9) + pad(s.cmd, 10) + pad(":" + s.port + (s.lan ? "!" : ""), 7) + lpad(s.cpu, 7) + lpad(s.mem, 8) + "  " + pad(s.ls, 13) + (s.url || "");
+          return esc(t);
         })));
-    },
-    who: function () {
-      var s = ships[0];
-      flash(s);
-      line("marina who 3000", [esc(":3000  checkout · next dev · pid " + s.pid + " · up 2h · saved-cards · ~/dev/checkout")]);
     },
     ended: function () {
       var lost = here().filter(function (s) { return s.orphan; });
@@ -116,7 +110,7 @@
     },
     free: function () {
       var s = ships[5];
-      if (s.gone) return line("marina free 6006", [":6006  free"]);
+      if (s.gone) return line("marina free 6006", [":6006  already free"]);
       line("marina free 6006", [":6006  freed — stopped search · storybook"]);
       sink(s);
     },

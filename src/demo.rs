@@ -165,7 +165,7 @@ fn servers() -> Vec<Srv> {
         srv("web", "vite", 5173, 0.8, 210 * MB, 5 * 3600, Some(2)),
         Srv {
             orphan: true,
-            ..srv("docs", "astro dev", 4321, 0.2, 120 * MB, 86_400, None)
+            ..srv("docs", "astro", 4321, 0.2, 120 * MB, 86_400, None)
         },
         Srv {
             branch: Some("pgvector-spike"),
@@ -368,7 +368,7 @@ fn target(
         UrlScheme::Postgres => format!("postgres://localhost:{}", s.port),
         _ => format!("http://localhost:{}", s.port),
     };
-    Target {
+    let mut t = Target {
         key: TargetKey::Port(s.port),
         kind: TargetKind::Listener,
         ports: vec![s.port],
@@ -392,7 +392,19 @@ fn target(
         exposed: s.exposed,
         container: s.container.map(str::to_string),
         launcher,
+    };
+    // like the real sampler: a container's processes live in the VM, so it
+    // has no pids, uptime or usage of its own
+    if t.container.is_some() {
+        t.anchor = Anchor {
+            pid: 0,
+            start_time: 0,
+        };
+        t.pids.clear();
+        t.cpu_pct = 0.0;
+        t.mem_bytes = 0;
     }
+    t
 }
 
 /// Like [`crate::sampler::spawn`], from the made-up machine. A

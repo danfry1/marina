@@ -35,8 +35,8 @@
   function servers(t) {
     return [
       { project: "checkout", cmd: "next dev", port: 3000, cpu: 1.2, mem: 380, up: t - 7200, branch: "saved-cards", by: "claude·checkout" },
-      { project: "checkout", cmd: "postgres", tag: "db", port: 5432, cpu: 0.1, mem: 64, up: t - 6 * 86400, branch: "—", by: null, container: "checkout-db-1" },
-      { project: "docs", cmd: "astro dev", port: 4321, cpu: 0.2, mem: 120, up: t - 86400, branch: "main", by: "claude·ended", orphan: true },
+      { project: "checkout", cmd: "postgres", tag: "db", port: 5432, cpu: 0, mem: 0, up: t - 6 * 86400, branch: "—", by: null, container: "checkout-db-1" },
+      { project: "docs", cmd: "astro", port: 4321, cpu: 0.2, mem: 120, up: t - 86400, branch: "main", by: "claude·ended", orphan: true },
       { project: "web", cmd: "vite", port: 5173, cpu: 0.8, mem: 210, up: t - 5 * 3600, branch: "main", by: "claude·web" },
       { project: "search", cmd: "storybook", port: 6006, cpu: 164, mem: 2970, up: t - 3 * 86400, branch: "pgvector-spike", by: "codex·search" },
       { project: "api", cmd: "cargo run", port: 8080, cpu: 0.4, mem: 42, up: t - 2400, branch: "rate-limit", by: "codex·api", lan: true },
@@ -79,7 +79,7 @@
       sorted(S.servers).forEach(function (s) { add(s.project, { kind: "server", s: s, child: true }); });
     } else {
       S.agents.forEach(function (a) { add(a.id, { kind: "agent", a: a, child: true }); });
-      sorted(S.servers).forEach(function (s) { add(s.by || "unattributed", { kind: "server", s: s, child: true }); });
+      sorted(S.servers).forEach(function (s) { add(s.by || "unknown", { kind: "server", s: s, child: true }); });
     }
     names.forEach(function (n) {
       var g = byName[n];
@@ -111,7 +111,7 @@
   }
 
   function handle(k) {
-    if (S.help) { if (k === "Escape" || k === "?" || k === "q") S.help = false; render(); return true; }
+    if (S.help) { if (!/^(Shift|Control|Alt|Meta|CapsLock|Tab)$/.test(k)) { S.help = false; render(); } return k !== "Tab"; }
     if (S.confirm) {
       var c = S.confirm;
       S.confirm = null;
@@ -129,7 +129,6 @@
       case "Escape": S.log = null; break;
       case "s":
         S.sort = S.sort === "port" ? "cpu" : S.sort === "cpu" ? "mem" : "port";
-        tell("sort: " + S.sort);
         break;
       case "v":
         S.by = S.by === "project" ? "session" : "project";
@@ -144,7 +143,10 @@
       case "o": case "y": url(e, k); break;
       case "K": case "x": tell(k + " isn't a key here — X (Shift-x) kills · ? lists them"); break;
       case "q": if (S.log) S.log = null; else tell("q quits marina — this one stays"); break;
-      default: return false;
+      default:
+        if (!/^[a-zA-Z0-9]$/.test(k)) return false;
+        // marina's other keys (fold, inspect, reverse sort) aren't emulated here
+        tell("hliS".indexOf(k) >= 0 ? k + " works in marina, not in this demo · ? lists what does" : k + " isn't a key here · ? lists them");
     }
     render();
     return true;
@@ -170,29 +172,27 @@
       return;
     }
     var list = serversOf(e);
-    if (!list.length) { tell("select a server or a group to kill"); return; }
+    if (!list.length) { tell(e && e.kind === "fold" ? "select a server — marina doesn't kill agent sessions" : "select a server or a group to kill"); return; }
     var label = what(e, list);
     if (list.length > 1 && !confirmed) { ask("X", "kill " + label, function () { kill(e, true); }); return; }
     list.forEach(function (s) { s.dying = true; });
     tell("stopping " + label + " — SIGTERM sent", "red");
     setTimeout(function () {
       S.servers = S.servers.filter(function (s) { return list.indexOf(s) < 0; });
-      var orphan = list.some(function (s) { return s.orphan; });
-      tell(label + " stopped" + (orphan ? " — nothing is left running from ended sessions" : ""), "green");
       render();
     }, reduced ? 0 : 1200);
   }
 
   function restart(e, confirmed) {
-    if (e && e.kind === "agent") { tell("select one of its servers — marina doesn't restart agent sessions"); return; }
+    if (e && e.kind === "agent") { tell("exit " + e.a.agent + " from its terminal — marina doesn't restart agent sessions; its servers are listed under it", "yellow"); return; }
     var list = serversOf(e);
-    if (!list.length) { tell("select a server or a group to restart"); return; }
+    if (!list.length) { tell(e && e.kind === "fold" ? "select a server — marina doesn't restart agent sessions" : "select a server or a group to restart"); return; }
     var label = what(e, list);
     if (list.length > 1 && !confirmed) { ask("R", "restart " + label, function () { restart(e, true); }); return; }
     tell("restarting " + label + "…", "yellow");
     setTimeout(function () {
       list.forEach(function (s) { s.up = now(); s.born = Date.now(); });
-      tell("t shows its output · restarted " + label, "green");
+      tell(list.length === 1 && list[0].container ? "docker restart " + list[0].container + ": done" : "t shows its output · restarted " + list[0].project, "green");
       render();
     }, reduced ? 0 : 900);
   }
@@ -205,7 +205,7 @@
   }
   function logs(e) {
     if (S.log && S.log.kind === "log") { S.log = null; return; }
-    if (!e || e.kind !== "server") { tell("select a server to see its log"); return; }
+    if (!e || e.kind !== "server") { tell(e && e.kind === "agent" ? "select one of its servers — a " + e.a.agent + " session has no log" : e && e.kind === "fold" ? "select a server — the agents section has no log" : "select a server to see its log"); return; }
     var s = e.s;
     S.log = { kind: "log", title: s.container ? "docker logs " + s.container : "~/dev/" + s.project + "/.dev.log", lines: logLines(s) };
     tell("tailing " + s.project + " · " + s.cmd);
@@ -224,9 +224,8 @@
     if (!s) { tell(e && e.kind === "agent" ? e.a.id + " hasn't started a web server" : e && e.kind === "fold" ? "the agents section has no URL — select a session or a server" : "select a server to open its URL"); return; }
     var u = (s.cmd === "postgres" ? "postgres://localhost:" : "http://localhost:") + s.port;
     if (k === "y") {
-      if (navigator.clipboard) navigator.clipboard.writeText(u).catch(function () {});
-      tell("copied " + u, "green");
-    } else tell(s.cmd === "postgres" ? u + " is not a web URL" : "opening " + u + " (in the demo, nothing opens)", "cyan");
+      tell("demo: y would copy " + u, "green");
+    } else tell(s.cmd === "postgres" ? u + " is not a web URL" : "demo: o would open " + u, "cyan");
   }
 
   // ---- Drawing ---------------------------------------------------------------
@@ -260,8 +259,8 @@
     var s = e.s, c = cpuOf(s), born = s.born && Date.now() - s.born < 1300;
     open = '<div class="' + cls + (s.dying ? " dying" : born ? " born" : "") + '" data-row="' + i + '">';
     return open + cells([[lead + (e.child && S.by !== "session" ? "" : esc(s.project))], [s.dying ? "stopping…" : esc(s.cmd) + (s.tag ? sp("dim", " ·" + s.tag) : "")],
-      [":" + s.port + (s.lan ? sp("red", "!") : "")], [c.toFixed(1) + "%", c >= 100 ? "red" : ""], [mem(s.mem), s.mem >= 2048 ? "red" : ""],
-      [esc(via(s)), (s.orphan ? "yellow" : s.by ? "mag" : "dim") + " c-via"], [age(t - s.up), "c-up"], [esc(s.branch), "dim c-br"]]) + "</div>";
+      [":" + s.port + (s.lan ? sp("red", "!") : "")], [s.container ? "—" : c.toFixed(1) + "%"], [s.container ? "—" : mem(s.mem)],
+      [esc(via(s)), (s.orphan ? "yellow" : s.by ? "mag" : "dim") + " c-via"], [s.container ? "—" : age(t - s.up), "c-up"], [esc(s.branch), "dim c-br"]]) + "</div>";
   }
 
   function detailLine(e) {
@@ -282,7 +281,7 @@
       ["s", "sort: port · cpu · mem"], ["v", "group by project / by who started them"]];
     return '<div class="help"><div class="help-box">' + ln("<b>" + sp("cyan", "marina — keys") + "</b>") + ln("") +
       rows.map(function (r) { return '<div class="help-row">' + sp("mag", r[0]) + sp("white", r[1]) + "</div>"; }).join("") +
-      ln("") + ln(sp("dim", "Esc or ? closes · the real thing also filters with /")) + "</div></div>";
+      ln("") + ln(sp("dim", "any key closes · the real thing also filters with /")) + "</div></div>";
   }
 
   // the keys that do something on this row
@@ -291,7 +290,7 @@
     if (e.kind === "group") { var n = serversOf(e).length; return "Enter fold · X kill " + n + " · R restart " + n + " · o open · ? help"; }
     if (e.kind === "fold") return "Enter fold/unfold · v by session · ? help";
     if (e.kind === "agent") return "Enter jump · d diff · o open its server · ? help";
-    return "o open · y copy · t logs · R restart · X kill · s sort · v by session · ? help";
+    return "Enter inspect · o open · y copy · t logs · R restart · X kill · ? help";
   }
 
   function render() {
@@ -358,7 +357,7 @@
 
   // While the demo is on screen, its keys work from anywhere on the page
   // (not Space or Enter, which the page needs), so you can just start typing.
-  var pageKeys = "jkgGKRTDOYsv?u";
+  var pageKeys = "jkgGXRtdoysvKx?";
   var onScreen = false;
   document.addEventListener("keydown", function (e) {
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;

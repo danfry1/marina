@@ -664,8 +664,8 @@ non-issue — rows for system stuff may just be opaque.
   _Container cpu/mem not captured — shown as `—`._
 - **`phys_footprint` memory** via `libproc` (Activity-Monitor-matching), with RSS
   fallback.
-- **CLI / agent surface**: `ls [sel…]`/`kill`/`restart`/`url`/`version` with
-  `--json` and project/port/command selectors; strict argument parsing (typos
+- **CLI / agent surface**: `ls [sel…]`/`kill`/`restart`/`url`/`version`, with
+  `--json` on `ls`/`kill`/`url` and project/port/command selectors; strict argument parsing (typos
   exit 2, never launch the TUI). Project-selector kill = group-kill.
 - **TUI grouping**: a project with several targets gets a collapsible header
   (`Enter` folds; `X`/`R` act on its visible members, after a confirm); a lone target stays a plain
