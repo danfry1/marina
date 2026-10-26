@@ -21,17 +21,21 @@ developer-process-centric.
 
 - **Live, stable TUI** — grouped by project; no flicker, no cursor-jump while you
   navigate, and it only redraws when something changed — an idle cockpit does
-  near-zero work. Mouse works too (click to select, click a header to sort,
-  wheel to move / scroll logs).
+  near-zero work. Mouse works too (click to select, click the selected row
+  again for what Enter does, click a header to sort, wheel to move / scroll
+  logs). Mouse capture means a plain drag doesn't select text: hold Shift
+  (Option in iTerm2) to select.
 - **Smart resolution** — infers project + tool from cwd, argv, package manifests
   (package.json / Cargo.toml / pyproject / go.mod / …) and git (worktrees and
   detached HEADs included); sees through `pnpm`/`npm`/`yarn`/`node`/corepack
   wrappers to the real tool (`pnpm dev` → `vite`, `pnpm exec vp dev` → `vp dev`,
   `python -m http.server` → `http.server`).
-- **First-class verbs** — kill (fingerprint-verified SIGTERM→SIGKILL escalation,
-  `u` cancels the force-kill), restart (waits for the port to free, captures the
-  new process's output to a log), tail logs inline, copy URL, open in browser.
-  Docker rows stop/restart/tail via the docker CLI.
+- **First-class verbs** — kill (`X`: a fingerprint-verified SIGTERM; a server
+  still running after 4s is reported, and `X` again force-kills it — nothing
+  escalates on its own), restart (waits for the port to free, captures the new
+  process's output to a log), tail logs inline, copy URL, open in browser. On
+  a group header, `X` and `R` act on the servers the filter shows, after a
+  confirm. Docker rows stop/restart/tail via the docker CLI.
 - **Who started it** — a `VIA` column names the launcher of every server: the
   coding-agent session (`claude`, `codex`, `opencode`, `cursor-agent`, …), the
   editor, or the terminal — even after the agent backgrounded it with
@@ -42,7 +46,7 @@ developer-process-centric.
   `codex resume <id>`, `opencode --session <id>`). A server whose Claude Code
   session has **ended** is flagged `claude·ended` — an orphan — and a server
   nobody owns any more reads `detached`.
-  `marina kill --orphaned` cleans up after finished sessions; an agent can run
+  `marina kill --ended` cleans up after finished sessions; an agent can run
   `marina kill --mine` to stop exactly the servers it started.
 - **Honest signals** — rows flash green when they appear, turn red while dying,
   and if a long-running server vanishes *without* you killing it, marina says so
@@ -52,13 +56,14 @@ developer-process-centric.
   kills the whole project. Declared groups bundle an app with its database.
 - **Session view** — press `v` to group by *who started it* instead: one header
   per agent session (`claude·fal-app`, `codex·api`), editor, or terminal, across
-  projects. `K` on a session header stops everything that session started.
+  projects. `X` on a session header stops everything that session started.
 - **Agent sessions** — every running coding-agent session (Claude Code,
   opencode, Codex, …) is listed, even one with no servers: a folded
   `▸ agents (21)  3 working · 13 stale · 14GB` section at the bottom of the
   project view, and a row per session in the session view. Each shows what it
   is doing (`$ cargo test`, `working`, `idle 12m`), its cpu/mem (agent + MCP
-  helpers), dir, branch and session id; an agent's background server
+  helpers) and branch, and its detail line the session id and where it runs;
+  an agent's background server
   (`opencode serve`) is shown just above that section, always visible, as
   `opencode server`, rather than as a project among the dev servers; `i` lists its shells and helpers and
   the resume command. Working vs idle comes from when its terminal was last
@@ -66,11 +71,11 @@ developer-process-centric.
   for over a day are dimmed as *stale* — usually a forgotten session holding
   memory. Background Claude Code
   sessions are included; daemons and pty hosts are not. marina never stops an
-  agent: `K` on an agent row explains why, and `K` on its header stops only
+  agent: `X` on an agent row explains why, and `X` on its header stops only
   its servers.
-- **Jump to a session** — an agent row's `VIA` says where it lives
-  (`herdr·ghostty`, `tmux·iterm`, `ghostty`, `—` for no terminal), and
-  `Enter` focuses it there — switching the multiplexer's pane and raising
+- **Jump to a session** — an agent row's detail line says where it lives
+  (`Enter jumps (herdr·ghostty)`, `tmux·iterm`, `ghostty`; `Enter copies
+  resume` for no terminal), and `Enter` focuses it there — switching the multiplexer's pane and raising
   the terminal app showing it:
   a herdr or tmux pane, or the iTerm2 session / Terminal tab / WezTerm pane on
   its tty, or a Ghostty terminal in its directory (macOS asks once to let your
@@ -85,7 +90,7 @@ developer-process-centric.
   section and at the end of `marina agents`.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
-  and `D` opens the uncommitted diff (stat, untracked files, patch) in the
+  and `d` opens the uncommitted diff (stat, untracked files, patch) in the
   pane below. A stale session with no servers and a clean, pushed tree is
   marked *looks finished* — the one to close first.
 - **Orphan notices** — when an agent session ends and leaves servers running,
@@ -94,7 +99,7 @@ developer-process-centric.
   (`osascript` / `notify-send`; turn off with `[notify] desktop = false`).
 - **Where an agent's server came up** — when an agent session starts a web
   server, the status line says so (`claude·api started vite on
-  http://localhost:5173 — O on its session opens it`), once per server.
+  http://localhost:5173 — o on its session opens it`), once per server.
 - **Agent/script CLI** — `marina ls --json`, `marina kill <project>`,
   `marina who 3000` / `marina free 3000`, `marina agents`, sharing the exact
   same resolution engine as the TUI.
@@ -135,7 +140,7 @@ nix profile install github:danfry1/marina   # install
 cargo build --release && ./target/release/marina
 ```
 
-Runs on **macOS and Linux**. On Linux, `O` (open) uses `xdg-open` and `Y` (copy)
+Runs on **macOS and Linux**. On Linux, `o` (open) uses `xdg-open` and `y` (copy)
 uses `wl-copy`/`xclip`; accurate `phys_footprint` memory is macOS-only (Linux
 falls back to RSS).
 
@@ -158,32 +163,40 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 
 | key | action |
 |---|---|
-| `j` / `k`, `g` / `G` | move / jump to top·bottom (mouse: click / wheel) |
-| `Enter` | fold / unfold a group · on an agent row: jump to its pane |
-| `D` | uncommitted diff of the selected agent's / server's work tree |
-| `v` | group by project ↔ by agent session / launcher (lists agent sessions) |
+| `j` `k` / `↑` `↓` | move (stops at the ends; mouse: click / wheel) |
+| `g` `G` / `Home` `End` | top · bottom |
+| `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp` | half a page · a page (with a pane open, `PgDn`/`PgUp` page it) |
+| `h` `l` / `←` `→` | fold · unfold a header; `h` on a row under one goes up to it |
+| `Enter` | fold a header · inspect a server · jump to an agent session's pane |
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
-| `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`) |
-| `s` | cycle sort (port / cpu / mem) — or click a column header |
-| `K` · `u` | kill selection · cancel the pending force-kill |
-| `R` · `T` | restart (output captured to a log) · tail logs |
-| `[` / `]`, `+` / `-` | scroll / resize the log pane |
-| `Y` · `O` | copy URL · open in browser (on an agent session: the server it started; again: the next) |
-| `Esc` | close pane / clear filter |
-| `q` / `Ctrl+C` | quit |
+| `t` · `d` | the server's log · the uncommitted diff of its (or an agent's) work tree, in a pane; again closes it |
+| `[` `]`, `+` `-` | scroll · resize the pane |
+| `y` · `o` | copy URL · open in browser (on a session or group: its first web server; again: the next) |
+| `X` | kill: SIGTERM; again on a server still stopping: SIGKILL |
+| `R` | restart (output captured to a log) |
+| `/` | filter (project / command / port / cwd / branch / launcher — `/claude`, `/ended`); Esc while typing restores the previous filter |
+| `s` · `S` | cycle sort (port / cpu / mem) · reverse it — or click a column header (again: reverse) |
+| `v` | group by project ↔ by who started them (lists agent sessions) |
+| `?` | all the keys |
+| `Esc` | close the pane, then inspect, then clear the filter |
+| `q` · `Ctrl+C` | close the open pane, else quit · quit |
 
-`K`/`R` on a group header act on the whole project. Docker rows map to
-`docker stop` / `docker restart` / `docker logs -f`.
+Capital letters touch processes (`X`, `R`); everything else is lowercase,
+with vim's `G` as the one exception. `X`/`R` on a group header act on the
+servers it shows (in session view, that session's; with a filter, only the
+ones it lets through), and ask first when that's more than one. Docker rows
+map to `docker stop` / `docker restart` / `docker logs -f`.
 
 **CLI** (for scripts and agents)
 
 ```sh
 marina ls [sel…] [--json]     # the snapshot — table, or a stable JSON contract
 marina ls --mine              # only servers started by the agent session running this
-marina kill --orphaned        # stop servers whose agent session has ended
+marina kill --ended           # stop servers whose agent session has ended
 marina kill <selector>        # project name, port (3000 / :3000), or command
+marina kill api --grace 10    # SIGTERM, then SIGKILL after 10s (default 5)
 marina restart <selector>     # output captured to ~/.local/state/marina/logs/
-marina url <selector> [--json]
+marina url [selector…] [--json] # bare: the servers running in this directory
 marina open [selector…]       # open in the browser — bare: the servers running in this directory
 marina who <port>… [--json]   # what's holding a port — dev target or not
 marina free <port>… [--json]  # stop the dev target on a port, wait until it's released
@@ -223,9 +236,22 @@ Both take ports only (no name matching). `who` exits `1` when the port is free.
 a holder that isn't a dev target (e.g. macOS ControlCenter on `:5000`), naming it
 instead.
 
-A selector matching a project name acts on **every** service under it. Exit
-codes: `0` ok, `1` no match, `2` usage error — and unknown commands/flags are
-errors, they never fall through to the TUI.
+A selector is a port (`3000`, `:3000` — ports only) or a name: an exact
+project name, else an exact command, else part of either. A project name acts
+on **every** server under it. `kill`, `restart` and `open` refuse a name that
+reaches more than one project without naming one (`api` matching `api-gateway`
+and `rapid-ui`), listing the candidates; `--all` goes ahead. `open` lists
+rather than opens more than three servers unless `--all` is given.
+
+`kill --json` adds a `result` to each server: `terminated`, `force_killed`,
+`still_running` or `denied`. `--ended` was formerly `--orphaned` (still
+accepted), and the JSON's `launcher.ended` was `launcher.orphaned`.
+
+Exit codes: `0` ok · `1` a selector matched nothing, or a server didn't stop ·
+`2` usage error or an ambiguous selector · `3` the port scan failed, so
+nothing is reported rather than an empty list. `kill --mine` / `kill --ended`
+with nothing in scope is success. `-h` / `--help` works after any command, and
+unknown commands/flags are errors — they never fall through to the TUI.
 
 ## Use with AI agents
 
@@ -272,6 +298,9 @@ match_cmd  = "OrbStack|CloudSyncAgent"   # and/or match_port = 7000
 
 [notify]
 desktop = false                # no desktop notifications at all
+
+[ports]
+range = [3100, 3999]           # where `marina port` assigns from
 ```
 
 ## Privacy & security
@@ -286,7 +315,7 @@ marina is deliberately boring on this front:
   optional file it *reads* is `~/.config/marina/config.toml`. Its writes are
   user-triggered and live under `~/.local/state/marina/`: when **you** restart a
   process (`R` / `marina restart`), the new process's stdout/stderr is captured
-  to `logs/<project>.log` so `T` can always tail it; and `marina port` records
+  to `logs/<project>.log` so `t` can always tail it; and `marina port` records
   its assignments (port, project root, optional service name, timestamps) in
   `ports.json`.
 - **Your processes, your permissions.** It runs unprivileged (no `sudo`) and only
@@ -308,15 +337,15 @@ marina is deliberately boring on this front:
   only when herdr or tmux is running — those tools' own pane listings
   (`herdr agent list`, `tmux list-panes`); the nearest project
   manifest's `name` (package.json / Cargo.toml / …); `.git/HEAD` for the branch;
-  and, only when you press `T` to tail logs, its open file descriptors (via
+  and, only when you press `t` to tail logs, its open file descriptors (via
   `lsof`) and the discovered log file.
 - **Secrets stay internal.** Command-line args can contain tokens/passwords, so
   marina **never displays, serializes, or logs raw argv** — the UI and
   `ls --json` show only derived labels (`next dev`, `vite`); even the inspect
   panel shows just the program path and an arg count. argv is used for
   classification and captured for `restart`, and never leaves the process.
-- **Outbound actions are only the ones you trigger:** `O` opens a URL in your
-  browser, `Y` copies to the clipboard, `K`/`R` send signals to *your* processes,
+- **Outbound actions are only the ones you trigger:** `o` opens a URL in your
+  browser, `y` copies to the clipboard, `X`/`R` send signals to *your* processes,
   `Enter` on an agent asks its multiplexer or terminal app to focus it. The one unprompted
   action is a local desktop notification when an agent session leaves servers
   behind (`[notify] desktop = false` disables it).
@@ -327,7 +356,7 @@ See [DESIGN.md](./DESIGN.md) and the glossary in [CONTEXT.md](./CONTEXT.md).
 
 ## Status
 
-macOS + Linux · ~8.3k LOC · 127 tests (CI builds + tests on both). Docker container
+macOS + Linux · ~14k LOC · 178 tests (CI builds + tests on both). Docker container
 naming + verbs are implemented but pending live verification against a running
 daemon; container cpu/mem (`docker stats`), restart env-capture, and an MCP
 wrapper are future work.

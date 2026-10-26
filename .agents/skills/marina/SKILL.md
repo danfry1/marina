@@ -40,23 +40,30 @@ Each element:
 | `cpu_pct`, `mem_bytes` | resource use; `null` when not measurable (e.g. a docker container) |
 | `exposed` | `true` = bound to 0.0.0.0/:: — reachable from the LAN (worth flagging to the user) |
 | `container` | docker container name, or `null` for a native process |
-| `launcher` | who started it, or `null`: `{kind, name, pid, alive, orphaned, session, cwd}` — `kind` is `agent` / `editor` / `terminal` / `detached`; `name` e.g. `claude`, `codex`, `opencode`, `cursor`, `copilot`, `tmux`; `session` is the agent's session/thread id; `orphaned: true` = its agent session has ended |
+| `launcher` | who started it, or `null`: `{kind, name, pid, alive, ended, session, cwd}` — `kind` is `agent` / `editor` / `terminal` / `detached`; `name` e.g. `claude`, `codex`, `opencode`, `cursor`, `copilot`, `tmux`; `session` is the agent's session/thread id; `ended: true` = its agent session has ended |
 | `uptime_secs`, `pids`, `anchor_pid`, `cwd`, `branch` | process details |
 
-An empty array means nothing dev-relevant is running. You can pre-filter with a
-selector: `marina ls api --json`.
+An empty array means nothing dev-relevant is running — marina exits 3 instead
+when it couldn't scan ports, so `[]` is never a guess. You can pre-filter with
+a selector: `marina ls api --json` (exit 1 if it matches nothing).
 
 ## 2. Act on it
 
-A **selector** matches by project name (exact or substring), a port (`3000` or
-`:3000`), or a command label.
+A **selector** is a port (`3000` or `:3000` — matches ports only) or a name:
+an exact project name, else an exact command label, else a substring of
+either. `kill`, `restart` and `open` refuse (exit 2, candidates on stderr) a
+name that reaches servers in more than one project without naming one
+exactly; pick the exact `project` from `ls --json`, or pass `--all` if you
+really mean all of them.
 
 ```sh
-marina kill <selector>      # SIGTERM, then verified SIGKILL (docker: docker stop)
+marina kill <selector>      # SIGTERM, then verified SIGKILL after 5s
+                            # (--grace <secs> to wait longer; docker: docker stop)
 marina restart <selector>   # kill the subtree, wait for the port to free, re-exec
                             # in the same cwd; output is captured to
                             # ~/.local/state/marina/logs/<project>.log
-marina url <selector>       # print matching URLs (add --json for structure)
+marina url [selector]       # print matching URLs (add --json for structure);
+                            # bare: servers in this directory
 marina open [selector]      # open in the browser; bare: servers in this directory;
                             # --mine: the ones this session started
 marina who <port>           # what's holding a port — a dev target, another
@@ -71,14 +78,18 @@ marina port --list          # all assignments · `--release [name]` returns one
 marina version              # version check (also proves the binary works)
 ```
 
-**Scope flags** (on `ls` / `kill` / `restart` / `url`, with or without selectors):
+**Scope flags** (on `ls` / `kill` / `restart` / `url` / `open`, with or without
+selectors):
 
 ```sh
 marina ls --mine            # only servers started by *your* agent session
 marina kill --mine          # stop exactly the servers you started — nothing else
-marina ls --orphaned        # servers whose launching agent session has ended
-marina kill --orphaned      # clean up after finished sessions
+marina ls --ended           # servers whose launching agent session has ended
+marina kill --ended         # clean up after finished sessions
 ```
+
+`--ended` doesn't include `detached` servers (nobody is known to own them).
+`--orphaned` is an old name for `--ended` and still works.
 
 `--mine` matches by your session/thread id (Claude Code, Codex, opencode, Copilot,
 Amp, …) or agent pid, and exits 2 if marina isn't running inside an agent session.
@@ -87,7 +98,14 @@ Amp, …) or agent pid, and exits 2 if marina isn't running inside an agent sess
 a `next dev` on :3000 and a `postgres` on :5432, `marina kill client-portal`
 stops both.
 
-Exit codes — check them: `0` ok · `1` no match · `2` usage error.
+`kill --json` gives each server a `result`: `terminated`, `force_killed`,
+`still_running` or `denied`; the exit code is 1 if any is `still_running` or
+`denied`.
+
+Exit codes — check them: `0` ok · `1` a selector matched nothing, or a server
+didn't stop · `2` usage error, or an ambiguous selector · `3` the port scan
+failed (nothing is known — don't conclude a port is free). `kill --mine` with
+nothing to stop is `0`.
 
 ## Handling common requests
 
@@ -95,8 +113,9 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 - **"what's on :3000" / EADDRINUSE** → `marina who 3000` (`--json` for structure;
   `status` is `target`, `other`, or `free`).
 - **"stop/kill the X project"** → `marina ls --json` to find the exact `project`
-  value, then `marina kill <project>`. Prefer the exact name to avoid
-  over-matching (a substring like `api` could match several).
+  value, then `marina kill <project>`. An exact project name always wins over
+  substring matches; a substring that reaches several projects exits 2 and
+  lists them — ask the user which one rather than adding `--all`.
 - **Starting a dev server** (especially in a git worktree, or when other agents
   may be running the same project) → don't hard-code `:3000`; ask marina:
   `pnpm dev --port $(marina port)` / `PORT=$(marina port) npm run dev`. Use a
@@ -111,8 +130,8 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 - **"what's this server / who started it?"** → `marina who <port>` or the
   `launcher` field. Servers with `launcher.name == "claude"` but a different
   `session` belong to another Claude Code session — leave them alone unless asked.
-- **"kill leftover/zombie dev servers"** → `marina ls --orphaned` first, show the
-  user, then `marina kill --orphaned`.
+- **"kill leftover/zombie dev servers"** → `marina ls --ended` first, show the
+  user, then `marina kill --ended`.
 - **"what are my agents doing" / "which Claude sessions are running"** →
   `marina agents --json`: one entry per live agent session with `session`,
   `resume` (e.g. `claude --resume <id>`), `state` (`working` / `idle` /
@@ -133,10 +152,15 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
 - marina only sees and touches the **current user's own** processes, and never
   lists or kills the shell/session it (or you) run in — so you can't accidentally
   kill your own terminal.
-- It makes no network calls. The only file it writes is the per-project restart
-  log (`~/.local/state/marina/logs/<project>.log`) — read that when the user asks
-  why a restarted server is misbehaving.
+- It makes no network calls. It writes two things under `~/.local/state/marina/`:
+  the per-project restart log (`logs/<project>.log`) — read that when the user
+  asks why a restarted server is misbehaving — and `marina port`'s assignments
+  (`ports.json`).
+- A restarted server doesn't get its original environment back (marina can't
+  capture it); if it depends on env vars set in its old shell, it may fail —
+  check its log.
 - Unknown subcommands/flags exit 2 immediately (they never fall through to the
   blocking TUI), so it's safe to script against.
 - Resolution is heuristic; if a `project`/`command` looks wrong, fall back to the
   `port` selector, which is exact.
+- `marina <command> --help` prints the usage.

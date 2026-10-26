@@ -36,7 +36,7 @@ Sleep 1500ms
 # tail a service's logs inline
 Down
 Sleep 600ms
-Type "T"
+Type "t"
 Sleep 3s
 Escape
 Sleep 1s

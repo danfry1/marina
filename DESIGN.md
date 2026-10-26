@@ -255,7 +255,7 @@ Three subtleties these contracts encode:
   (port-wait + re-exec), docker verbs, and log discovery (`lsof` can stall) all
   run on their own threads and report back over the `UiEvent` channel. Only the
   initial signal burst and `CopyUrl`/`Open` are cheap enough to run inline.
-- **Verbs demand an immediate resample.** After `K`/`R` the UI sends
+- **Verbs demand an immediate resample.** After `X`/`R` the UI sends
   `SamplerCtl::Refresh` so the dead row disappears in ~a second even when the
   adaptive cadence had backed off to 5s. The sampler blocks in `recv_timeout`,
   so a refresh request also wakes it instantly.
@@ -341,10 +341,12 @@ remains a possible refinement.)
 
 **Wired:** copy, open, kill (fingerprint-verified SIGTERM now — the start_time
 check runs before *every* signal, the first SIGTERM included, since the pids
-come from a snapshot that can be seconds old — then SIGKILL after a 4s grace
-period, same verification; `u` cancels the escalation, and the status wording is
-honest that SIGTERM already went out; signals go through `libc::kill` so EPERM
-is reported, not swallowed), restart (verified kill subtree → wait for the ports
+come from a snapshot that can be seconds old. Escalation is explicit: a
+server still running after 4s is reported (`X again to force-kill …`), and `X`
+on a row that's still stopping sends a verified SIGKILL — so a slow, clean
+shutdown is never cut short. The CLI escalates on its own after `--grace`
+(default 5s). Signals go through `libc::kill` so EPERM is reported, not
+swallowed), restart (verified kill subtree → wait for the ports
 to actually free, escalating if SIGTERM is ignored → re-exec captured argv in
 cwd with stdout/stderr captured to `~/.local/state/marina/logs/<project>.log`,
 plus a watchdog that reports a respawn crashing within 2s), docker verbs
@@ -352,15 +354,22 @@ plus a watchdog that reports a respawn crashing within 2s), docker verbs
 **Follow-ups:** env capture for restart, supervisor logs (pm2/foreman),
 container cpu/mem via `docker stats`.
 
-Navigation: `j/k` move, `g/G` top/bottom, `/` filter (project/command/port/cwd/
-branch), `s` cycle sort (port/cpu/mem — or click a header), `i` inspect panel,
-`Enter` fold/unfold, `[`/`]` + `+`/`-` scroll/resize the log pane, `Esc` closes
-the innermost thing (log → inspect → filter), mouse click/wheel, `q` or `Ctrl+C`
-quit. **Verbs are capital letters** — `K` kill, `R` restart, `T` tail, `Y`
-copy-url, `O` open — distinct from lowercase nav so `k` (up) never collides with
-kill, and so destructive actions require a deliberate Shift. (`u` after a kill
-cancels the pending SIGKILL; the rows render in a red "dying" style during the
-grace window.)
+Navigation: `j/k` move (stopping at the ends), `g/G` top/bottom, `Ctrl-d/u` and
+`PgDn/PgUp` page, `h/l` fold/unfold (`h` on a row goes up to its header), `/`
+filter (project/command/port/cwd/branch/launcher; Esc while typing restores the
+previous filter), `s` cycle sort and `S` reverse (or click a header, again to
+reverse), `i` inspect panel, `Enter` folds a header / inspects a server / jumps
+to an agent (clicking the selected row does the same), `[`/`]` + `+`/`-`
+scroll/resize the pane, `Esc` closes the innermost thing (pane → inspect →
+filter), `q` closes an open pane or else quits, `Ctrl+C` quits. **Shift means
+it touches processes** — `X` kill, `R` restart — and nothing else is
+uppercase except vim's `G`: `t` log, `d` diff, `y` copy-url, `o` open. `X` sits
+away from `h/j/k/l/g/G`, so a Shift held over from `G` can't kill the bottom
+row. Any verb on more than one server (a group header) asks first, and a
+header acts only on the members the filter shows. A row marina just stopped or
+restarted stays under the cursor as a placeholder (`stopped`, `restarting…`),
+so a second press can't land on the neighbour that slid into its place.
+Stopping rows render red, `stopping…`.
 
 ---
 
@@ -404,12 +413,20 @@ holder is reported and left alone (exit 1). It is idempotent (an already-free
 port exits 0, so `marina free 3000 && pnpm dev` re-runs safely) and waits until
 the port is actually released before returning. `who` exits 1 for a free port.
 
-**Scope flags** — `--mine` and `--orphaned` narrow `ls`/`kill`/`restart`/`url`
+**Scope flags** — `--mine` and `--ended` narrow `ls`/`kill`/`restart`/`url`/`open`
 by launcher (see *Launcher attribution*), with or without selectors. `--mine`
 is "started by the agent session running this command" (matched by session id,
 else agent pid; exit 2 outside an agent session), so an agent can clean up its
-own servers without touching the user's or another session's. `--orphaned` is
-"started by an agent session that has since ended".
+own servers without touching the user's or another session's. `--ended` is
+"started by an agent session that has since ended" (named after the TUI's
+`claude·ended`; `--orphaned` is its old name and still accepted).
+
+**Selectors** — a port matches ports only; a name matches an exact project,
+else an exact command, else a substring. A name reaching more than one
+project without naming one is refused by `kill`/`restart`/`open` (exit 2,
+candidates listed) unless `--all`. A failed port scan exits 3 on every command
+that snapshots, so "nothing running" is never reported from a scan that didn't
+happen; `kill --json` reports a per-server `result`.
 
 Unknown commands/flags are hard errors (exit 2) — a typo in a script must never
 fall through and block on the TUI.
@@ -562,7 +579,7 @@ and after `marina agents`.
 **Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
 `diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached
 20s and refreshed at most 6 directories per tick, in parallel (the CLI refreshes all).
-Shown as a badge before the branch (`●4 ↑2`, `✓`); `D` streams `diff --stat`,
+Shown as a badge before the branch (`●4 ↑2`, `✓`); `d` streams `diff --stat`,
 untracked files and the patch into the log pane. *Looks finished* = stale, no
 live servers, clean and pushed tree — closing it loses nothing, and the
 session can be resumed.
@@ -576,8 +593,8 @@ before idle before stale). Agent rows show the activity in COMMAND and dim
 when stale; the title totals agent count and memory; `i` lists
 shells/helpers; and `marina agents [sel…] [--json]` prints them with a
 `state` and the servers each started.
-Verbs never reach an agent: `selected_targets` is empty on an agent row (K/R/T/
-Y/O explain instead), a session header's `K` stops only its servers, and the
+Verbs never reach an agent: `selected_targets` is empty on an agent row (X/R/t/
+y/o explain instead), a session header's `X` stops only its servers, and the
 CLI command is read-only.
 
 A **selector** matches by project name (exact/substring), port (`3000`/`:3000`),
@@ -622,16 +639,16 @@ non-issue — rows for system stuff may just be opaque.
   `[[rule]]` (regex → label + url template), `[[watch]]`, `[[override]]` (pin by
   port/cmd), `[[ignore]]` (hide noise by port/cmd). Layered over built-in
   defaults; bad regex / absent file falls back silently.
-- **Inline log tail** (`T`): discovery in order of confidence — a `.log` held
+- **Inline log tail** (`t`): discovery in order of confidence — a `.log` held
   open by the subtree (`lsof`, run **off-thread**), then marina's own capture
   from a previous restart, then `*.log` in the project dir / `logs/`, then a pm2
   log — live-tailed in a scrollable, resizable pane (`[`/`]`, `+`/`-`) that
   survives log rotation; `Esc` closes. Honest "no log file" when nothing's found.
   Docker rows tail `docker logs -f`.
 - **Restart log capture**: anything marina restarts gets stdout/stderr appended
-  to `~/.local/state/marina/logs/<project>.log` — so `T` always works for it.
-- **Kill undo** (`u`): cancels the pending SIGKILL within the 4s grace window
-  (wording is honest that SIGTERM already went). Dying rows render red.
+  to `~/.local/state/marina/logs/<project>.log` — so `t` always works for it.
+- **Explicit force-kill**: `X` sends SIGTERM; a server still running after 4s
+  is reported, and `X` on it again sends SIGKILL. Stopping rows render red.
 - **Crash detection**: a long-running target vanishing without a marina-issued
   kill/restart raises `⚠ … exited unexpectedly`; marina-initiated actions are
   suppressed. New rows flash green briefly.
@@ -643,7 +660,7 @@ non-issue — rows for system stuff may just be opaque.
   sort, wheel), persistent **data-source warnings** (port-scan failure, sampler
   death) that can't be mistaken for "no dev processes".
 - **Docker targets**: named via `docker ps` (cached, fail-silent), with verbs —
-  `K` → `docker stop`, `R` → `docker restart`, `T` → `docker logs -f`.
+  `X` → `docker stop`, `R` → `docker restart`, `t` → `docker logs -f`.
   _Container cpu/mem not captured — shown as `—`._
 - **`phys_footprint` memory** via `libproc` (Activity-Monitor-matching), with RSS
   fallback.
@@ -651,13 +668,13 @@ non-issue — rows for system stuff may just be opaque.
   `--json` and project/port/command selectors; strict argument parsing (typos
   exit 2, never launch the TUI). Project-selector kill = group-kill.
 - **TUI grouping**: a project with several targets gets a collapsible header
-  (`Enter` folds; `K`/`R` act on the whole group); a lone target stays a plain
+  (`Enter` folds; `X`/`R` act on its visible members, after a confirm); a lone target stays a plain
   row. Group cpu/mem aggregate in the header; same project-matching as the CLI.
 - **Session view** (`v`): the same grouping machinery keyed by launcher instead
   of project — one header per agent session (`claude·<dir>`, `claude·ended`),
-  editor, terminal, `detached`, or `unattributed`; distinct sessions that would
+  editor, terminal, `detached`, or `unknown`; distinct sessions that would
   share a label get a short id suffix (`#219a`). Every session gets a header,
-  even with one member, because the session is the information. `K`/`R` on a
+  even with one member, because the session is the information. `X`/`R` on a
   session header act on exactly that session's targets. Live agent sessions
   list here too (see *Agent sessions*).
 - **Orphan notices**: the snapshot diff in `App::apply` reports each agent

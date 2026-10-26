@@ -1,6 +1,6 @@
 // A small marina in the browser: `marina demo`'s made-up machine (src/demo.rs)
-// in the servers view, with the keys that matter (j/k, g/G, Enter, K, R, T,
-// O, Y, s, v, ?). It copies how marina looks and behaves; it doesn't run
+// in the servers view, with the keys that matter (j/k, g/G, Enter, X, R, t,
+// d, o, y, s, v, ?). It copies how marina looks and behaves; it doesn't run
 // marina, and nothing it does leaves the page.
 (function () {
   "use strict";
@@ -46,10 +46,10 @@
   function init() {
     S = {
       servers: servers(now()), agents: agents(), sel: 0, sort: "port", by: "project",
-      agentsOpen: false, folded: {}, log: null, help: false, notice: null,
+      agentsOpen: false, folded: {}, log: null, help: false, notice: null, confirm: null,
       touched: S ? S.touched : false, hint: false,
     };
-    tell("⚠ 1 server left running by ended agent sessions · /ended to review", "yellow", true);
+    tell("⚠ /ended to review · 1 server left running by ended agent sessions", "yellow", true);
   }
 
   function via(s) { return s.orphan ? "claude·ended" : s.by ? s.by.split("·")[0] : "—"; }
@@ -112,6 +112,13 @@
 
   function handle(k) {
     if (S.help) { if (k === "Escape" || k === "?" || k === "q") S.help = false; render(); return true; }
+    if (S.confirm) {
+      var c = S.confirm;
+      S.confirm = null;
+      if (k === c.key || k === "Enter") c.run(); else tell("cancelled");
+      render();
+      return true;
+    }
     var n = entries().length, e = current();
     switch (k) {
       case "j": case "ArrowDown": S.sel = Math.min(n - 1, S.sel + 1); break;
@@ -127,16 +134,16 @@
       case "v":
         S.by = S.by === "project" ? "session" : "project";
         S.sel = 0;
-        tell(S.by === "session" ? "grouped by agent session / launcher" : "grouped by project");
+        tell(S.by === "session" ? "grouped by who started them" : "grouped by project");
         break;
       case "Enter": enter(e); break;
-      case "K": kill(e); break;
+      case "X": kill(e); break;
       case "R": restart(e); break;
-      case "T": logs(e); break;
-      case "D": diff(e); break;
-      case "O": case "Y": url(e, k); break;
-      case "u": tell("nothing to cancel"); break;
-      case "q": tell("q quits marina — this one stays"); break;
+      case "t": logs(e); break;
+      case "d": diff(e); break;
+      case "o": case "y": url(e, k); break;
+      case "K": case "x": tell(k + " isn't a key here — X (Shift-x) kills · ? lists them"); break;
+      case "q": if (S.log) S.log = null; else tell("q quits marina — this one stays"); break;
       default: return false;
     }
     render();
@@ -148,21 +155,26 @@
     if (e.kind === "fold") { S.agentsOpen = !S.agentsOpen; return; }
     if (e.kind === "group") { S.folded[e.name] = !S.folded[e.name]; return; }
     if (e.kind === "agent") { tell("jumping to the " + e.a.place + "… (in the demo, nothing moves)", "cyan"); return; }
-    tell("Enter folds groups and jumps to agent sessions — on a server, try K, R or T");
+    tell("Enter inspects a server in marina — here, try X, R or t on it");
   }
 
-  function kill(e) {
+  function what(e, list) {
+    return e.kind === "group" ? list.length + " server" + (list.length === 1 ? "" : "s") + " in " + e.name : list[0].project + " · " + list[0].cmd;
+  }
+  // a verb on several servers asks first: its key again or Enter goes ahead
+  function ask(key, prompt, run) { S.confirm = { key: key, run: run }; tell(prompt + "? " + key + " again or Enter · any other key cancels", "yellow", true); }
+
+  function kill(e, confirmed) {
     if (e && e.kind === "agent") {
-      tell("marina doesn't kill agent sessions — exit " + e.a.agent + " from its terminal; its servers are listed under it", "yellow");
+      tell("exit " + e.a.agent + " from its terminal — marina doesn't kill agent sessions; its servers are listed under it", "yellow");
       return;
     }
     var list = serversOf(e);
     if (!list.length) { tell("select a server or a group to kill"); return; }
-    var label = e.kind === "group" ? e.name : list[0].project;
+    var label = what(e, list);
+    if (list.length > 1 && !confirmed) { ask("X", "kill " + label, function () { kill(e, true); }); return; }
     list.forEach(function (s) { s.dying = true; });
-    tell(list.length === 1 && list[0].container
-      ? "stopping 1 container…"
-      : "killing " + label + " (" + list.length * 3 + " processes) — SIGTERM sent, SIGKILL in 4s · u cancels the SIGKILL", "red");
+    tell("stopping " + label + " — SIGTERM sent", "red");
     setTimeout(function () {
       S.servers = S.servers.filter(function (s) { return list.indexOf(s) < 0; });
       var orphan = list.some(function (s) { return s.orphan; });
@@ -171,15 +183,16 @@
     }, reduced ? 0 : 1200);
   }
 
-  function restart(e) {
-    if (e && e.kind === "agent") { tell("marina doesn't restart agent sessions — select one of its servers"); return; }
+  function restart(e, confirmed) {
+    if (e && e.kind === "agent") { tell("select one of its servers — marina doesn't restart agent sessions"); return; }
     var list = serversOf(e);
     if (!list.length) { tell("select a server or a group to restart"); return; }
-    var label = e.kind === "group" ? e.name : list[0].project;
+    var label = what(e, list);
+    if (list.length > 1 && !confirmed) { ask("R", "restart " + label, function () { restart(e, true); }); return; }
     tell("restarting " + label + "…", "yellow");
     setTimeout(function () {
       list.forEach(function (s) { s.up = now(); s.born = Date.now(); });
-      tell(label + " restarted — its output goes to ~/.local/state/marina/logs/" + label + ".log", "green");
+      tell("t shows its output · restarted " + label, "green");
       render();
     }, reduced ? 0 : 900);
   }
@@ -191,24 +204,26 @@
     return ["> " + s.project + "@0.1.0 dev", "> " + s.cmd, "", "  ➜  Local:   http://localhost:" + s.port + "/", "  ✓ Ready in 1.8s", " GET / 200 in 142ms", " GET /" + s.project + " 200 in 88ms"];
   }
   function logs(e) {
-    if (S.log) { S.log = null; return; }
-    if (!e || e.kind !== "server") { tell("select a service (not a group) to tail"); return; }
+    if (S.log && S.log.kind === "log") { S.log = null; return; }
+    if (!e || e.kind !== "server") { tell("select a server to see its log"); return; }
     var s = e.s;
-    S.log = { title: s.container ? "docker logs " + s.container : "~/dev/" + s.project + "/.dev.log", lines: logLines(s) };
+    S.log = { kind: "log", title: s.container ? "docker logs " + s.container : "~/dev/" + s.project + "/.dev.log", lines: logLines(s) };
     tell("tailing " + s.project + " · " + s.cmd);
   }
   function diff(e) {
     var p = e && (e.kind === "agent" ? e.a.project : e.kind === "server" ? e.s.project : null);
+    if (S.log && S.log.kind === "diff") { S.log = null; return; }
     if (!p) { tell("select an agent session or a server to see its diff"); return; }
-    S.log = { title: "diff ~/dev/" + p, lines: [" src/" + p + "/index.ts | 42 +++++++++++++++++++++----", " src/lib/flags.ts        |  6 ++++-",
+    S.log = { kind: "diff", title: "~/dev/" + p, lines: [" src/" + p + "/index.ts | 42 +++++++++++++++++++++----", " src/lib/flags.ts        |  6 ++++-",
       " 2 files changed, 41 insertions(+), 7 deletions(-)", "", "+  if (flags.payments) {", "+    return <SavedCards user={user} />", "+  }"] };
   }
   function url(e, k) {
     var s = e && e.kind === "server" ? e.s : null;
     if (e && e.kind === "agent") s = S.servers.filter(function (x) { return x.by === e.a.id; })[0];
-    if (!s) { tell(e && e.kind === "agent" ? e.a.id + " hasn't started a web server" : "select a service (not a group) to open"); return; }
+    if (e && e.kind === "group") s = serversOf(e).filter(function (x) { return x.cmd !== "postgres"; })[0];
+    if (!s) { tell(e && e.kind === "agent" ? e.a.id + " hasn't started a web server" : e && e.kind === "fold" ? "the agents section has no URL — select a session or a server" : "select a server to open its URL"); return; }
     var u = (s.cmd === "postgres" ? "postgres://localhost:" : "http://localhost:") + s.port;
-    if (k === "Y") {
+    if (k === "y") {
       if (navigator.clipboard) navigator.clipboard.writeText(u).catch(function () {});
       tell("copied " + u, "green");
     } else tell(s.cmd === "postgres" ? u + " is not a web URL" : "opening " + u + " (in the demo, nothing opens)", "cyan");
@@ -235,16 +250,16 @@
       return open + cells([[bar + (S.folded[e.name] ? "▸ " : "▾ ") + "<b>" + esc(e.name) + "</b>" + sp("dim", " (" + e.list.length + ")")], [""], [""],
         [gc.toFixed(1) + "%"], [mem(gm)], ["", "c-via"], ["", "c-up"], ["", "c-br"]]) + "</div>";
     }
-    var lead = bar + (e.child ? "  ↳ " : "");
+    var lead = bar + (e.child ? (S.by === "session" && e.kind === "server" ? "  " : "  ↳ ") : "");
     if (e.kind === "agent") {
       var a = e.a;
-      return open + cells([[lead + (e.child ? "" : esc(a.id)), "mag"], [a.shell ? esc("$ " + a.shell) : "idle " + age(a.quiet), a.shell ? "yellow" : "dim"], ["—", "dim"],
-        [agentCpu(a).toFixed(1) + "%"], ["520MB"], [esc(a.host), "dim c-via"], [a.quiet > 86400 ? "3d" : "4h", "c-up"],
+      return open + cells([[lead + (e.child ? "◆ " + esc(a.agent) : esc(a.id)), "mag"], [a.shell ? esc("$ " + a.shell) : "idle " + age(a.quiet), a.shell ? "yellow" : "dim"], ["—", "dim"],
+        [agentCpu(a).toFixed(1) + "%"], ["520MB"], ["—", "dim c-via"], [a.quiet > 86400 ? "3d" : "4h", "c-up"],
         [sp(a.tree === "✓" ? "green" : "yellow", a.tree) + " " + esc(a.branch), "c-br"]]) + "</div>";
     }
     var s = e.s, c = cpuOf(s), born = s.born && Date.now() - s.born < 1300;
     open = '<div class="' + cls + (s.dying ? " dying" : born ? " born" : "") + '" data-row="' + i + '">';
-    return open + cells([[lead + (e.child ? "" : esc(s.project))], [esc(s.cmd) + (s.tag ? sp("dim", " ·" + s.tag) : "")],
+    return open + cells([[lead + (e.child && S.by !== "session" ? "" : esc(s.project))], [s.dying ? "stopping…" : esc(s.cmd) + (s.tag ? sp("dim", " ·" + s.tag) : "")],
       [":" + s.port + (s.lan ? sp("red", "!") : "")], [c.toFixed(1) + "%", c >= 100 ? "red" : ""], [mem(s.mem), s.mem >= 2048 ? "red" : ""],
       [esc(via(s)), (s.orphan ? "yellow" : s.by ? "mag" : "dim") + " c-via"], [age(t - s.up), "c-up"], [esc(s.branch), "dim c-br"]]) + "</div>";
   }
@@ -252,8 +267,8 @@
   function detailLine(e) {
     if (!e) return "";
     if (e.kind === "fold") return S.agents.length + " agent sessions · 2 working · 1 idle and open >1d (520MB) · helpers: chrome-devtools-mcp ×4 192MB · Enter folds/unfolds";
-    if (e.kind === "group") { var l = serversOf(e); return e.name + " · " + l.length + " service" + (l.length === 1 ? "" : "s") + " · K " + (S.by === "session" ? "stops its servers" : "kills all"); }
-    if (e.kind === "agent") return e.a.id + " · " + (e.a.shell ? "$ " + e.a.shell : "idle " + age(e.a.quiet)) + " · in the " + e.a.place + " · Enter jumps there · D its diff";
+    if (e.kind === "group") { var l = serversOf(e); return e.name + " · " + l.length + " server" + (l.length === 1 ? "" : "s") + " · X " + (S.by === "session" ? "stops its servers" : "kills all"); }
+    if (e.kind === "agent") return e.a.id + " · " + (e.a.shell ? "$ " + e.a.shell : "idle " + age(e.a.quiet)) + " · Enter jumps (" + e.a.host + ") · in the " + e.a.place + " · d its diff";
     var s = e.s;
     return s.project + " · " + s.cmd + " · " + (s.cmd === "postgres" ? "postgres://" : "http://") + "localhost:" + s.port + " · ~/dev/" + s.project +
       (s.lan ? " · LAN-exposed (0.0.0.0)" : "") + (s.orphan ? " · via claude (session 5e551000 ended)" : s.by ? " · via " + s.by : s.container ? " · docker " + s.container : "");
@@ -262,34 +277,43 @@
   function ln(html, cls) { return '<div class="ln ' + (cls || "") + '">' + (html || "") + "</div>"; }
 
   function helpHtml() {
-    var rows = [["j / k", "move · g / G top · bottom"], ["Enter", "fold a group · on an agent: jump to it"], ["K", "kill (SIGTERM, then a verified SIGKILL)"],
-      ["R", "restart, output captured to a log"], ["T · D", "tail its logs · an agent's diff"], ["O · Y", "open · copy its URL"],
-      ["s", "sort: port · cpu · mem"], ["v", "group by project / by agent session"]];
+    var rows = [["j / k", "move · g / G top · bottom"], ["Enter", "fold a group · on an agent: jump to it"], ["X", "kill (again: force-kill)"],
+      ["R", "restart, output captured to a log"], ["", "X and R on a group ask first"], ["t · d", "its log · its uncommitted diff"], ["o · y", "open · copy its URL"],
+      ["s", "sort: port · cpu · mem"], ["v", "group by project / by who started them"]];
     return '<div class="help"><div class="help-box">' + ln("<b>" + sp("cyan", "marina — keys") + "</b>") + ln("") +
       rows.map(function (r) { return '<div class="help-row">' + sp("mag", r[0]) + sp("white", r[1]) + "</div>"; }).join("") +
       ln("") + ln(sp("dim", "Esc or ? closes · the real thing also filters with /")) + "</div></div>";
+  }
+
+  // the keys that do something on this row
+  function hints(e) {
+    if (!e) return "v by session · ? help";
+    if (e.kind === "group") { var n = serversOf(e).length; return "Enter fold · X kill " + n + " · R restart " + n + " · o open · ? help"; }
+    if (e.kind === "fold") return "Enter fold/unfold · v by session · ? help";
+    if (e.kind === "agent") return "Enter jump · d diff · o open its server · ? help";
+    return "o open · y copy · t logs · R restart · X kill · s sort · v by session · ? help";
   }
 
   function render() {
     var list = entries();
     if (S.sel >= list.length) S.sel = Math.max(0, list.length - 1);
     var t = now(), e = list[S.sel];
-    var title = " DEMO · marina · " + S.servers.length + " targets · " + S.agents.length + " agents 2.0GB · sort:" + S.sort + (S.by === "session" ? " · by:session" : "") + " ";
+    var title = " DEMO · marina · " + S.servers.length + " servers · " + S.agents.length + " agents 2.0GB · sort:" + S.sort + (S.by === "session" ? " · by:session" : "") + " ";
     var head = cells([["  PROJECT", "th"], ["COMMAND", "th"], ["PORT" + (S.sort === "port" ? " ▾" : ""), "th"], ["CPU" + (S.sort === "cpu" ? " ▾" : ""), "th"],
       ["MEM" + (S.sort === "mem" ? " ▾" : ""), "th"], ["VIA", "th c-via"], ["UP", "th c-up"], ["BRANCH", "th c-br"]]);
     var html = '<div class="box main"><div class="box-title"><span>' + esc(title) + '</span></div><div class="box-body"><div class="tbl">' +
       head + list.map(function (x, i) { return rowHtml(x, i, t); }).join("") + "</div></div></div>";
     if (S.log) {
-      html += '<div class="box logs"><div class="box-title"><span>' + esc(" logs: " + S.log.title + " — Esc close ") + '</span></div><div class="box-body">' +
+      html += '<div class="box logs"><div class="box-title"><span>' + esc(" " + S.log.kind + ": " + S.log.title + " — q close ") + '</span></div><div class="box-body">' +
         S.log.lines.map(function (l) { return ln(esc(l)); }).join("") + "</div></div>";
     }
     html += '<div class="status">' + ln(esc(detailLine(e))) +
-      ln(S.notice ? sp(S.notice.cls, S.notice.text) : sp("dim", "j/k move · Enter fold/jump · K kill · R restart · T logs · s sort · v by session · ? help")) + "</div>";
+      ln(S.notice ? sp(S.notice.cls, S.notice.text) : sp("dim", hints(e))) + "</div>";
     if (S.help) html += helpHtml();
     if (S.hint) {
       html += '<div class="invite-hint"><b>Your turn.</b> ' + (touchOnly
-        ? "Tap the keys below: K kills, T shows logs, v groups by agent session."
-        : "Press <kbd>j</kbd> <kbd>k</kbd> to move, <kbd>K</kbd> to kill, <kbd>T</kbd> for logs, <kbd>v</kbd> to group by session.") + "</div>";
+        ? "Tap the keys below: X kills, t shows logs, v groups by agent session."
+        : "Press <kbd>j</kbd> <kbd>k</kbd> to move, <kbd>X</kbd> to kill, <kbd>t</kbd> for logs, <kbd>v</kbd> to group by session.") + "</div>";
     }
     screen.innerHTML = html;
   }
@@ -365,7 +389,7 @@
   // session left behind and kills it, then groups by agent session, with the
   // keycaps going down, then hands over. Any input stops it.
 
-  var script = [["j", 1400], ["j", 500], ["j", 500], ["K", 1100], ["v", 2600]];
+  var script = [["j", 1400], ["j", 500], ["j", 500], ["X", 1100], ["v", 2600]];
   var shown = false;
   function attract() {
     if (shown || S.touched) return;

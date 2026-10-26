@@ -78,9 +78,12 @@
   that hides a target the curation heuristics keep surfacing. The complement of
   a watch rule.
 
-- **Dying row** — a target inside an active kill grace window (SIGTERM sent,
-  SIGKILL pending, `u` still cancels the escalation), rendered struck-through
-  in red until the window closes.
+- **Dying row** — a target `X` sent SIGTERM to that hasn't exited yet,
+  rendered red as `stopping…`; `X` on it again sends SIGKILL.
+
+- **Held row** — the placeholder (`stopped`, `restarting…`) that keeps a row
+  marina just stopped or restarted under the cursor after it leaves the
+  snapshot, so a second keypress can't hit its neighbour. Moving lets it go.
 
 - **Inspect panel** — the `i` pane showing everything about the selection that
   doesn't fit a row: program + arg count (never raw argv), all ports, url, cwd,
@@ -88,7 +91,7 @@
 
 - **Launcher** — who started a Target: an *agent* session (`claude`, `codex`,
   …), an *editor*, a *terminal*, or nobody any more (*detached*). Shown in the
-  `VIA` column; the basis of the `--mine` / `--orphaned` scopes.
+  `VIA` column; the basis of the `--mine` / `--ended` scopes.
 
 - **Port lease** — a `marina port` assignment: (project root, optional service
   name) → port, stable across calls and exclusive across worktrees. Stored in
@@ -142,5 +145,6 @@
   and whose work tree is clean and pushed: the safest one to close.
 
 - **Orphaned** — a Target whose launching agent session has ended while the
-  server kept running (`claude·ended`). Distinct from *detached*, which carries
-  no agent markers at all.
+  server kept running (`claude·ended`; the CLI's `--ended`, JSON
+  `launcher.ended`). Distinct from *detached*, which carries no agent markers
+  at all.

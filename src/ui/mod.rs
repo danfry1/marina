@@ -1,6 +1,6 @@
 //! Ratatui view, split by responsibility:
 //! - `state`  — view state that survives snapshot swaps (selection, sort,
-//!   filter, log pane, pending kill, flash/dying animation), plus all input
+//!   filter, log pane, stopping/held rows, confirms, flash animation), plus all input
 //!   handling logic (keys arrive via `main`, mouse via `App::on_mouse`).
 //! - `render` — drawing from `(snapshot + view state)`; no state decisions
 //!   beyond recording layout rects for mouse hit-testing.
@@ -12,5 +12,6 @@ mod state;
 
 pub use render::render;
 pub use state::App;
+pub(crate) use state::{Entry, PaneKind, Verb};
 
 pub(crate) use format::{fmt_age, fmt_uptime, tildify, unix_now};

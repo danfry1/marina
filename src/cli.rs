@@ -1,25 +1,29 @@
 //! Non-interactive CLI — the resolution engine exposed for scripts and agents.
 //!
-//!   marina ls [sel]… [--json]   list running dev targets (optionally filtered)
-//!   marina kill <sel>… [--json] SIGTERM → verified SIGKILL matching targets
-//!   marina restart <sel>…       restart matching targets (output captured)
-//!   marina url <sel>… [--json]  print matching targets' URLs
+//!   marina ls [sel]… [--json]   list running dev servers (optionally filtered)
+//!   marina kill <sel>… [--json] SIGTERM → verified SIGKILL matching servers
+//!   marina restart <sel>…       restart matching servers (output captured)
+//!   marina url [sel]… [--json]  print matching servers' URLs
 //!   marina open [sel]… [--mine] open matching servers in the browser
-//!   marina who <port>… [--json] what is holding a port (dev target or not)
-//!   marina free <port>… [--json] stop whatever dev target holds a port
+//!   marina who <port>… [--json] what is holding a port (dev server or not)
+//!   marina free <port>… [--json] stop whatever dev server holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
 //!   marina port --list | --release [name]
 //!   marina agents [sel]… [--json] running coding-agent sessions + their shells
+//!   marina demo                 the TUI on made-up servers (handled in main)
 //!   marina version              print the version
 //!
-//! A <selector> matches by project name (exact or substring, case-insensitive),
-//! by port (`3000` or `:3000`), or by command label. Killing a project name
-//! takes down every target under it — the grouping primitive, via the CLI.
+//! A <selector> is a port (`3000` or `:3000`, ports only), or a name: an
+//! exact project name, else an exact command label, else a substring of
+//! either (case-insensitive). Killing a project name takes down every server
+//! under it — the grouping primitive, via the CLI. A name that reaches
+//! servers in more than one project without naming one is ambiguous: `kill`,
+//! `restart` and `open` refuse it (exit 2) unless `--all` is given.
 //! Docker targets are stopped/restarted via `docker stop`/`docker restart`.
 //!
-//! `--mine` narrows ls/kill/restart/url/open to targets started by the agent
+//! `--mine` narrows ls/kill/restart/url/open to servers started by the agent
 //! session running this command (so an agent can clean up after itself);
-//! `--orphaned` to targets whose launching agent session has ended.
+//! `--ended` to servers whose launching agent session has ended.
 //!
 //! `agents` is read-only by design: agent sessions are never targets, so no
 //! selector, scope or verb here can stop one.
@@ -44,14 +48,17 @@ marina — developer-process cockpit
 
 USAGE:
     marina                       launch the TUI
-    marina ls [sel]... [--json]  list running dev targets
-    marina kill <sel>... [--json] stop matching targets (SIGTERM -> SIGKILL)
-    marina restart <sel>...      restart matching targets (output captured)
-    marina url <sel>... [--json] print matching targets' URLs
+    marina ls [sel]... [--json]  list running dev servers
+    marina kill <sel>... [--json] [--grace <secs>]
+                                 stop matching servers (SIGTERM, then SIGKILL
+                                 after the grace period, default 5s)
+    marina restart <sel>...      restart matching servers (output captured)
+    marina url [sel]... [--json] print matching servers' URLs
+                                 (no selector: the ones running in this dir)
     marina open [sel]... [--mine]  open matching servers in the browser
                                  (no selector: the ones running in this dir)
     marina who <port>... [--json]  what is holding a port
-    marina free <port>... [--json] stop the dev target holding a port
+    marina free <port>... [--json] stop the dev server holding a port
     marina port [name] [--json]  stable free port for this project/worktree
                                  (pnpm dev --port $(marina port))
     marina port --list           show assigned ports
@@ -59,36 +66,73 @@ USAGE:
     marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
     marina demo                  the TUI on a made-up machine — try the keys
     marina version               print the version
+    marina <command> --help      this help
 
 SELECTOR:
-    a project name (exact or substring), a port (3000 or :3000), or a command.
-    `who` and `free` take ports only.
+    a port (3000 or :3000) matches that port only. A name matches an exact
+    project name, else an exact command, else part of either. kill, restart
+    and open refuse a name that reaches more than one project (--all to go
+    ahead). `who` and `free` take ports only.
 
 SCOPE (ls / kill / restart / url / open; usable instead of, or with, selectors):
-    --mine       only targets started by the agent session running marina
-    --orphaned   only targets whose launching agent session has ended
+    --mine       only servers started by the agent session running marina
+    --ended      only servers whose launching agent session has ended
+                 (`detached` servers, whose launcher is unknown, aren't included)
+
+EXIT CODES:
+    0 ok · 1 a selector matched nothing, or a server didn't stop
+    2 usage error, or an ambiguous selector · 3 the port scan failed
 ";
 
 /// Dispatch a CLI subcommand. Returns `Some(exit_code)` if it handled the
 /// invocation, `None` when there were no args (caller launches the TUI).
-/// Exit codes: 0 ok, 1 no match, 2 usage error — so scripts/agents can branch.
+/// Exit codes: 0 ok, 1 no match (or a partial failure), 2 usage error or an
+/// ambiguous selector, 3 the port scan failed — so scripts/agents can branch.
 pub fn dispatch(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
-    let rest = &args[1..];
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return Some(0);
+    }
+    // `--grace <secs>` is the one flag with a value
+    let mut rest: Vec<&str> = Vec::new();
+    let mut grace = None;
+    let mut it = args[1..].iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let value = match a.strip_prefix("--grace") {
+            Some("") => it.next(),
+            Some(v) if v.starts_with('=') => Some(&v[1..]),
+            _ => {
+                rest.push(a);
+                continue;
+            }
+        };
+        match value
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|g| *g >= 0.0)
+        {
+            Some(g) => grace = Some(Duration::from_secs_f64(g)),
+            None => {
+                eprintln!("marina: --grace takes a number of seconds (--grace 10)");
+                return Some(2);
+            }
+        }
+    }
     let flags: Vec<&str> = rest
         .iter()
-        .map(String::as_str)
+        .copied()
         .filter(|s| s.starts_with('-'))
         .collect();
     let selectors: Vec<&str> = rest
         .iter()
-        .map(String::as_str)
+        .copied()
         .filter(|s| !s.starts_with('-'))
         .collect();
     if let Some(bad) = flags.iter().find(|f| {
         !matches!(
             **f,
-            "--json" | "--mine" | "--orphaned" | "--list" | "--release"
+            // --orphaned: the old name for --ended
+            "--json" | "--mine" | "--ended" | "--orphaned" | "--all" | "--list" | "--release"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -96,9 +140,10 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         return Some(2);
     }
     let json = flags.contains(&"--json");
+    let all = flags.contains(&"--all");
     let mut scope = Scope {
         mine: None,
-        orphaned: flags.contains(&"--orphaned"),
+        ended: flags.contains(&"--ended") || flags.contains(&"--orphaned"),
     };
     if flags.contains(&"--mine") {
         match launcher::own_agent() {
@@ -110,11 +155,19 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         }
     }
     if scope.active() && matches!(cmd, "who" | "free" | "port" | "agents") {
-        eprintln!("marina: {cmd} doesn't take --mine / --orphaned");
+        eprintln!("marina: {cmd} doesn't take --mine / --ended");
         return Some(2);
     }
     if json && cmd == "open" {
         eprintln!("marina: open doesn't take --json (marina url --json prints the URLs)");
+        return Some(2);
+    }
+    if all && !matches!(cmd, "kill" | "restart" | "open") {
+        eprintln!("marina: --all only applies to kill, restart and open");
+        return Some(2);
+    }
+    if grace.is_some() && cmd != "kill" {
+        eprintln!("marina: --grace only applies to `marina kill`");
         return Some(2);
     }
     let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
@@ -122,12 +175,17 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         eprintln!("marina: --list / --release only apply to `marina port`");
         return Some(2);
     }
+    let pick = Pick {
+        selectors: &selectors,
+        scope: &scope,
+        all,
+    };
     let code = match cmd {
-        "ls" => ls(json, &selectors, &scope),
-        "kill" => kill(&selectors, json, &scope),
-        "restart" => restart(&selectors, &scope),
-        "url" => url(&selectors, json, &scope),
-        "open" => open(&selectors, &scope),
+        "ls" => ls(json, &pick),
+        "kill" => kill(&pick, json, grace.unwrap_or(Duration::from_secs(5))),
+        "restart" => restart(&pick),
+        "url" => url(&pick, json),
+        "open" => open(&pick),
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
@@ -136,7 +194,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        "help" | "--help" | "-h" => {
+        "help" => {
             print!("{USAGE}");
             0
         }
@@ -164,16 +222,30 @@ fn snapshot(with_cpu: bool) -> Snapshot {
     }
 }
 
-/// `--mine` / `--orphaned`: narrow by who launched a target.
+/// A snapshot to act on, or exit 3 when the port scan failed — "nothing is
+/// running" must never be reported on the strength of a scan that didn't
+/// happen.
+fn scanned(cmd: &str, with_cpu: bool) -> Result<Snapshot, i32> {
+    let snap = snapshot(with_cpu);
+    match &snap.error {
+        Some(e) => {
+            eprintln!("marina {cmd}: couldn't scan ports ({e}) — not reporting a partial list");
+            Err(3)
+        }
+        None => Ok(snap),
+    }
+}
+
+/// `--mine` / `--ended`: narrow by who launched a target.
 struct Scope {
     /// The agent session running this command (pid, session id).
     mine: Option<(Option<u32>, Option<String>)>,
-    orphaned: bool,
+    ended: bool,
 }
 
 impl Scope {
     fn active(&self) -> bool {
-        self.mine.is_some() || self.orphaned
+        self.mine.is_some() || self.ended
     }
 
     fn keep(&self, t: &Target) -> bool {
@@ -183,73 +255,197 @@ impl Scope {
                 return false;
             }
         }
-        !self.orphaned || l.is_some_and(|l| l.is_orphaned())
+        !self.ended || l.is_some_and(|l| l.is_orphaned())
+    }
+
+    /// `started by this session`, for "nothing to kill (no servers …)".
+    fn describe(&self) -> &'static str {
+        match (self.mine.is_some(), self.ended) {
+            (true, true) => "in that scope",
+            (true, false) => "started by this session",
+            _ => "left running by ended agent sessions",
+        }
     }
 }
 
-/// Selector + scope matching. No selectors means "everything in scope" when a
-/// scope flag is given (`kill --orphaned`), or for `ls`; otherwise nothing.
-fn pick<'a>(
-    snap: &'a Snapshot,
-    selectors: &[&str],
-    scope: &Scope,
-    all_if_empty: bool,
-) -> Vec<&'a Target> {
-    if selectors.is_empty() && !all_if_empty && !scope.active() {
-        return Vec::new();
+/// A command's selectors and scope.
+struct Pick<'a> {
+    selectors: &'a [&'a str],
+    scope: &'a Scope,
+    /// `--all`: an ambiguous name acts on everything it matches.
+    all: bool,
+}
+
+/// What a set of selectors picked.
+#[derive(Default)]
+struct Picked<'a> {
+    targets: Vec<&'a Target>,
+    /// Selectors that matched nothing in scope.
+    unmatched: Vec<String>,
+    /// Names that reach servers in several projects without naming one.
+    ambiguous: Vec<(String, Vec<&'a Target>)>,
+}
+
+impl Picked<'_> {
+    /// Name each selector that matched nothing; 1 if any did.
+    fn report_unmatched(&self, cmd: &str) -> i32 {
+        for sel in &self.unmatched {
+            eprintln!("marina {cmd}: nothing matches {sel:?}");
+        }
+        i32::from(!self.unmatched.is_empty())
     }
-    snap.targets
-        .iter()
-        .filter(|t| selectors.is_empty() || selectors.iter().any(|s| matches(t, s)))
-        .filter(|t| scope.keep(t))
-        .collect()
+
+    /// Refuse an ambiguous selector, listing what it reaches (exit 2).
+    fn refuse_ambiguous(&self, cmd: &str) -> Option<i32> {
+        if self.ambiguous.is_empty() {
+            return None;
+        }
+        for (sel, ts) in &self.ambiguous {
+            let mut projects: Vec<&str> = ts.iter().map(|t| t.project.as_str()).collect();
+            projects.dedup();
+            eprintln!(
+                "marina {cmd}: {sel:?} matches servers in {} projects — name one, or add --all:",
+                projects.len()
+            );
+            for t in ts {
+                let port = t.ports.first().map(|p| format!(":{p}")).unwrap_or_default();
+                eprintln!("  {:<20} {:<16} {port}", t.project, t.command_label);
+            }
+        }
+        Some(2)
+    }
+}
+
+impl Pick<'_> {
+    /// Selector + scope matching. No selectors means "everything in scope"
+    /// when a scope flag is given (`kill --ended`), or with `all_if_empty`
+    /// (`ls`); otherwise nothing.
+    fn on<'a>(&self, snap: &'a Snapshot, all_if_empty: bool) -> Picked<'a> {
+        if self.selectors.is_empty() {
+            let targets = if all_if_empty || self.scope.active() {
+                snap.targets.iter().filter(|t| self.scope.keep(t)).collect()
+            } else {
+                Vec::new()
+            };
+            return Picked {
+                targets,
+                ..Picked::default()
+            };
+        }
+        let mut out = Picked::default();
+        let mut keys = Vec::new();
+        for &sel in self.selectors {
+            let hits: Vec<&Target> = matching(snap, sel)
+                .into_iter()
+                .filter(|t| self.scope.keep(t))
+                .collect();
+            if hits.is_empty() {
+                out.unmatched.push(sel.to_string());
+                continue;
+            }
+            keys.extend(hits.iter().map(|t| &t.key));
+            if !self.all && is_ambiguous(sel, &hits) {
+                out.ambiguous.push((sel.to_string(), hits));
+            }
+        }
+        // snapshot order, each server once
+        out.targets = snap
+            .targets
+            .iter()
+            .filter(|t| keys.contains(&&t.key))
+            .collect();
+        out
+    }
+}
+
+/// A selector that's a port: `3000` or `:3000`.
+fn as_port(sel: &str) -> Option<u16> {
+    sel.strip_prefix(':').unwrap_or(sel).parse().ok()
+}
+
+/// The servers one selector names: a port's server; else the projects of
+/// that exact name; else servers running that exact command; else any whose
+/// project or command contains it.
+fn matching<'a>(snap: &'a Snapshot, sel: &str) -> Vec<&'a Target> {
+    if let Some(port) = as_port(sel) {
+        return snap
+            .targets
+            .iter()
+            .filter(|t| t.ports.contains(&port))
+            .collect();
+    }
+    let q = sel.to_lowercase();
+    let by = |f: &dyn Fn(&Target) -> bool| -> Vec<&'a Target> {
+        snap.targets.iter().filter(|t| f(t)).collect()
+    };
+    let project = by(&|t| t.project.to_lowercase() == q);
+    if !project.is_empty() {
+        return project;
+    }
+    let command = by(&|t| t.command_label.to_lowercase() == q);
+    if !command.is_empty() {
+        return command;
+    }
+    by(&|t| t.project.to_lowercase().contains(&q) || t.command_label.to_lowercase().contains(&q))
+}
+
+/// A name whose servers span several projects, none of them named by it
+/// exactly (`api` → `api-gateway`, `rapid-ui`; `vite` → three projects).
+fn is_ambiguous(sel: &str, hits: &[&Target]) -> bool {
+    if as_port(sel).is_some() || hits.iter().any(|t| t.project.eq_ignore_ascii_case(sel)) {
+        return false;
+    }
+    let first = &hits[0].project;
+    hits.iter().any(|t| &t.project != first)
 }
 
 #[cfg(test)]
 fn select<'a>(snap: &'a Snapshot, selectors: &[&str]) -> Vec<&'a Target> {
-    snap.targets
-        .iter()
-        .filter(|t| selectors.iter().any(|s| matches(t, s)))
-        .collect()
-}
-
-fn matches(t: &Target, sel: &str) -> bool {
-    let s = sel.trim_start_matches(':');
-    if let Ok(port) = s.parse::<u16>() {
-        if t.ports.contains(&port) {
-            return true;
-        }
+    let scope = Scope {
+        mine: None,
+        ended: false,
+    };
+    Pick {
+        selectors,
+        scope: &scope,
+        all: true,
     }
-    let sel = sel.to_lowercase();
-    t.project.to_lowercase().contains(&sel) || t.command_label.to_lowercase().contains(&sel)
+    .on(snap, false)
+    .targets
 }
 
 // --- handlers ---------------------------------------------------------------
 
-fn ls(json: bool, selectors: &[&str], scope: &Scope) -> i32 {
-    let snap = snapshot(true);
-    let targets = pick(&snap, selectors, scope, true);
+fn ls(json: bool, pick: &Pick) -> i32 {
+    let snap = match scanned("ls", true) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let picked = pick.on(&snap, true);
+    let code = picked.report_unmatched("ls");
+    let targets = &picked.targets;
     if json {
         let view: Vec<TargetJson> = targets.iter().copied().map(TargetJson::from).collect();
         match serde_json::to_string_pretty(&view) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("marina: json error: {e}"),
         }
-        return 0;
+        return code;
     }
     if targets.is_empty() {
-        println!("no dev targets running");
-        return if selectors.is_empty() && !scope.active() {
-            0
-        } else {
-            1
-        };
+        if pick.selectors.is_empty() {
+            match pick.scope.active() {
+                true => println!("no dev servers {}", pick.scope.describe()),
+                false => println!("no dev servers running"),
+            }
+        }
+        return code;
     }
     println!(
         "{:<20} {:<16} {:<8} {:>6} {:>8} {:<14} {:<14}",
         "PROJECT", "COMMAND", "PORT", "CPU", "MEM", "VIA", "URL"
     );
-    for t in &targets {
+    for t in targets {
         let port = match t.ports.first() {
             // `!` marks a LAN-exposed bind (0.0.0.0 / ::)
             Some(p) if t.exposed => format!(":{p}!"),
@@ -275,7 +471,7 @@ fn ls(json: bool, selectors: &[&str], scope: &Scope) -> i32 {
             t.project, t.command_label, port, cpu, mem, via, url
         );
     }
-    0
+    code
 }
 
 /// Does agent `a` match a selector: its name, project, cwd, or a session-id
@@ -308,7 +504,10 @@ fn now_secs() -> u64 {
 }
 
 fn agents(selectors: &[&str], json: bool) -> i32 {
-    let snap = snapshot(true);
+    let snap = match scanned("agents", true) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let picked: Vec<&Agent> = snap
         .agents
         .iter()
@@ -401,74 +600,171 @@ pub fn repeated_text(r: &[(String, usize, u64)], n: usize) -> String {
         .join(", ")
 }
 
-fn kill(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
-    if selectors.is_empty() && !scope.active() {
-        eprintln!("kill: need a selector (project, port, or command) or --mine / --orphaned");
+/// What `kill` did to one server, for `kill --json`'s `result`.
+fn kill_result(t: &Target, report: &verbs::KillReport, docker_ok: Option<bool>) -> &'static str {
+    if let Some(ok) = docker_ok {
+        return if ok { "terminated" } else { "still_running" };
+    }
+    let has = |pids: &[u32]| t.pid_starts.iter().any(|(p, _)| pids.contains(p));
+    if has(&report.denied) {
+        "denied"
+    } else if has(&report.survivors) {
+        "still_running"
+    } else if has(&report.forced) {
+        "force_killed"
+    } else {
+        "terminated"
+    }
+}
+
+#[derive(Serialize)]
+struct KillJson {
+    #[serde(flatten)]
+    target: TargetJson,
+    /// `terminated` | `force_killed` | `still_running` | `denied`.
+    result: &'static str,
+}
+
+fn kill(pick: &Pick, json: bool, grace: Duration) -> i32 {
+    if pick.selectors.is_empty() && !pick.scope.active() {
+        eprintln!("marina kill: need a selector (project, port, or command) or --mine / --ended");
         return 2;
     }
-    let snap = snapshot(false);
-    let targets = pick(&snap, selectors, scope, false);
+    let snap = match scanned("kill", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let picked = pick.on(&snap, false);
+    if let Some(code) = picked.refuse_ambiguous("kill") {
+        return code;
+    }
+    let mut code = picked.report_unmatched("kill");
+    let targets = &picked.targets;
     if targets.is_empty() {
-        eprintln!("no targets match {selectors:?}");
-        return 1;
+        if pick.selectors.is_empty() {
+            // nothing in scope is already the outcome asked for
+            eprintln!("nothing to kill (no servers {})", pick.scope.describe());
+        }
+        if json {
+            println!("[]");
+        }
+        return code;
     }
     let mut pid_starts: Vec<verbs::PidStart> = Vec::new();
-    let mut killed: Vec<&Target> = Vec::new();
-    for t in &targets {
-        killed.push(t);
-        if let Some(c) = &t.container {
-            if !json {
-                println!("stopping container {c}");
-            }
-            let _ = std::process::Command::new("docker")
-                .args(["stop", c])
-                .status();
-            continue;
-        }
-        let port = t.ports.first().map(|p| format!(":{p}")).unwrap_or_default();
+    let mut docker_ok = std::collections::HashMap::new();
+    for t in targets {
+        let port = t
+            .ports
+            .first()
+            .map(|p| format!(" :{p}"))
+            .unwrap_or_default();
         if !json {
-            println!("killing {} {} ({} pids)", t.project, port, t.pids.len());
+            println!("stopping {} · {}{port}", t.project, t.command_label);
         }
-        pid_starts.extend(&t.pid_starts);
+        match &t.container {
+            Some(c) => {
+                let ok = std::process::Command::new("docker")
+                    .args(["stop", c])
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                docker_ok.insert(&t.key, ok);
+            }
+            None => pid_starts.extend(&t.pid_starts),
+        }
     }
-    if !pid_starts.is_empty() {
-        // verified SIGTERM -> wait -> verified SIGKILL (recycled pids skipped)
-        verbs::kill_blocking(&pid_starts, Duration::from_millis(1500));
+    // verified SIGTERM -> wait -> verified SIGKILL (recycled pids skipped)
+    let report = if pid_starts.is_empty() {
+        verbs::KillReport::default()
+    } else {
+        verbs::kill_blocking(&pid_starts, grace)
+    };
+    let results: Vec<&'static str> = targets
+        .iter()
+        .map(|t| kill_result(t, &report, docker_ok.get(&t.key).copied()))
+        .collect();
+    let stopped = results
+        .iter()
+        .filter(|r| matches!(**r, "terminated" | "force_killed"))
+        .count();
+    if stopped < targets.len() {
+        code = 1;
     }
     if json {
-        let view: Vec<TargetJson> = killed.into_iter().map(TargetJson::from).collect();
+        let view: Vec<KillJson> = targets
+            .iter()
+            .zip(&results)
+            .map(|(t, &result)| KillJson {
+                target: TargetJson::from(*t),
+                result,
+            })
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&view).unwrap_or_default()
         );
-    } else {
-        println!("done.");
+        return code;
     }
-    0
+    for (t, r) in targets.iter().zip(&results) {
+        let why = match *r {
+            "force_killed" => format!(
+                "force-killed (still running after {}s)",
+                grace.as_secs_f64()
+            ),
+            "still_running" => "still running".into(),
+            "denied" => "permission denied — not your process?".into(),
+            _ => continue,
+        };
+        let port = t
+            .ports
+            .first()
+            .map(|p| format!(" :{p}"))
+            .unwrap_or_default();
+        eprintln!("{} · {}{port}: {why}", t.project, t.command_label);
+    }
+    match stopped == targets.len() {
+        true => println!("stopped {}", plural(stopped, "server")),
+        false => println!("stopped {stopped} of {}", plural(targets.len(), "server")),
+    }
+    code
 }
 
-fn restart(selectors: &[&str], scope: &Scope) -> i32 {
-    if selectors.is_empty() && !scope.active() {
-        eprintln!("restart: need a selector or --mine / --orphaned");
+/// `3 servers`, `1 server`.
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+fn restart(pick: &Pick) -> i32 {
+    if pick.selectors.is_empty() && !pick.scope.active() {
+        eprintln!("marina restart: need a selector or --mine / --ended");
         return 2;
     }
-    let snap = snapshot(false);
-    let targets = pick(&snap, selectors, scope, false);
+    let snap = match scanned("restart", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let picked = pick.on(&snap, false);
+    if let Some(code) = picked.refuse_ambiguous("restart") {
+        return code;
+    }
+    let mut code = picked.report_unmatched("restart");
+    let targets = &picked.targets;
     if targets.is_empty() {
-        eprintln!("no targets match {selectors:?}");
-        return 1;
+        if pick.selectors.is_empty() {
+            eprintln!("nothing to restart (no servers {})", pick.scope.describe());
+        }
+        return code;
     }
     // Capture commands, terminate everything, then re-exec.
     let mut plans: Vec<(String, Vec<String>, std::path::PathBuf)> = Vec::new();
     let mut pid_starts: Vec<verbs::PidStart> = Vec::new();
-    let mut code = 0;
-    for t in &targets {
+    for t in targets {
         if let Some(c) = &t.container {
             let ok = std::process::Command::new("docker")
                 .args(["restart", c])
+                .stdout(std::process::Stdio::null())
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
             if ok {
                 println!("restarted container {c}");
             } else {
@@ -479,7 +775,7 @@ fn restart(selectors: &[&str], scope: &Scope) -> i32 {
         }
         pid_starts.extend(&t.pid_starts);
         if t.anchor_argv.is_empty() {
-            eprintln!("skipping {}: command not captured", t.project);
+            eprintln!("skipping {}: its command wasn't captured", t.project);
             continue;
         }
         plans.push((t.project.clone(), t.anchor_argv.clone(), t.cwd.clone()));
@@ -492,28 +788,87 @@ fn restart(selectors: &[&str], scope: &Scope) -> i32 {
         return 1;
     }
     verbs::kill_blocking(&pid_starts, Duration::from_millis(1500));
+    let mut restarted = false;
     for (project, argv, cwd) in plans {
         let log = crate::logs::state_log_path(&project);
         match verbs::respawn(&argv, &cwd, log.as_deref()) {
-            Ok(_child) => match &log {
-                Some(p) => println!("restarted {project} (output -> {})", p.display()),
-                None => println!("restarted {project}"),
-            },
+            Ok(_child) => {
+                restarted = true;
+                match &log {
+                    Some(p) => println!("restarted {project} (output -> {})", p.display()),
+                    None => println!("restarted {project}"),
+                }
+            }
             Err(e) => {
                 eprintln!("restart {project} failed: {e}");
                 code = 1;
             }
         }
     }
+    if restarted {
+        eprintln!(
+            "marina: restarted without the original environment — a server that needs env vars set by its old shell may fail; check its log"
+        );
+    }
     code
 }
 
-fn url(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
-    let snap = snapshot(false);
-    let targets = pick(&snap, selectors, scope, false);
+/// The servers running in (or under) the current directory, or in a
+/// project this directory is inside (`proj/src` finds proj's server) —
+/// what a bare `url` / `open` means from a project's terminal. Errs (exit 2)
+/// from `~` or `/`, where that's everything.
+fn running_here<'a>(cmd: &str, targets: Vec<&'a Target>) -> Result<Vec<&'a Target>, i32> {
+    let here = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if here
+        .as_ref()
+        .is_some_and(|h| h.parent().is_none() || Some(h) == home.as_ref())
+    {
+        eprintln!(
+            "marina {cmd}: from here that's everything — name one (marina {cmd} api, marina {cmd} 3000)"
+        );
+        return Err(2);
+    }
+    Ok(targets
+        .into_iter()
+        .filter(|t| {
+            here.as_ref().is_some_and(|h| {
+                !t.cwd.as_os_str().is_empty() && (t.cwd.starts_with(h) || h.starts_with(&t.cwd))
+            })
+        })
+        .collect())
+}
+
+fn url(pick: &Pick, json: bool) -> i32 {
+    let snap = match scanned("url", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let bare = pick.selectors.is_empty() && !pick.scope.active();
+    let picked = pick.on(&snap, bare);
+    let code = picked.report_unmatched("url");
+    let targets = if bare {
+        match running_here("url", picked.targets) {
+            Ok(t) => t,
+            Err(code) => return code,
+        }
+    } else {
+        picked.targets
+    };
     if targets.is_empty() {
-        eprintln!("no targets match {selectors:?}");
-        return 1;
+        if bare {
+            eprintln!(
+                "marina url: no server running here — name one (marina url api, marina url 3000)"
+            );
+            return 1;
+        }
+        if pick.selectors.is_empty() {
+            eprintln!("no servers {}", pick.scope.describe());
+        }
+        if json {
+            println!("[]");
+        }
+        return code;
     }
     if json {
         #[derive(Serialize)]
@@ -532,7 +887,7 @@ fn url(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
             "{}",
             serde_json::to_string_pretty(&view).unwrap_or_default()
         );
-        return 0;
+        return code;
     }
     for t in targets {
         match &t.url {
@@ -540,42 +895,44 @@ fn url(selectors: &[&str], json: bool, scope: &Scope) -> i32 {
             None => println!("{}\t—", t.project),
         }
     }
-    0
+    code
 }
 
 /// `marina open [sel]`: open matching servers' web URLs in the browser. With
 /// no selector or scope, the servers running in (or under) the current
-/// directory — what you mean from a project's terminal.
-fn open(selectors: &[&str], scope: &Scope) -> i32 {
-    let snap = snapshot(false);
-    let bare = selectors.is_empty() && !scope.active();
-    let mut targets = pick(&snap, selectors, scope, bare);
-    if bare {
-        // running here: in this directory or under it, or in a project this
-        // directory is inside (`proj/src` finds proj's server)
-        let here = std::env::current_dir().ok();
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        if here
-            .as_ref()
-            .is_some_and(|h| h.parent().is_none() || Some(h) == home.as_ref())
-        {
-            eprintln!("marina open: from here that's everything — name one (marina open api, marina open 3000)");
-            return 2;
-        }
-        targets.retain(|t| {
-            here.as_ref().is_some_and(|h| {
-                !t.cwd.as_os_str().is_empty() && (t.cwd.starts_with(h) || h.starts_with(&t.cwd))
-            })
-        });
+/// directory — what you mean from a project's terminal. More than three
+/// are listed instead of opened, unless `--all`.
+fn open(pick: &Pick) -> i32 {
+    let snap = match scanned("open", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let bare = pick.selectors.is_empty() && !pick.scope.active();
+    let picked = pick.on(&snap, bare);
+    if let Some(code) = picked.refuse_ambiguous("open") {
+        return code;
     }
+    let code = picked.report_unmatched("open");
+    let targets = if bare {
+        match running_here("open", picked.targets) {
+            Ok(t) => t,
+            Err(code) => return code,
+        }
+    } else {
+        picked.targets
+    };
     let web: Vec<&Target> = targets
         .iter()
         .copied()
         .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
         .collect();
-    // from ~ or / a bare `open` would match everything: list, don't open
-    if bare && web.len() > 3 {
-        eprintln!("{} web servers run under here — name one:", web.len());
+    // a tab per match gets out of hand: list them, don't open them
+    if web.len() > 3 && !pick.all {
+        eprintln!(
+            "{} web servers {} — name one, or add --all:",
+            web.len(),
+            if bare { "run under here" } else { "match" }
+        );
         for t in &web {
             if let Some(u) = &t.url {
                 eprintln!(
@@ -588,13 +945,15 @@ fn open(selectors: &[&str], scope: &Scope) -> i32 {
         return 1;
     }
     if web.is_empty() {
-        eprintln!(
-            "{}",
-            match (selectors.is_empty(), scope.active()) {
-                (true, false) => "no web server running here — name one (marina open api, marina open 3000) or use --mine",
-                _ => "no web server matches",
-            }
-        );
+        if !targets.is_empty() || bare || pick.selectors.is_empty() {
+            eprintln!(
+                "{}",
+                match (pick.selectors.is_empty(), pick.scope.active()) {
+                    (true, false) => "no web server running here — name one (marina open api, marina open 3000) or use --mine",
+                    _ => "no web server matches",
+                }
+            );
+        }
         return 1;
     }
     let mut failed = false;
@@ -608,16 +967,16 @@ fn open(selectors: &[&str], scope: &Scope) -> i32 {
             }
         }
     }
-    i32::from(failed)
+    code.max(i32::from(failed))
 }
 
 // --- ports: who / free ------------------------------------------------------
 
 /// `who`/`free` take ports only — a project substring like `api` silently
-/// matching several targets is fine for `ls`, not for "what's on this port".
+/// matching several servers is fine for `ls`, not for "what's on this port".
 fn parse_ports(cmd: &str, selectors: &[&str]) -> Result<Vec<u16>, i32> {
     if selectors.is_empty() {
-        eprintln!("{cmd}: need a port (3000 or :3000)");
+        eprintln!("marina {cmd}: need a port (3000 or :3000)");
         return Err(2);
     }
     let mut ports = Vec::new();
@@ -629,7 +988,9 @@ fn parse_ports(cmd: &str, selectors: &[&str]) -> Result<Vec<u16>, i32> {
                 }
             }
             _ => {
-                eprintln!("{cmd}: {sel:?} is not a port (use `marina ls {sel}` to match by name)");
+                eprintln!(
+                    "marina {cmd}: {sel:?} is not a port (use `marina ls {sel}` to match by name)"
+                );
                 return Err(2);
             }
         }
@@ -770,7 +1131,10 @@ fn who(selectors: &[&str], json: bool) -> i32 {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let snap = snapshot(false);
+    let snap = match scanned("who", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let mut code = 0;
     let mut view = Vec::new();
     for port in ports {
@@ -796,7 +1160,7 @@ fn who(selectors: &[&str], json: bool) -> i32 {
                 _ if processes.is_empty() => {
                     "in use, but the owner isn't visible (another user's process?)".into()
                 }
-                _ => format!("{} — not a dev target", describe_holders(&processes)),
+                _ => format!("{} — not a dev server", describe_holders(&processes)),
             };
             println!(":{port:<6}{line}");
         }
@@ -827,7 +1191,10 @@ fn free(selectors: &[&str], json: bool) -> i32 {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let snap = snapshot(false);
+    let snap = match scanned("free", false) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
 
     // Classify first, then stop each target once (two ports can share one).
     let mut plan: Vec<(u16, Option<&Target>, Vec<Holder>)> = Vec::new();
@@ -891,7 +1258,7 @@ fn free(selectors: &[&str], json: bool) -> i32 {
                     "in use by a process marina can't see (another user's?) — not touched".into()
                 }
                 _ => format!(
-                    "held by {} — not a dev target, not touched",
+                    "held by {} — not a dev server, not touched",
                     describe_holders(&processes)
                 ),
             };
@@ -1129,8 +1496,8 @@ struct LauncherJson {
     pid: Option<u32>,
     /// The launching process is still running.
     alive: bool,
-    /// Started by an agent session that has since ended.
-    orphaned: bool,
+    /// Started by an agent session that has since ended (`--ended`).
+    ended: bool,
     /// Agent session id (Claude Code: `claude --resume <session>`).
     session: Option<String>,
     cwd: Option<String>,
@@ -1143,7 +1510,7 @@ impl From<&launcher::Launcher> for LauncherJson {
             name: l.name.clone(),
             pid: l.pid,
             alive: l.alive,
-            orphaned: l.is_orphaned(),
+            ended: l.is_orphaned(),
             session: l.session.clone(),
             cwd: l.cwd.as_ref().map(|c| c.display().to_string()),
         }
@@ -1333,6 +1700,86 @@ mod tests {
         assert!(select(&snap, &["nope-xyz"]).is_empty()); // no match
     }
 
+    /// The sample plus `api` (:4000), `api-gateway` (:4001) and a project
+    /// named `app-3000` (:4002).
+    fn named_snapshot() -> Snapshot {
+        let mut snap = Snapshot::sample();
+        for (name, port) in [("api", 4000), ("api-gateway", 4001), ("app-3000", 4002)] {
+            let mut t = snap.targets[0].clone();
+            t.key = crate::model::TargetKey::Port(port);
+            t.ports = vec![port];
+            t.project = name.into();
+            t.command_label = "vite".into();
+            snap.targets.push(t);
+        }
+        snap
+    }
+
+    fn pick_with<'a>(snap: &'a Snapshot, selectors: &'a [&'a str]) -> Picked<'a> {
+        let scope = Scope {
+            mine: None,
+            ended: false,
+        };
+        Pick {
+            selectors,
+            scope: &scope,
+            all: false,
+        }
+        .on(snap, false)
+    }
+
+    #[test]
+    fn an_exact_name_wins_and_a_port_matches_only_ports() {
+        let snap = named_snapshot();
+        let p = pick_with(&snap, &["api"]);
+        assert_eq!(p.targets.len(), 1, "api, not api-gateway");
+        assert!(p.ambiguous.is_empty());
+        // nothing on :3001, and a project named app-3000 isn't a port match
+        let p = pick_with(&snap, &["3001"]);
+        assert!(p.targets.is_empty());
+        assert_eq!(p.unmatched, vec!["3001".to_string()]);
+        assert_eq!(pick_with(&snap, &["3000"]).targets[0].ports, vec![3000]);
+    }
+
+    #[test]
+    fn a_name_reaching_several_projects_is_ambiguous() {
+        let snap = named_snapshot();
+        // a substring: api-gateway, and the `api` it doesn't name exactly
+        let p = pick_with(&snap, &["gate"]);
+        assert!(p.ambiguous.is_empty(), "one project is fine");
+        let p = pick_with(&snap, &["ap"]);
+        assert_eq!(p.ambiguous.len(), 1);
+        assert_eq!(p.refuse_ambiguous("kill"), Some(2));
+        // an exact command across projects is ambiguous too
+        assert_eq!(pick_with(&snap, &["vite"]).ambiguous.len(), 1);
+        // --all goes ahead
+        assert_eq!(select(&snap, &["vite"]).len(), 3);
+    }
+
+    #[test]
+    fn help_anywhere_prints_usage_and_flags_are_checked_per_command() {
+        let d = |a: &[&str]| dispatch(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(d(&["ls", "--help"]), Some(0));
+        assert_eq!(d(&["kill", "api", "-h"]), Some(0));
+        assert_eq!(
+            d(&["ls", "--all"]),
+            Some(2),
+            "--all is for kill/restart/open"
+        );
+        assert_eq!(d(&["ls", "--grace", "3"]), Some(2), "--grace is for kill");
+        assert_eq!(
+            d(&["kill", "x", "--grace"]),
+            Some(2),
+            "--grace needs seconds"
+        );
+        assert_eq!(d(&["kill", "x", "--grace=soon"]), Some(2));
+        assert_eq!(
+            d(&["ls", "--dump"]),
+            Some(2),
+            "debug flags are first-position only"
+        );
+    }
+
     #[test]
     fn unknown_commands_and_flags_error_instead_of_launching_the_tui() {
         // a typo'd subcommand must not fall through to the TUI
@@ -1502,7 +1949,34 @@ mod tests {
 
     #[test]
     fn agents_take_no_scope_flags() {
+        assert_eq!(dispatch(&["agents".into(), "--ended".into()]), Some(2));
         assert_eq!(dispatch(&["agents".into(), "--orphaned".into()]), Some(2));
+    }
+
+    #[test]
+    fn kill_results_name_what_happened_to_each_server() {
+        let snap = Snapshot::sample();
+        let mut t = snap.targets[0].clone();
+        t.pid_starts = vec![(10, 1), (11, 1)];
+        let mut r = verbs::KillReport::default();
+        assert_eq!(kill_result(&t, &r, None), "terminated");
+        r.forced = vec![11];
+        assert_eq!(kill_result(&t, &r, None), "force_killed");
+        r.survivors = vec![11];
+        assert_eq!(kill_result(&t, &r, None), "still_running");
+        r.denied = vec![10];
+        assert_eq!(kill_result(&t, &r, None), "denied");
+        assert_eq!(kill_result(&t, &r, Some(true)), "terminated", "docker stop");
+        let j = serde_json::to_value(KillJson {
+            target: TargetJson::from(&t),
+            result: "terminated",
+        })
+        .unwrap();
+        assert_eq!(j["result"], "terminated");
+        assert_eq!(
+            j["project"], "client-portal",
+            "the target's fields, flattened"
+        );
     }
 
     #[test]
@@ -1531,5 +2005,16 @@ mod tests {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
         assert_eq!(obj.len(), 15, "unexpected extra/removed JSON fields");
+        let l = launcher::Launcher {
+            kind: launcher::LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(1),
+            alive: false,
+            session: None,
+            cwd: None,
+            start_time: 0,
+        };
+        let j = serde_json::to_value(LauncherJson::from(&l)).unwrap();
+        assert_eq!(j["ended"], true, "named like the TUI's claude·ended");
     }
 }
