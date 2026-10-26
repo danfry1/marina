@@ -222,6 +222,22 @@ file lock, so concurrent callers never collide; a port taken over by another
 project's process is replaced (with a note on stderr), while this project's own
 server keeps it. Assignments for deleted worktrees are dropped automatically.
 
+Agents only use `marina port` when they're told to; left alone they start on
+the framework's default. Put this in the project's `CLAUDE.md` or `AGENTS.md`:
+
+```md
+## Dev servers
+- Run servers on `$(marina port)`, not a fixed port.
+  One per service: `marina port <name>`.
+- Your server's URL: `marina url --mine`.
+- When done, stop yours: `marina kill --mine`.
+```
+
+`--mine` matches the agent session running the command (by the session id the
+agent exports, else by process ancestry), so one agent's `kill --mine` leaves
+every other session's servers alone. Outside an agent session it exits `2`
+rather than matching everything.
+
 `who` and `free` are for the `EADDRINUSE` moment:
 
 ```sh
