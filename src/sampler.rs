@@ -658,7 +658,7 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
                 break; // UI gone
             }
             match ctl_rx.recv_timeout(delay) {
-                Ok(SamplerCtl::Refresh) => {
+                Ok(SamplerCtl::Refresh | SamplerCtl::Demo(_)) => {
                     delay = FAST;
                     // collapse a burst of refresh requests into one rebuild
                     while ctl_rx.try_recv().is_ok() {}

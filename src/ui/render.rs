@@ -71,7 +71,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
     let title = format!(
-        " marina · {} targets{agents} · sort:{}{} ",
+        " {}marina · {} targets{agents} · sort:{}{} ",
+        if app.demo { "DEMO · " } else { "" },
         app.snapshot.targets.len(),
         app.sort.label(),
         match app.group_by {

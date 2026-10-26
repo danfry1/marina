@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod demo;
 mod docker;
 mod exec;
 mod git;
@@ -48,11 +49,22 @@ fn main() -> io::Result<()> {
     // CLI subcommands (ls/kill/restart/url/version/help). Unknown args error
     // there rather than falling through; only a bare `marina` reaches the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = cli::dispatch(&args) {
-        std::process::exit(code);
+    let demo = args.first().is_some_and(|a| a == "demo");
+    if demo && args.len() > 1 {
+        eprintln!("marina: demo takes no arguments");
+        std::process::exit(2);
+    }
+    if !demo {
+        if let Some(code) = cli::dispatch(&args) {
+            std::process::exit(code);
+        }
     }
 
-    let (rx, ctl) = sampler::spawn();
+    let (rx, ctl) = if demo {
+        demo::spawn()
+    } else {
+        sampler::spawn()
+    };
     let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableMouseCapture);
@@ -64,8 +76,9 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
+    app.demo = demo;
     let notify = config::load().notify;
-    let desktop_notify = notify.desktop;
+    let desktop_notify = notify.desktop && !demo;
     let result = run(
         &mut terminal,
         &mut app,
@@ -290,6 +303,15 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
     let Some(a) = app.selected_agent() else {
         return;
     };
+    if app.demo {
+        let place = a
+            .host
+            .as_ref()
+            .map(|h| format!("the {}", h.describe()))
+            .unwrap_or_else(|| "its terminal".into());
+        app.set_status(format!("demo: Enter would jump to {place}"));
+        return;
+    }
     match a.host.clone() {
         Some(host) => {
             let ev = ev.clone();
@@ -343,8 +365,15 @@ fn verb_diff(app: &mut ui::App) {
     };
     let (tx, rx) = mpsc::channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let demo = app.demo;
     std::thread::spawn(move || {
-        for line in git::diff_lines(&dir) {
+        let lines = if demo {
+            let project = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+            demo::diff_lines(&project.unwrap_or_default())
+        } else {
+            git::diff_lines(&dir)
+        };
+        for line in lines {
             if tx.send(line).is_err() {
                 break; // pane closed
             }
@@ -380,11 +409,18 @@ fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) 
         }
         (ps, cs, keys)
     };
+    let label = app.selection_label();
+    // the demo's servers have no processes to signal
+    if app.demo && !keys.is_empty() {
+        app.mark_marina_action(&keys);
+        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Stop(keys)));
+        app.set_status(format!("stopped {label} (demo: nothing was signalled)"));
+        return;
+    }
     if pid_starts.is_empty() && containers.is_empty() {
         app.set_status("nothing to kill");
         return;
     }
-    let label = app.selection_label();
     app.mark_marina_action(&keys);
     if !containers.is_empty() {
         let n = containers.len();
@@ -435,6 +471,12 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
         }
         (plans, cs, keys)
     };
+    if app.demo {
+        app.mark_marina_action(&keys);
+        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Restart(keys)));
+        app.set_status(format!("restarted {label} (demo: nothing was run)"));
+        return;
+    }
     if plans.is_empty() && containers.is_empty() {
         app.set_status(format!("can't restart {label}: command not captured"));
         return;
@@ -499,6 +541,10 @@ fn verb_copy(app: &mut ui::App) {
 fn verb_open(app: &mut ui::App) {
     match session_url(app, 'O') {
         Some(Ok((url, more))) => {
+            if app.demo {
+                app.set_status(format!("demo: O would open {url}{more}"));
+                return;
+            }
             let _ = verbs::open_url(&url);
             app.set_status(format!("opening {url}{more}"));
             return;
@@ -515,6 +561,9 @@ fn verb_open(app: &mut ui::App) {
     }
     let url = app.selected_target().and_then(|t| t.url.clone());
     match url {
+        Some(u) if u.scheme.is_web() && app.demo => {
+            app.set_status(format!("demo: O would open {}", u.value));
+        }
         Some(u) if u.scheme.is_web() => {
             let _ = verbs::open_url(&u.value);
             app.set_status(format!("opening {}", u.value));
@@ -539,6 +588,16 @@ fn verb_tail(app: &mut ui::App, ev: &Sender<UiEvent>) {
         app.set_status("select a service (not a group) to tail");
         return;
     };
+    if app.demo {
+        let lines = demo::log_lines(&t.project, &t.command_label, t.ports.first().copied());
+        let title = format!("{} · {} (demo)", t.project, t.command_label);
+        let (tx, rx) = mpsc::channel();
+        for l in lines {
+            let _ = tx.send(l);
+        }
+        app.open_log(title, rx, Arc::new(AtomicBool::new(false)));
+        return;
+    }
     if let Some(c) = &t.container {
         let mut cmd = std::process::Command::new("docker");
         cmd.args(["logs", "-f", "--tail", "200", c]);

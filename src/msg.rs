@@ -4,7 +4,7 @@
 //!   UI      ──SamplerCtl──► sampler refresh-now / shutdown (by dropping the sender)
 //!   verbs/logs ──UiEvent──► UI      results from background verb + discovery threads
 
-use crate::model::Snapshot;
+use crate::model::{Snapshot, TargetKey};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,6 +19,14 @@ pub enum SamplerCtl {
     /// Rebuild a snapshot now (right after a verb) instead of waiting out the
     /// adaptive-cadence sleep — a killed row disappears immediately.
     Refresh,
+    /// `marina demo`: a verb on the made-up servers, in place of a signal.
+    Demo(DemoAct),
+}
+
+/// What a verb does to `marina demo`'s made-up servers.
+pub enum DemoAct {
+    Stop(Vec<TargetKey>),
+    Restart(Vec<TargetKey>),
 }
 
 /// Background verb / log-discovery threads -> UI. Drained every loop tick.

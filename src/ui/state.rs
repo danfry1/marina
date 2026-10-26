@@ -115,6 +115,8 @@ pub(crate) struct PendingKill {
 }
 
 pub struct App {
+    /// `marina demo`: made-up servers; verbs act on them, not on processes.
+    pub demo: bool,
     /// `O`/`Y` on a session with several servers: (verb, pid, which, when).
     pub(crate) url_cycle: Option<(char, u32, usize, Instant)>,
     /// When each server was last announced as started, so one that keeps
@@ -175,6 +177,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            demo: false,
             url_cycle: None,
             announced: HashMap::new(),
             snapshot: Arc::new(Snapshot::empty()),

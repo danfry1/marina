@@ -57,6 +57,7 @@ USAGE:
     marina port --list           show assigned ports
     marina port --release [name] give this project's port back
     marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
+    marina demo                  the TUI on a made-up machine — try the keys
     marina version               print the version
 
 SELECTOR:

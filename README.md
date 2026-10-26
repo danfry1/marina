@@ -146,6 +146,7 @@ However you installed it, the command is **`marina`** (on your `PATH`):
 ```sh
 marina        # launch the TUI — leave it open in a pane while you work
 marina ls     # or a one-shot list (add --json for scripts/agents)
+marina demo   # the TUI on a made-up machine: try the keys, nothing real is touched
 ```
 
 No flags or config needed — it auto-discovers your running dev servers. Press
@@ -189,6 +190,7 @@ marina free <port>… [--json]  # stop the dev target on a port, wait until it's
 marina port [name] [--json]   # a stable, collision-free port for this project/worktree
 marina port --list            # every assigned port · --release [name] gives one back
 marina agents [sel…] [--json] # agent sessions: shells, helpers, servers, resume command
+marina demo                   # the TUI on made-up servers and sessions
 marina version
 ```
 
