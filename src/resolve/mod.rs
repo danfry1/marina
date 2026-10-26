@@ -46,6 +46,20 @@ pub fn project_root(start: &Path, stop: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
+/// The git worktree `start` is in: the nearest directory holding a `.git`
+/// (a directory for the main checkout, a file for a linked worktree). Nearest,
+/// not outermost — agent tools put worktrees *inside* the repo
+/// (`.claude/worktrees/<name>`), and each of those is its own tree. Like
+/// [`project_root`], the walk stops below `stop` (`$HOME`): a dotfiles repo
+/// there isn't the worktree of everything under it.
+pub fn worktree_root(start: &Path, stop: Option<&Path>) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .take_while(|d| Some(*d) != stop)
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// manifest name -> dir basename.
 pub fn project_name(root: &Path) -> String {
     name_from_manifest(root)
@@ -774,6 +788,34 @@ mod tests {
         // (a dotfiles repo in $HOME must not swallow every home-cwd process)
         assert_eq!(project_root(&dir.join("sub"), Some(&dir)), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_root_is_the_nearest_git_and_stops_below_home() {
+        let base = std::env::temp_dir().join(format!("marina-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let nested = repo.join(".claude/worktrees/a");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(nested.join("web/src")).unwrap();
+        std::fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(
+            worktree_root(&repo.join(".claude"), None),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            worktree_root(&nested.join("web/src"), None),
+            Some(nested.clone())
+        );
+        // a dotfiles repo at $HOME doesn't claim what's under it
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("scratch")).unwrap();
+        assert_eq!(worktree_root(&base.join("scratch"), Some(&base)), None);
+        assert_eq!(
+            worktree_root(&base.join("scratch"), None),
+            Some(base.clone())
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -191,7 +191,8 @@ map to `docker stop` / `docker restart` / `docker logs -f`.
 
 ```sh
 marina ls [sel…] [--json]     # the snapshot — table, or a stable JSON contract
-marina ls --mine              # only servers started by the agent session running this
+marina ls --mine              # only servers started by the agent session running this, in this worktree
+marina kill --session         # the same session's servers in every worktree (subagents included)
 marina kill --ended           # stop servers whose agent session has ended
 marina kill <selector>        # project name, port (3000 / :3000), or command
 marina kill api --grace 10    # SIGTERM, then SIGKILL after 10s (default 5)
@@ -231,12 +232,22 @@ the framework's default. Put this in the project's `CLAUDE.md` or `AGENTS.md`:
   One per service: `marina port <name>`.
 - Your server's URL: `marina url --mine`.
 - When done, stop yours: `marina kill --mine`.
+- Another agent in this worktree? Name your port
+  (`marina port <task>`) and kill by port.
 ```
 
-`--mine` matches the agent session running the command (by the session id the
-agent exports, else by process ancestry), so one agent's `kill --mine` leaves
-every other session's servers alone. Outside an agent session it exits `2`
-rather than matching everything.
+`--mine` matches servers started by the agent session running the command (by
+the session id the agent exports, else by process ancestry) **in the git
+worktree it's run from**, so one agent's `kill --mine` leaves every other
+session's servers alone. The worktree limit is for subagents: they share their
+parent's session id, so without it a subagent in `.claude/worktrees/a` would
+stop its siblings' servers too. `--session` drops the limit, for an
+orchestrator cleaning up after all its subagents at once. Outside an agent
+session both exit `2` rather than matching everything, and so does `--mine`
+outside a git worktree, where it couldn't tell an agent from its subagents.
+
+Subagents sharing one worktree can't be told apart by marina at all, so the
+last line of the snippet has each take a named port and stop by port.
 
 `who` and `free` are for the `EADDRINUSE` moment:
 
