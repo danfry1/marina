@@ -1,7 +1,7 @@
-# marina demo. Regenerate with:  demo/record.sh   (requires: vhs, node)
-# Run via record.sh, not directly: it builds --release and runs vhs from a
-# neutral cwd (so VHS's own helper processes aren't picked up as targets) with
-# $MARINA_BIN / $MARINA_SCENE set.
+# marina demo. Regenerate with:  demo/record.sh   (requires: vhs)
+# Records `marina demo` — made-up servers and agent sessions — so the GIF is
+# the same on any machine and never shows a real one. Run via record.sh, not
+# directly: it builds --release and sets $MARINA_BIN.
 Output marina.gif
 
 Set Shell "bash"
@@ -12,55 +12,74 @@ Set Padding 18
 Set TypingSpeed 55ms
 Set WindowBar Colorful
 
-# --- off-camera: start a demo scene, then launch marina ---
+# --- off-camera: launch the demo ---
 Hide
-Type "bash $MARINA_SCENE/scene-up.sh"
+Type "clear && $MARINA_BIN demo"
 Enter
-Sleep 3s
-Type "clear"
-Enter
-Type "$MARINA_BIN"
-Enter
-Sleep 3s
+Sleep 2s
 Show
 
 # settle on the populated cockpit
-Sleep 2s
+Sleep 2500ms
 
-# grouping: fold then unfold the client-portal project (2 services)
+# fold and unfold the checkout project (2 servers)
 Enter
-Sleep 1500ms
+Sleep 1200ms
 Enter
-Sleep 1500ms
+Sleep 1200ms
 
-# tail a service's logs inline
+# a server's log, inline; q closes the pane
 Down
 Sleep 600ms
 Type "t"
 Sleep 3s
-Escape
+Type "q"
 Sleep 1s
 
-# cycle the sort: port -> cpu -> mem -> port
+# sort by cpu, then mem, then back to port
 Type "s"
-Sleep 1300ms
+Sleep 1200ms
 Type "s"
-Sleep 1300ms
+Sleep 1200ms
 Type "s"
 Sleep 1s
 
-# live filter, then clear
-Type "/client"
+# filter to what Claude Code sessions started; Esc puts the old filter back
+Type "/claude"
 Sleep 2s
 Escape
 Sleep 1s
 
-# the help overlay
-Type "?"
+# the server an ended session left behind: X stops it, the row stays put
+Down
+Sleep 500ms
+Down
+Sleep 900ms
+Type "X"
 Sleep 2500ms
+
+# X on a group asks first; any other key cancels
+Type "g"
+Sleep 800ms
+Type "X"
+Sleep 2500ms
+Escape
+Sleep 1200ms
+
+# group by who started them: agent sessions with their servers
+Type "v"
+Sleep 1500ms
+Down
+Sleep 2500ms
+Type "v"
+Sleep 1s
+
+# every key
+Type "?"
+Sleep 3s
 Escape
 Sleep 800ms
 
 # back to the top — leave the full cockpit on screen
 Type "g"
-Sleep 2000ms
+Sleep 2s
