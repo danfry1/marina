@@ -59,12 +59,6 @@ pub struct Sampler {
     hosts: crate::hosts::Hosts,
     /// opencode session ids, asked of its background service.
     opencode: crate::opencode::Sessions,
-    /// Work tree per agent cwd.
-    trees: HashMap<PathBuf, Option<PathBuf>>,
-    /// Agents' own reports, through marina's hooks; `None` in tests.
-    reports: Option<crate::hooks::Reports>,
-    /// Claude Code transcript summaries; `None` when turned off in config.
-    transcripts: Option<crate::transcript::Cache>,
     /// Agents' working-tree status.
     git: crate::git::Cache,
     home: Option<PathBuf>,
@@ -86,12 +80,6 @@ impl Sampler {
             docker_cache: None,
             hosts: Default::default(),
             opencode: Default::default(),
-            trees: HashMap::new(),
-            reports: Some(Default::default()),
-            transcripts: crate::config::load()
-                .agents
-                .transcripts
-                .then(Default::default),
             git: Default::default(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             last_topology: Vec::new(),
@@ -201,7 +189,7 @@ impl Sampler {
                 if let Some(g) = self.resolver.group_name(&ports, &project, &label) {
                     project = g;
                 }
-                let git_branch = branch_of(agg.root.as_deref(), &cwd);
+                let git_branch = agg.root.as_deref().and_then(resolve::git_branch);
                 let exposed = ports
                     .iter()
                     .any(|p| exposed_ports.get(p).copied().unwrap_or(false));
@@ -298,8 +286,8 @@ impl Sampler {
                     pids,
                     project: w.project,
                     command_label: w.label,
-                    git_branch: branch_of(None, &w.cwd),
                     cwd: w.cwd,
+                    git_branch: None,
                     cpu_pct: cpu,
                     mem_bytes: mem,
                     url: None,
@@ -330,94 +318,12 @@ impl Sampler {
                 a.host = self
                     .hosts
                     .lookup(procs, a.pid, a.tty_path.as_deref(), &a.cwd);
-                // the host tracks /clear and resume; markers can lag. But
-                // only take a Claude session id whose transcript belongs to
-                // this directory: a session started from inside the pane
-                // (inheriting its variables) can report itself to it.
+                // the host tracks /clear and resume; markers can lag
                 if let Some(s) = a.host.as_ref().and_then(|h| h.session.clone()) {
-                    let plausible = a.name != "claude"
-                        || a.session.is_none()
-                        || crate::transcript::belongs_to(&s, &a.cwd).unwrap_or(true);
-                    if plausible {
-                        a.session = Some(s);
-                    }
+                    a.session = Some(s);
                 }
             }
             self.opencode.fill(procs, &mut agents);
-            // what each said of itself. Matched by ancestry, a report also
-            // names its session — the current one, after /clear or resume.
-            if let Some(reps) = self.reports.as_mut() {
-                reps.refresh();
-                for a in &mut agents {
-                    let Some(r) = reps.find(&a.name, a.pid, a.start_time, a.session.as_deref())
-                    else {
-                        continue;
-                    };
-                    if r.chain.contains(&a.pid) && r.session.is_some() {
-                        a.session = r.session.clone();
-                    }
-                    a.report = Some(r.clone());
-                }
-            }
-            // by cwd, cached: it stats every ancestor
-            self.trees
-                .retain(|cwd, _| agents.iter().any(|a| &a.cwd == cwd));
-            for a in &mut agents {
-                a.tree = self
-                    .trees
-                    .entry(a.cwd.clone())
-                    .or_insert_with(|| crate::model::work_tree(&a.cwd))
-                    .clone();
-            }
-            if let Some(tc) = self.transcripts.as_mut() {
-                let oc_service = procs.values().any(|p| {
-                    crate::launcher::agent_service(&p.argv) == Some("opencode")
-                        && p.argv.iter().any(|a| a == "--service")
-                });
-                for a in agents.iter_mut() {
-                    let Some(id) = a.session.clone() else {
-                        continue;
-                    };
-                    a.summary = match a.name.as_str() {
-                        "claude" => tc.get(&id),
-                        "codex" => tc.get_codex(&id),
-                        "opencode" => tc.get_opencode(&id, oc_service),
-                        _ => None,
-                    };
-                    let now = crate::ui::unix_now();
-                    a.subagents = match a.name.as_str() {
-                        "claude" => tc.claude_subagents(&id, now),
-                        "codex" => tc.codex_subagents(&id, now),
-                        _ => Vec::new(),
-                    };
-                }
-                let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
-                tc.retain(&live);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                for a in &mut agents {
-                    a.infer_waiting(now);
-                    // where its screen can be read cheaply and quietly
-                    // (tmux, Zellij — not iTerm2's scripting, a wedged
-                    // kitty, or a WezTerm whose GUI is closed, which logs a
-                    // file per failed call), confirm the inference: there
-                    // must be a dialog on it
-                    if a.waiting {
-                        use crate::hosts::HostKind;
-                        if let Some(h) = a
-                            .host
-                            .as_ref()
-                            .filter(|h| matches!(h.kind, HostKind::Tmux | HostKind::Zellij))
-                        {
-                            if let Some(screen) = crate::hosts::read_screen(h, 30) {
-                                a.waiting = crate::hosts::shows_dialog(&screen);
-                            }
-                        }
-                    }
-                }
-            }
             (out, agents)
         };
 
@@ -510,26 +416,10 @@ impl Sampler {
         }
 
         self.seq += 1;
-        // recently exited sessions, for resuming (when reading transcripts)
-        let ended = match self.transcripts.as_mut() {
-            Some(tc) => {
-                let live: Vec<&str> = agents.iter().filter_map(|a| a.session.as_deref()).collect();
-                // a running session marina couldn't identify may own a
-                // transcript in its directory
-                let busy: Vec<(String, PathBuf)> = agents
-                    .iter()
-                    .filter(|a| a.session.is_none())
-                    .map(|a| (a.name.clone(), a.cwd.clone()))
-                    .collect();
-                tc.ended(&live, &busy)
-            }
-            None => Vec::new(),
-        };
         Snapshot {
             seq: self.seq,
             targets,
             agents,
-            ended,
             error,
         }
     }
@@ -694,7 +584,7 @@ fn build_agents(
                 pid,
                 start_time: p.start_time,
                 session,
-                git_branch: branch_of(root.as_deref(), &cwd),
+                git_branch: root.as_deref().and_then(resolve::git_branch),
                 cwd,
                 project,
                 argv0: p.argv.first().cloned().unwrap_or_else(|| p.name.clone()),
@@ -708,11 +598,6 @@ fn build_agents(
                 host: None,
                 git: None,
                 title: None,
-                summary: None,
-                waiting: false,
-                tree: None,
-                report: None,
-                subagents: Vec::new(),
             })
         })
         .collect();
@@ -773,7 +658,7 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
                 break; // UI gone
             }
             match ctl_rx.recv_timeout(delay) {
-                Ok(SamplerCtl::Refresh | SamplerCtl::Demo(..)) => {
+                Ok(SamplerCtl::Refresh | SamplerCtl::Demo(_)) => {
                     delay = FAST;
                     // collapse a burst of refresh requests into one rebuild
                     while ctl_rx.try_recv().is_ok() {}
@@ -826,17 +711,6 @@ fn root_of(cwd: &Path, cache: &mut RootCache, home: Option<&Path>) -> Option<Pat
 /// the username. Name it after the tool instead (`opencode`, not `danielfry`).
 fn home_project(label: &str) -> String {
     label.split_whitespace().next().unwrap_or(label).to_string()
-}
-
-/// The branch checked out where `cwd` is: from the project root when it's
-/// the git root, else from the work tree containing `cwd` (a monorepo
-/// package's root isn't the repo's; a linked worktree has its own HEAD).
-fn branch_of(root: Option<&Path>, cwd: &Path) -> Option<String> {
-    root.and_then(resolve::git_branch).or_else(|| {
-        crate::model::work_tree(cwd)
-            .as_deref()
-            .and_then(resolve::git_branch)
-    })
 }
 
 fn project_name(root: Option<&Path>, cwd: &Path, cache: &mut NameCache) -> String {
@@ -981,7 +855,6 @@ mod tests {
             mem_bytes: 0,
             start_time: 0,
             agent: None,
-            term: None,
         }
     }
     fn map(ps: Vec<ProcInfo>) -> HashMap<u32, ProcInfo> {
@@ -1145,9 +1018,6 @@ mod tests {
             docker_cache: Some((Instant::now(), HashMap::new())), // never shell out in tests
             hosts: Default::default(),
             opencode: Default::default(),
-            trees: HashMap::new(),
-            reports: None,     // nor ~/.local/state
-            transcripts: None, // never read ~/.claude in tests
             git: Default::default(),
             home: Some(PathBuf::from("/Users/me")),
             last_topology: Vec::new(),

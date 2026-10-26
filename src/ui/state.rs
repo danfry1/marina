@@ -33,10 +33,6 @@ pub(crate) const FREEZE: Duration = Duration::from_secs(2);
 pub(crate) const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Orphan notices outlive ordinary status messages — they ask for a decision.
 pub(crate) const NOTICE_TTL: Duration = Duration::from_secs(20);
-/// An agent working at least this long gets a "finished" notice when it stops.
-const AGENT_WORK_MIN: u64 = 30;
-/// ...once it has been quiet this long (rides out pauses between tool calls).
-const AGENT_QUIET: u64 = 10;
 /// How long a newly-appeared row flashes.
 pub(crate) const FLASH: Duration = Duration::from_millis(1500);
 /// How long after a marina-initiated kill/restart a vanished target is NOT
@@ -92,10 +88,6 @@ pub(crate) enum Entry {
     /// Project view: the folded `agents` section at the bottom. Its own
     /// variant, so it can never collide with (or kill) a project named so.
     Agents,
-    /// Inbox: a session that has exited, by session id (Enter resumes it).
-    Ended(String),
-    /// Inbox: the folded header of the parked (0) or ended (1) sessions.
-    Fold(u8),
 }
 
 pub(crate) struct LogView {
@@ -123,7 +115,7 @@ pub(crate) struct PendingKill {
 }
 
 pub struct App {
-    /// `marina demo`: made-up sessions; verbs only say what they'd do.
+    /// `marina demo`: made-up servers; verbs act on them, not on processes.
     pub demo: bool,
     /// `O`/`Y` on a session with several servers: (verb, pid, which, when).
     pub(crate) url_cycle: Option<(char, u32, usize, Instant)>,
@@ -150,20 +142,8 @@ pub struct App {
     pub(crate) agent_session_of: HashMap<u32, String>,
     /// Project view's `agents` section is unfolded.
     pub(crate) agents_open: bool,
-    /// Notify when an agent finishes or starts waiting (`[notify] agents`).
-    pub notify_agents: bool,
-    /// Per agent pid: (started, last seen) working, unix seconds.
-    agent_streaks: HashMap<u32, (u64, u64)>,
-    /// Agents already reported as waiting on a question.
-    /// Agents already reported as waiting, and on what (the pending tool
-    /// call): a flicker in the waiting signal doesn't repeat the notice.
-    agent_blocked: HashMap<u32, String>,
-    /// Work trees with two or more sessions working at once, already
-    /// reported, and when they last were (their edits can collide). Kept
-    /// for a while after, so a flicker in "working" doesn't report again.
-    busy_trees: HashMap<std::path::PathBuf, u64>,
     /// Messages for a desktop notification, drained by the main loop.
-    pub(crate) notifications: Vec<Notice>,
+    pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
     pub(crate) log_height: u16,
     /// A background log discovery is running (guards double-`T`).
@@ -187,8 +167,6 @@ pub struct App {
     pub(crate) log_rect: Option<Rect>,
     /// Header cells that sort on click: (x_start, x_end, mode).
     pub(crate) header_hits: Vec<(u16, u16, SortMode)>,
-    /// Preview, reply box and inbox (`ui::control`).
-    pub(crate) ctl: super::control::Control,
     /// PROJECT column width at the last render (it grows with the pane).
     pub(crate) project_w: u16,
     /// Recent cpu/mem per target and per agent session, for the inspect
@@ -217,10 +195,6 @@ impl App {
             session_of: HashMap::new(),
             agent_session_of: HashMap::new(),
             agents_open: false,
-            notify_agents: true,
-            agent_streaks: HashMap::new(),
-            agent_blocked: HashMap::new(),
-            busy_trees: HashMap::new(),
             notifications: Vec::new(),
             log: None,
             log_height: 12,
@@ -238,7 +212,6 @@ impl App {
             log_rect: None,
             header_hits: Vec::new(),
             project_w: 22,
-            ctl: Default::default(),
             history: HashMap::new(),
         }
     }
@@ -249,12 +222,7 @@ impl App {
     /// and to notice targets that vanished *without* marina killing them.
     pub fn apply(&mut self, snap: Arc<Snapshot>) {
         let old = std::mem::replace(&mut self.snapshot, snap);
-        if old.seq == 0 && self.snapshot.seq > 0 {
-            self.first_look();
-        }
         self.record_history();
-        self.update_seen();
-        self.drop_orphan_reply();
         let now = Instant::now();
         if old.seq > 0 {
             let old_keys: HashSet<&TargetKey> = old.targets.iter().map(|t| &t.key).collect();
@@ -292,46 +260,11 @@ impl App {
             } else if let Some(msg) = started.filter(|_| !self.notice_showing()) {
                 self.set_status(msg);
             }
-            // a target turning heavy (runaway test runner, leak): say so once
-            let was_heavy: HashSet<&TargetKey> = old
-                .targets
-                .iter()
-                .filter(|t| t.is_heavy())
-                .map(|t| &t.key)
-                .collect();
-            if let Some(t) = self
-                .snapshot
-                .targets
-                .iter()
-                .find(|t| t.is_heavy() && !was_heavy.contains(&t.key))
-            {
-                let msg = format!(
-                    "⚠ {} in {} is using {:.0}% CPU · {} — select it and K to stop it",
-                    t.command_label,
-                    t.project,
-                    t.cpu_pct,
-                    super::format::fmt_mem(t.mem_bytes)
-                );
-                self.set_status(msg);
-            }
             // An agent session that ended and left servers running: say so
             // once, at the transition, and queue a desktop notification.
             for msg in orphan_notices(&old, &self.snapshot) {
-                self.notifications.push(Notice {
-                    title: "servers left running".into(),
-                    body: msg.clone(),
-                    jump: None,
-                    kind: NoticeKind::Other,
-                    who: String::new(),
-                    group: None,
-                });
+                self.notifications.push(msg.clone());
                 self.set_notice(format!("⚠ {msg} · /ended to review, K to stop"));
-            }
-            if self.notify_agents {
-                for n in self.agent_notices(unix_now()) {
-                    self.set_notice(format!("{} · Enter on its row jumps there", n.text()));
-                    self.notifications.push(n);
-                }
             }
         } else {
             let n = self
@@ -351,134 +284,6 @@ impl App {
             session_groups(&self.snapshot.targets, &self.snapshot.agents);
         self.data_warning = self.snapshot.error.clone();
         self.dirty = true;
-    }
-
-    /// Agents that finished a stretch of work, or started waiting on a
-    /// question, since the last snapshot: `claude·api finished after 12m`,
-    /// `claude·api needs you`. Each transition is reported once.
-    /// Agent notices: (text, the session to jump to when it's clicked).
-    pub(crate) fn agent_notices(&mut self, now: u64) -> Vec<Notice> {
-        let mut out = Vec::new();
-        // two sessions editing one work tree at once: say so as it starts
-        let mut working: HashMap<&std::path::Path, Vec<&Agent>> = HashMap::new();
-        for a in &self.snapshot.agents {
-            if let Some(t) = a.tree.as_deref().filter(|_| a.is_working(now)) {
-                working.entry(t).or_default().push(a);
-            }
-        }
-        let busy: Vec<std::path::PathBuf> = working
-            .iter()
-            .filter(|(_, v)| v.len() > 1)
-            .map(|(t, _)| t.to_path_buf())
-            .collect();
-        self.busy_trees
-            .retain(|_, last| now.saturating_sub(*last) < BUSY_TREE_FORGET);
-        for t in &busy {
-            if self.busy_trees.insert(t.clone(), now).is_some() {
-                continue; // reported already
-            }
-            let who: Vec<String> = working[t.as_path()]
-                .iter()
-                .map(|a| {
-                    self.agent_session_of
-                        .get(&a.pid)
-                        .cloned()
-                        .unwrap_or_else(|| a.name.clone())
-                })
-                .collect();
-            out.push(Notice {
-                title: "same work tree".into(),
-                body: format!(
-                    "{} are working in the same tree ({}) — their edits can collide",
-                    who.join(" and "),
-                    tildify(&t.display().to_string())
-                ),
-                jump: None,
-                kind: NoticeKind::Other,
-                who: String::new(),
-                group: None,
-            });
-        }
-        let live: HashSet<u32> = self.snapshot.agents.iter().map(|a| a.pid).collect();
-        self.agent_streaks.retain(|pid, _| live.contains(pid));
-        self.agent_blocked.retain(|pid, _| live.contains(pid));
-        for a in &self.snapshot.agents {
-            let label = self
-                .agent_session_of
-                .get(&a.pid)
-                .cloned()
-                .unwrap_or_else(|| a.name.clone());
-            if a.is_blocked() {
-                let ask = a.summary.as_ref().and_then(|s| s.ask());
-                // what it's waiting on: the tool call, else the question —
-                // a recap landing during a prompt isn't a new prompt
-                let what = match a.summary.as_ref() {
-                    Some(s) if s.pending_tool.is_some() => {
-                        format!("{:?}@{:?}", s.pending_tool, s.pending_since)
-                    }
-                    Some(_) => format!("{ask:?}"),
-                    None => String::new(),
-                };
-                if self.agent_blocked.get(&a.pid) != Some(&what) {
-                    self.agent_blocked.insert(a.pid, what);
-                    // say what it wants, so the notification is actionable
-                    let body = match (a.pending_tool(), ask) {
-                        (Some(t), _) => format!("wants to run {}", clip(&t, 90)),
-                        (None, Some(q)) => clip(&q, 120),
-                        (None, None) => String::new(),
-                    };
-                    out.push(Notice {
-                        title: format!("{label} needs you"),
-                        body,
-                        jump: jump_key(a),
-                        kind: NoticeKind::NeedsYou,
-                        who: label.clone(),
-                        group: None,
-                    });
-                }
-                self.agent_streaks.remove(&a.pid); // the question says it all
-                continue;
-            }
-            // kept until a different question comes: waiting can flicker
-            if a.is_working(now) {
-                self.agent_streaks
-                    .entry(a.pid)
-                    .and_modify(|s| s.1 = now)
-                    .or_insert((now, now));
-            } else if let Some(&(start, last)) = self.agent_streaks.get(&a.pid) {
-                if now.saturating_sub(last) >= AGENT_QUIET {
-                    self.agent_streaks.remove(&a.pid);
-                    if last.saturating_sub(start) >= AGENT_WORK_MIN {
-                        let s = a.summary.as_ref();
-                        let took = super::format::fmt_age(last - start);
-                        // ending on a question: it's your turn, say what's asked
-                        let notice = match s.and_then(|s| s.ask()) {
-                            Some(q) => Notice {
-                                title: format!("{label} finished after {took} · your turn"),
-                                body: clip(&q, 120),
-                                jump: jump_key(a),
-                                kind: NoticeKind::NeedsYou,
-                                who: label.clone(),
-                                group: None,
-                            },
-                            None => Notice {
-                                title: format!("{label} finished after {took}"),
-                                body: s
-                                    .and_then(|s| s.last_reply.as_deref())
-                                    .map(|r| clip(&super::agent_view::first_sentence(r), 110))
-                                    .unwrap_or_default(),
-                                jump: jump_key(a),
-                                kind: NoticeKind::Finished,
-                                who: label.clone(),
-                                group: None,
-                            },
-                        };
-                        out.push(notice);
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// The web URLs of the servers `a` started, by port.
@@ -509,6 +314,64 @@ impl App {
         };
         self.url_cycle = Some((verb, pid, i, Instant::now()));
         i
+    }
+
+    /// A session's label (`claude·api`), as the session view names it.
+    pub(crate) fn agent_label(&self, a: &Agent) -> String {
+        self.agent_session_of
+            .get(&a.pid)
+            .cloned()
+            .unwrap_or_else(|| a.name.clone())
+    }
+
+    /// A notice (`set_notice`) is still on screen.
+    fn notice_showing(&self) -> bool {
+        self.status.is_some()
+            && self.status_ttl == NOTICE_TTL
+            && self.status_at.elapsed() < NOTICE_TTL
+    }
+
+    /// The line for web servers a live agent session just started (not in
+    /// `old_keys`, and not announced in the last few minutes): the first by
+    /// port — what `O` on that session opens first — and how many more.
+    fn started_servers(&mut self, old_keys: &HashSet<&TargetKey>, now: Instant) -> Option<String> {
+        const AGAIN_AFTER: Duration = Duration::from_secs(300);
+        self.announced.retain(|_, at| at.elapsed() < AGAIN_AFTER);
+        let mut fresh: Vec<(&Target, &Agent)> = self
+            .snapshot
+            .targets
+            .iter()
+            .filter(|t| !old_keys.contains(&t.key) && !self.announced.contains_key(&t.key))
+            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
+            .filter_map(|t| {
+                // a session marina can point O at: its launcher's pid is live
+                let l = t.launcher.as_ref().filter(|l| l.alive)?;
+                let a = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|a| l.pid == Some(a.pid) && l.name == a.name)?;
+                Some((t, a))
+            })
+            .collect();
+        fresh.sort_by_key(|(t, _)| t.ports.first().copied());
+        let keys: Vec<TargetKey> = fresh.iter().map(|(t, _)| t.key.clone()).collect();
+        let msg = fresh.first().map(|(t, a)| {
+            let more = match fresh.len() {
+                1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            };
+            format!(
+                "{} started {} on {}{more} — O on its session opens it",
+                self.agent_label(a),
+                t.command_label,
+                t.url.as_ref().map(|u| u.value.as_str()).unwrap_or_default()
+            )
+        });
+        for k in keys {
+            self.announced.insert(k, now);
+        }
+        msg
     }
 
     /// Servers this agent session started (its live launcher is the agent).
@@ -576,56 +439,6 @@ impl App {
         self.dirty = true;
     }
 
-    /// A notice (`set_notice`) is still on screen.
-    fn notice_showing(&self) -> bool {
-        self.status.is_some()
-            && self.status_ttl == NOTICE_TTL
-            && self.status_at.elapsed() < NOTICE_TTL
-    }
-
-    /// The line for web servers a live agent session just started (not in
-    /// `old_keys`, and not announced in the last few minutes): the first by
-    /// port — what `O` on that session opens first — and how many more.
-    fn started_servers(&mut self, old_keys: &HashSet<&TargetKey>, now: Instant) -> Option<String> {
-        const AGAIN_AFTER: Duration = Duration::from_secs(300);
-        self.announced.retain(|_, at| at.elapsed() < AGAIN_AFTER);
-        let mut fresh: Vec<(&Target, &Agent)> = self
-            .snapshot
-            .targets
-            .iter()
-            .filter(|t| !old_keys.contains(&t.key) && !self.announced.contains_key(&t.key))
-            .filter(|t| t.url.as_ref().is_some_and(|u| u.scheme.is_web()))
-            .filter_map(|t| {
-                // a session marina can point O at: its launcher's pid is live
-                let l = t.launcher.as_ref().filter(|l| l.alive)?;
-                let a = self
-                    .snapshot
-                    .agents
-                    .iter()
-                    .find(|a| l.pid == Some(a.pid) && l.name == a.name)?;
-                Some((t, a))
-            })
-            .collect();
-        fresh.sort_by_key(|(t, _)| t.ports.first().copied());
-        let keys: Vec<TargetKey> = fresh.iter().map(|(t, _)| t.key.clone()).collect();
-        let msg = fresh.first().map(|(t, a)| {
-            let more = match fresh.len() {
-                1 => String::new(),
-                n => format!(" (+{} more)", n - 1),
-            };
-            format!(
-                "{} started {} on {}{more} — O on its session opens it",
-                self.agent_label(a),
-                t.command_label,
-                t.url.as_ref().map(|u| u.value.as_str()).unwrap_or_default()
-            )
-        });
-        for k in keys {
-            self.announced.insert(k, now);
-        }
-        msg
-    }
-
     /// A status message that stays up long enough to act on.
     pub fn set_notice(&mut self, s: impl Into<String>) {
         self.set_status(s);
@@ -633,7 +446,7 @@ impl App {
     }
 
     /// Notification texts queued since the last call.
-    pub fn take_notifications(&mut self) -> Vec<Notice> {
+    pub fn take_notifications(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notifications)
     }
 
@@ -812,11 +625,7 @@ impl App {
                 .iter()
                 .filter(|t| &t.key == k)
                 .collect(),
-            Some(Entry::Agent(_))
-            | Some(Entry::Agents)
-            | Some(Entry::Ended(_))
-            | Some(Entry::Fold(_))
-            | None => Vec::new(),
+            Some(Entry::Agent(_)) | Some(Entry::Agents) | None => Vec::new(),
         }
     }
 
@@ -835,8 +644,6 @@ impl App {
                 .map(|a| format!("{} session", a.name))
                 .unwrap_or_default(),
             Some(Entry::Agents) => "agent sessions".into(),
-            Some(Entry::Ended(_)) => "ended session".into(),
-            Some(Entry::Fold(_)) => String::new(),
             None => String::new(),
         }
     }
@@ -845,11 +652,7 @@ impl App {
     /// row still exists, else the nearest neighbor (same list position), never
     /// a jump back to the top. Called by render before drawing.
     pub(crate) fn reconcile(&mut self) {
-        self.ctl.holding = self.ctl.inbox && self.browsing_inbox();
         self.display = self.compute_entries();
-        if self.ctl.inbox {
-            self.note_sections();
-        }
         let idx = self
             .selected
             .as_ref()
@@ -968,7 +771,7 @@ impl App {
             })
     }
 
-    pub(crate) fn matches_agent(&self, a: &Agent) -> bool {
+    fn matches_agent(&self, a: &Agent) -> bool {
         if self.filter.is_empty() {
             return true;
         }
@@ -992,10 +795,6 @@ impl App {
     pub fn escape(&mut self) {
         if self.log.is_some() {
             self.close_log();
-        } else if self.ctl.preview.is_some() {
-            self.ctl.preview = None;
-            self.drop_screen();
-            self.dirty = true;
         } else if self.inspect {
             self.inspect = false;
             self.dirty = true;
@@ -1112,15 +911,6 @@ impl App {
                     self.close_help();
                     return;
                 }
-                if self.ctl.inbox {
-                    // a card selects; the table geometry below doesn't apply
-                    if let Some(e) = self.card_at(x, y) {
-                        self.selected = Some(e);
-                        self.last_input = Instant::now();
-                        self.dirty = true;
-                    }
-                    return;
-                }
                 let t = self.table_rect;
                 if !rect_contains(t, x, y) {
                     return;
@@ -1156,8 +946,6 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_up(3);
-                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
-                    self.detail_scroll_by(-3);
                 } else {
                     self.select_prev();
                 }
@@ -1165,8 +953,6 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if self.log_rect.is_some_and(|r| rect_contains(r, x, y)) {
                     self.log_scroll_down(3);
-                } else if self.detail_visible() && rect_contains(self.ctl.detail_rect, x, y) {
-                    self.detail_scroll_by(3);
                 } else {
                     self.select_next();
                 }
@@ -1208,9 +994,6 @@ impl App {
     /// flatten to visible entries (collapsing folded groups). Volatile sorts
     /// freeze for `FREEZE` after a keystroke.
     pub(crate) fn compute_entries(&self) -> Vec<Entry> {
-        if self.ctl.inbox {
-            return self.inbox_entries(unix_now());
-        }
         let targets = &self.snapshot.targets;
         let agents = &self.snapshot.agents;
         let mut visible: Vec<usize> = (0..targets.len())
@@ -1406,9 +1189,7 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 fn key_of(e: &Entry) -> Option<&TargetKey> {
     match e {
         Entry::Member(k) | Entry::Target(k) => Some(k),
-        Entry::Group(_) | Entry::Agent(_) | Entry::Agents | Entry::Ended(_) | Entry::Fold(_) => {
-            None
-        }
+        Entry::Group(_) | Entry::Agent(_) | Entry::Agents => None,
     }
 }
 
@@ -1538,90 +1319,6 @@ fn ord_canonical(a: &Target, b: &Target) -> std::cmp::Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.project.cmp(&b.project),
-    }
-}
-
-/// How long a shared tree stays reported after two sessions stop working
-/// in it at once.
-const BUSY_TREE_FORGET: u64 = 600;
-
-/// A desktop notification: its text, and the session `marina jump` should
-/// bring up when it's clicked.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Notice {
-    /// A desktop notification's title: who, and what (`claude·api needs you`).
-    pub title: String,
-    /// Its body: what it's asking, or what it said.
-    pub body: String,
-    /// What `marina jump` is given when it's clicked.
-    pub jump: Option<String>,
-    pub kind: NoticeKind,
-    /// The session's label (`claude·api`, `claude·portal #aaaa`), for
-    /// naming it in a grouped notice.
-    pub who: String,
-    /// A notification group of its own (macOS replaces the banner in the
-    /// same group), instead of the session's.
-    pub group: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoticeKind {
-    NeedsYou,
-    Finished,
-    Other,
-}
-
-impl Notice {
-    /// The one-line form, for marina's own status line and logs.
-    pub fn text(&self) -> String {
-        if self.body.is_empty() {
-            self.title.clone()
-        } else {
-            format!("{}: {}", self.title, self.body)
-        }
-    }
-}
-
-/// Desktop notifications for one batch: sessions that finished together
-/// become one (`3 sessions finished`, naming them; clicking jumps to the
-/// first), so a burst isn't a stack of banners. Each that needs you stays
-/// its own: each is something to act on.
-pub fn coalesce(notices: Vec<Notice>) -> Vec<Notice> {
-    let (finished, mut out): (Vec<Notice>, Vec<Notice>) = notices
-        .into_iter()
-        .partition(|n| n.kind == NoticeKind::Finished);
-    match finished.len() {
-        0 => {}
-        1 => out.extend(finished),
-        n => {
-            let who: Vec<&str> = finished.iter().map(|f| f.who.as_str()).collect();
-            out.push(Notice {
-                title: format!("{n} sessions finished"),
-                body: format!("{} — click for the first", who.join(", ")),
-                jump: finished[0].jump.clone(),
-                kind: NoticeKind::Finished,
-                who: String::new(),
-                // its own group: not replacing (or replaced by) the first
-                // session's own banner
-                group: Some("finished".into()),
-            });
-        }
-    }
-    out
-}
-
-/// What `marina jump` is given to find `a` again: its session id, else
-/// its pid.
-fn jump_key(a: &Agent) -> Option<String> {
-    Some(a.session.clone().unwrap_or_else(|| a.pid.to_string()))
-}
-
-/// `s` cut to `n` chars with `…`.
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
 }
 
@@ -1761,11 +1458,11 @@ mod tests {
         let n = app.take_notifications();
         assert_eq!(n.len(), 1, "one notice per session, not per server: {n:?}");
         assert!(
-            n[0].body.starts_with(
+            n[0].starts_with(
                 "claude session in /Users/me/dev/portal ended — left 2 servers running"
             ),
             "{}",
-            n[0].body
+            n[0]
         );
         assert!(app
             .status
@@ -1898,108 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn agents_finishing_or_blocking_are_announced_once() {
-        use crate::hosts::{HostInfo, HostKind, HostStatus};
-        let snap_with = |seq: u64, working: bool, status: Option<HostStatus>| {
-            let mut snap = Snapshot::sample();
-            snap.seq = seq;
-            let mut a = Agent::sample(100, "s1", "api");
-            if !working {
-                a.children.clear(); // no shell; the host decides
-            }
-            a.host = Some(HostInfo {
-                kind: HostKind::Herdr,
-                target: "w1:p1".into(),
-                status,
-                title: None,
-                session: None,
-                app_pid: None,
-                outer: None,
-            });
-            snap.agents = vec![a];
-            Arc::new(snap)
-        };
-        let mut app = App::new();
-        app.apply(snap_with(1, true, Some(HostStatus::Working)));
-        let t0 = 1_000_000;
-        // working for two minutes...
-        app.snapshot = snap_with(2, true, Some(HostStatus::Working));
-        assert!(app.agent_notices(t0).is_empty());
-        assert!(app.agent_notices(t0 + 120).is_empty());
-        // ...then quiet: nothing until the quiet period passes
-        app.snapshot = snap_with(3, false, Some(HostStatus::Idle));
-        assert!(
-            app.agent_notices(t0 + 125).is_empty(),
-            "a pause, not done yet"
-        );
-        let n = app.agent_notices(t0 + 135);
-        assert_eq!(n.len(), 1);
-        assert_eq!(n[0].text(), "claude·api finished after 2m");
-        assert_eq!(n[0].kind, NoticeKind::Finished);
-        assert!(n[0].jump.is_some(), "clicking it jumps to the session");
-        assert!(app.agent_notices(t0 + 200).is_empty(), "once");
-
-        // a short burst isn't worth a ping
-        app.snapshot = snap_with(4, true, Some(HostStatus::Working));
-        app.agent_notices(t0 + 300);
-        app.snapshot = snap_with(5, false, Some(HostStatus::Idle));
-        assert!(app.agent_notices(t0 + 320).is_empty());
-
-        // blocked: right away, once
-        app.snapshot = snap_with(6, false, Some(HostStatus::Blocked));
-        let n = app.agent_notices(t0 + 400);
-        assert_eq!(n.len(), 1);
-        assert_eq!(n[0].text(), "claude·api needs you");
-        assert_eq!(n[0].kind, NoticeKind::NeedsYou);
-        assert!(app.agent_notices(t0 + 410).is_empty());
-    }
-
-    #[test]
-    fn finished_sessions_arriving_together_are_one_notification() {
-        let n = |who: &str, title: &str, kind| Notice {
-            title: title.into(),
-            body: "said something".into(),
-            jump: Some(format!("{who}-id")),
-            kind,
-            who: who.into(),
-            group: None,
-        };
-        let out = coalesce(vec![
-            n(
-                "claude·portal #aaaa",
-                "claude·portal #aaaa finished after 4m",
-                NoticeKind::Finished,
-            ),
-            n("claude·api", "claude·api needs you", NoticeKind::NeedsYou),
-            n(
-                "claude·My Project",
-                "claude·My Project finished after 12m",
-                NoticeKind::Finished,
-            ),
-        ]);
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[0].title, "claude·api needs you", "kept on its own");
-        assert_eq!(out[1].title, "2 sessions finished");
-        assert_eq!(
-            out[1].body,
-            "claude·portal #aaaa, claude·My Project — click for the first"
-        );
-        assert_eq!(out[1].jump.as_deref(), Some("claude·portal #aaaa-id"));
-        assert_eq!(
-            out[1].group.as_deref(),
-            Some("finished"),
-            "not the first session's"
-        );
-        // one alone is left as it is
-        let one = coalesce(vec![n(
-            "claude·docs",
-            "claude·docs finished after 4m",
-            NoticeKind::Finished,
-        )]);
-        assert_eq!(one[0].body, "said something");
-    }
-
-    #[test]
     fn multi_target_project_gets_a_group_single_does_not() {
         let entries = app_with_sample().compute_entries();
         // client-portal (next dev + postgres) -> a group header
@@ -2067,7 +1662,7 @@ mod tests {
         snap.targets.retain(|t| match &victim {
             Entry::Target(k) | Entry::Member(k) => &t.key != k,
             Entry::Group(p) => &t.project != p,
-            Entry::Agent(_) | Entry::Agents | Entry::Ended(_) | Entry::Fold(_) => true,
+            Entry::Agent(_) | Entry::Agents => true,
         });
         app.apply(Arc::new(snap));
         app.reconcile();

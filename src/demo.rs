@@ -1,198 +1,63 @@
-//! `marina demo`: the TUI on made-up sessions — to try marina with no agents
-//! running, and to record the README's demo the same way every time.
-//!
-//! Nothing real is touched. Approve, reject, reply and end change the
-//! made-up sessions; every other verb only says what it would do (see
-//! `main`), and nothing is written to the state dir. The pids are above any
-//! real pid, so even a verb that slipped through could reach no process.
+//! `marina demo`: the TUI on a made-up machine — a few projects' dev
+//! servers, a database container, the agent sessions that started them, one
+//! server orphaned by a session that ended and one left on the LAN. Nothing
+//! real is read or touched: verbs act on the made-up servers (a kill takes
+//! the row away, a restart starts it over), logs and diffs are made up too,
+//! and jumping or opening only says what it would do.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::git::GitStatus;
-use crate::hooks::Report;
 use crate::hosts::{HostInfo, HostKind, HostStatus};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{
     Agent, AgentChild, Anchor, Snapshot, Target, TargetKey, TargetKind, Url, UrlScheme,
 };
-use crate::msg::{SamplerCtl, SamplerMsg};
-use crate::sources::TtyActivity;
-use crate::transcript::{Ended, Summary};
+use crate::msg::{DemoAct, SamplerCtl, SamplerMsg};
 
-/// Above macOS's 99999 and Linux's 2^22.
+/// Made-up pids start above any real pid limit, so nothing can mistake one
+/// for a live process.
 const PID: u32 = 2_000_000_000;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum St {
-    Working,
-    Blocked,
-    /// Finished its turn.
-    Idle,
-}
+const MB: u64 = 1024 * 1024;
 
-/// One scripted change: `after` seconds into the previous state, become
-/// `st`, saying `reply`, with `tool` pending or `shell` running.
-#[derive(Clone)]
-struct Step {
-    after: u64,
-    st: St,
-    reply: Option<&'static str>,
-    tool: Option<&'static str>,
-    shell: Option<&'static str>,
-    pr: Option<&'static str>,
-    git: Option<GitStatus>,
-}
-
-fn step(after: u64, st: St) -> Step {
-    Step {
-        after,
-        st,
-        reply: None,
-        tool: None,
-        shell: None,
-        pr: None,
-        git: None,
-    }
-}
-
-impl Step {
-    fn says(mut self, r: &'static str) -> Self {
-        self.reply = Some(r);
-        self
-    }
-    fn tool(mut self, t: &'static str) -> Self {
-        self.tool = Some(t);
-        self
-    }
-    fn shell(mut self, s: &'static str) -> Self {
-        self.shell = Some(s);
-        self
-    }
-    fn pr(mut self, p: &'static str) -> Self {
-        self.pr = Some(p);
-        self
-    }
-    fn git(mut self, g: GitStatus) -> Self {
-        self.git = Some(g);
-        self
-    }
-}
-
+/// A made-up agent session.
 struct Sess {
     agent: &'static str,
     project: &'static str,
+    session: &'static str,
     branch: &'static str,
-    host: HostKind,
     title: &'static str,
-    prompt: String,
-    reply: String,
-    tool: Option<&'static str>,
+    status: HostStatus,
+    /// A command it's running now.
     shell: Option<&'static str>,
-    pr: Option<&'static str>,
+    host: HostKind,
+    /// Seconds since its terminal last had input (days: stale).
+    quiet: u64,
     git: GitStatus,
-    st: St,
-    /// When `st` began.
-    at: u64,
-    /// Seen already: parked rather than unread.
-    read: bool,
-    started: u64,
-    input: u64,
-    tokens: u64,
-    /// Subagents: what each was asked, its kind, and how long after the
-    /// demo starts it finishes (0: finished already).
-    subs: Vec<(&'static str, &'static str, u64)>,
-    /// What happens next, unprompted.
-    next: Vec<Step>,
-    on_yes: Vec<Step>,
-    on_no: Vec<Step>,
-    on_reply: Vec<Step>,
 }
 
-impl Sess {
-    fn new(agent: &'static str, project: &'static str, title: &'static str, now: u64) -> Self {
-        Sess {
-            agent,
-            project,
-            branch: "main",
-            host: HostKind::Tmux,
-            title,
-            prompt: String::new(),
-            reply: String::new(),
-            tool: None,
-            shell: None,
-            pr: None,
-            git: GitStatus::default(),
-            st: St::Idle,
-            at: now,
-            read: false,
-            started: now - 3 * 3600,
-            input: now - 60,
-            tokens: 60_000,
-            subs: Vec::new(),
-            next: Vec::new(),
-            on_yes: vec![
-                step(0, St::Working),
-                step(4, St::Idle).says("Done — that went through cleanly."),
-            ],
-            on_no: vec![step(0, St::Idle).says("Okay, I've left it. What should I do instead?")],
-            on_reply: Vec::new(),
-        }
-    }
-
-    /// Play a scripted answer once; after that, a plain one.
-    fn answer(&mut self, script: Vec<Step>, now: u64) {
-        let steps = if script.is_empty() {
-            vec![
-                step(0, St::Working),
-                step(6, St::Idle).says("Done. Nothing else is pending."),
-            ]
-        } else {
-            script
-        };
-        self.play(steps, now);
-    }
-
-    fn apply(&mut self, s: &Step, now: u64) {
-        self.st = s.st;
-        self.at = now;
-        self.tool = s.tool;
-        self.shell = s.shell;
-        if let Some(r) = s.reply {
-            self.reply = r.into();
-            self.read = false;
-        }
-        if s.pr.is_some() {
-            self.pr = s.pr;
-        }
-        if let Some(g) = s.git {
-            self.git = g;
-        }
-    }
-
-    /// Run any scripted steps that are due.
-    fn advance(&mut self, now: u64) {
-        while let Some(s) = self.next.first().cloned() {
-            if now < self.at + s.after {
-                break;
-            }
-            self.next.remove(0);
-            self.apply(&s, now);
-        }
-    }
-
-    /// Play `steps`: the first at once, the rest on the clock.
-    fn play(&mut self, steps: Vec<Step>, now: u64) {
-        let mut steps = steps.into_iter();
-        if let Some(first) = steps.next() {
-            self.apply(&first, now);
-        }
-        self.next = steps.collect();
-    }
+/// A made-up server.
+struct Srv {
+    project: &'static str,
+    label: &'static str,
+    port: u16,
+    cpu: f32,
+    mem: u64,
+    /// Seconds it has been up.
+    up: u64,
+    branch: Option<&'static str>,
+    /// Index into the sessions that started it; `None`: a terminal.
+    by: Option<usize>,
+    /// Its session has ended: an orphan.
+    orphan: bool,
+    exposed: bool,
+    container: Option<&'static str>,
+    scheme: UrlScheme,
 }
 
 fn git(changed: u32, untracked: u32, ins: u32, del: u32, ahead: u32) -> GitStatus {
@@ -206,498 +71,344 @@ fn git(changed: u32, untracked: u32, ins: u32, del: u32, ahead: u32) -> GitStatu
     }
 }
 
-fn scenario(now: u64) -> Vec<Sess> {
-    let mut out = Vec::new();
+fn sessions() -> Vec<Sess> {
+    vec![
+        Sess {
+            agent: "claude",
+            project: "checkout",
+            session: "5e551000-aaaa-4aaa-8aaa-000000000001",
+            branch: "saved-cards",
+            title: "Saved cards at checkout",
+            status: HostStatus::Working,
+            shell: Some("pnpm test checkout"),
+            host: HostKind::Herdr,
+            quiet: 60,
+            git: git(9, 3, 301, 40, 0),
+        },
+        Sess {
+            agent: "codex",
+            project: "api",
+            session: "5e551000-aaaa-4aaa-8aaa-000000000002",
+            branch: "rate-limit",
+            title: "Rate limiting for the public API",
+            status: HostStatus::Idle,
+            shell: None,
+            host: HostKind::Tmux,
+            quiet: 3 * 60,
+            git: git(3, 1, 88, 4, 0),
+        },
+        Sess {
+            agent: "claude",
+            project: "web",
+            session: "5e551000-aaaa-4aaa-8aaa-000000000003",
+            branch: "main",
+            title: "Fix the flaky date tests",
+            status: HostStatus::Working,
+            shell: Some("pnpm vitest run"),
+            host: HostKind::Herdr,
+            quiet: 20,
+            git: git(2, 0, 19, 7, 0),
+        },
+        Sess {
+            agent: "codex",
+            project: "search",
+            session: "5e551000-aaaa-4aaa-8aaa-000000000004",
+            branch: "pgvector-spike",
+            title: "Try a vector index",
+            status: HostStatus::Idle,
+            shell: None,
+            host: HostKind::Ghostty,
+            quiet: 3 * 86_400,
+            git: git(0, 0, 0, 0, 0),
+        },
+    ]
+}
 
-    // waiting on an approval
-    let mut s = Sess::new("claude", "checkout", "Saved cards at checkout", now);
-    s.branch = "saved-cards";
-    s.prompt = "Add saved cards to checkout, behind the payments flag".into();
-    s.reply =
-        "The schema change is ready. I need to run the migration against the dev database.".into();
-    s.st = St::Blocked;
-    s.tool = Some("Bash: pnpm prisma migrate dev --name saved_cards");
-    s.at = now - 40;
-    s.git = git(6, 2, 214, 31, 0);
-    s.tokens = 92_000;
-    s.on_yes = vec![
-        step(0, St::Working).shell("pnpm prisma migrate dev"),
-        step(5, St::Working).shell("pnpm test checkout"),
-        step(6, St::Idle)
-            .says("Migration applied and the checkout tests pass (48). Ready for review.")
-            .git(git(9, 3, 301, 40, 0)),
-    ];
-    out.push(s);
-
-    // waiting on a question
-    let mut s = Sess::new("codex", "api", "Rate limiting for the public API", now);
-    s.branch = "rate-limit";
-    s.prompt = "Add rate limiting to the public endpoints".into();
-    s.reply =
-        "There are two ways to key the limit. Should it apply per user, or per API key?".into();
-    s.st = St::Blocked;
-    s.at = now - 3 * 60;
-    s.git = git(3, 1, 88, 4, 0);
-    s.on_reply = vec![
-        step(0, St::Working),
-        step(4, St::Working).shell("cargo test rate_limit"),
-        step(5, St::Idle)
-            .says("Done: the limit is per API key, 100 requests a minute, with tests.")
-            .git(git(5, 1, 162, 9, 0)),
-    ];
-    out.push(s);
-
-    // working: tests now, done soon
-    let mut s = Sess::new("claude", "web", "Fix the flaky date tests", now);
-    s.prompt = "The date tests fail around midnight UTC — find out why and fix it".into();
-    s.st = St::Working;
-    s.shell = Some("pnpm vitest run");
-    s.subs = vec![
-        ("Find tests that build dates in local time", "Explore", 9),
-        (
-            "Check the CI logs for midnight failures",
-            "general-purpose",
-            6,
-        ),
-        ("Read the date utils", "Explore", 0),
-    ];
-    s.git = git(2, 0, 19, 7, 0);
-    s.next = vec![step(12, St::Idle).says(
-        "Fixed: the tests built dates in local time. All 214 pass now. Want me to open a PR?",
-    )];
-    out.push(s);
-
-    // working, then stops to ask for approval
-    let mut s = Sess::new("opencode", "mobile", "Settings screen redesign", now);
-    s.branch = "settings-v2";
-    s.prompt = "Redesign the settings screen to match the new Figma".into();
-    s.st = St::Working;
-    s.git = git(4, 1, 140, 66, 0);
-    s.next = vec![step(17, St::Blocked)
-        .says("I'd like to replace the old settings screen entirely.")
-        .tool("Edit: src/screens/Settings.tsx")];
-    s.on_yes = vec![
-        step(0, St::Working),
-        step(6, St::Idle)
-            .says("The new settings screen is in, with dark mode. Screenshots are in the PR.")
-            .pr("https://github.com/acme/mobile/pull/88"),
-    ];
-    out.push(s);
-
-    // waiting, in a terminal marina can't type into
-    let mut s = Sess::new("claude", "infra", "Staging database upgrade", now);
-    s.host = HostKind::Ghostty;
-    s.prompt = "Upgrade staging Postgres to 17".into();
-    s.reply = "The plan looks right: one database replaced, nothing destroyed.".into();
-    s.st = St::Blocked;
-    s.tool = Some("Bash: terraform apply -target=module.staging_db");
-    s.at = now - 6 * 60;
-    out.push(s);
-
-    // finished, unread, with a PR
-    let mut s = Sess::new("claude", "docs", "Quickstart rewrite", now);
-    s.prompt = "Rewrite the quickstart for the new CLI".into();
-    s.reply = "Rewrote the quickstart and fixed 12 broken links. The PR is open.".into();
-    s.pr = Some("https://github.com/acme/docs/pull/212");
-    s.at = now - 9 * 60;
-    s.git = git(0, 0, 0, 0, 0);
-    out.push(s);
-
-    // finished and read: parked
-    let mut s = Sess::new("claude", "landing", "Pricing page copy", now);
-    s.prompt = "Tighten the pricing page copy".into();
-    s.reply = "Shortened every plan description and committed it.".into();
-    s.read = true;
-    s.at = now - 2 * 3600;
-    s.input = now - 2 * 3600;
-    s.git = git(0, 0, 0, 0, 0);
-    out.push(s);
-
-    // forgotten for days
-    let mut s = Sess::new("codex", "search", "Try a vector index", now);
-    s.prompt = "Spike: would pgvector beat the current search?".into();
-    s.reply = "pgvector was 3x faster on the sample set; notes are in SPIKE.md.".into();
-    s.read = true;
-    s.at = now - 3 * 86_400;
-    s.started = now - 4 * 86_400;
-    s.input = now - 3 * 86_400;
-    s.git = git(0, 0, 0, 0, 0);
-    out.push(s);
-
-    out
+fn servers() -> Vec<Srv> {
+    let srv = |project, label, port, cpu, mem, up, by| Srv {
+        project,
+        label,
+        port,
+        cpu,
+        mem,
+        up,
+        branch: None,
+        by,
+        orphan: false,
+        exposed: false,
+        container: None,
+        scheme: UrlScheme::Http,
+    };
+    vec![
+        Srv {
+            branch: Some("saved-cards"),
+            ..srv(
+                "checkout",
+                "next dev",
+                3000,
+                1.2,
+                380 * MB,
+                2 * 3600,
+                Some(0),
+            )
+        },
+        Srv {
+            container: Some("checkout-db-1"),
+            scheme: UrlScheme::Postgres,
+            ..srv("checkout", "postgres", 5432, 0.1, 64 * MB, 6 * 86_400, None)
+        },
+        Srv {
+            branch: Some("rate-limit"),
+            exposed: true,
+            ..srv("api", "cargo run", 8080, 0.4, 42 * MB, 40 * 60, Some(1))
+        },
+        srv("web", "vite", 5173, 0.8, 210 * MB, 5 * 3600, Some(2)),
+        Srv {
+            orphan: true,
+            ..srv("docs", "astro dev", 4321, 0.2, 120 * MB, 86_400, None)
+        },
+        Srv {
+            branch: Some("pgvector-spike"),
+            ..srv(
+                "search",
+                "storybook",
+                6006,
+                164.0,
+                2970 * MB,
+                3 * 86_400,
+                Some(3),
+            )
+        },
+    ]
 }
 
 fn dir(project: &str) -> PathBuf {
     PathBuf::from("/Users/you/dev").join(project)
 }
 
-/// When the demo started, for the subagents' clocks.
-fn demo_start() -> u64 {
-    static T: OnceLock<u64> = OnceLock::new();
-    *T.get_or_init(crate::ui::unix_now)
+/// The made-up machine, and what has been done to it.
+struct World {
+    start: u64,
+    sessions: Vec<Sess>,
+    servers: Vec<Srv>,
+    /// Restarted: up since then.
+    restarted: Vec<(u16, u64)>,
+    seq: u64,
 }
 
-fn subagents_of(s: &Sess, now: u64) -> Vec<crate::transcript::Subagent> {
-    let start = demo_start();
-    s.subs
-        .iter()
-        .enumerate()
-        .map(|(i, &(task, kind, ends))| {
-            let running = now < start + ends;
-            crate::transcript::Subagent {
-                id: format!("demo-sub-{i}"),
-                task: task.into(),
-                kind: Some(kind.into()),
-                background: true,
-                running,
-                started: Some(start.saturating_sub(40 + 30 * i as u64)),
-                updated: if running {
-                    now
-                } else {
-                    (start + ends).min(now)
-                },
-                doing: running.then(|| "Grep: new Date".into()),
-                said: (!running).then(|| "Found it: three tests build dates in local time.".into()),
+impl World {
+    fn new(now: u64) -> Self {
+        World {
+            start: now,
+            sessions: sessions(),
+            servers: servers(),
+            restarted: Vec::new(),
+            seq: 0,
+        }
+    }
+
+    fn act(&mut self, act: DemoAct, now: u64) {
+        let port = |k: &TargetKey| match k {
+            TargetKey::Port(p) => Some(*p),
+            TargetKey::Command { .. } => None,
+        };
+        match act {
+            DemoAct::Stop(keys) => {
+                let ports: Vec<u16> = keys.iter().filter_map(port).collect();
+                self.servers.retain(|s| !ports.contains(&s.port));
             }
-        })
-        .collect()
+            DemoAct::Restart(keys) => {
+                for p in keys.iter().filter_map(port) {
+                    self.restarted.retain(|(q, _)| *q != p);
+                    self.restarted.push((p, now));
+                }
+            }
+        }
+    }
+
+    fn snapshot(&mut self, now: u64) -> Snapshot {
+        self.seq += 1;
+        // a little movement in the numbers, as a live machine has
+        let wobble = |i: usize| ((self.seq as f32 + i as f32 * 1.7).sin() * 0.15) + 1.0;
+        let agents: Vec<Agent> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| agent(i, s, now, wobble(i)))
+            .collect();
+        let targets = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let since = self
+                    .restarted
+                    .iter()
+                    .find(|(p, _)| *p == s.port)
+                    .map(|&(_, at)| at)
+                    .unwrap_or(self.start.saturating_sub(s.up));
+                target(i, s, &self.sessions, &agents, since, wobble(i + 7))
+            })
+            .collect();
+        Snapshot {
+            seq: self.seq,
+            targets,
+            agents,
+            error: None,
+        }
+    }
 }
 
-fn agent_of(i: usize, s: &Sess, now: u64) -> Agent {
+fn agent(i: usize, s: &Sess, now: u64, wobble: f32) -> Agent {
     let pid = PID + 100 * i as u32;
     let mut children = vec![AgentChild {
         pid: pid + 1,
-        start_time: s.started,
+        start_time: now - 3600,
         label: "npm exec chrome-devtools-mcp".into(),
         shell: false,
-        cpu_pct: 0.0,
-        mem_bytes: 60 << 20,
+        cpu_pct: 0.1,
+        mem_bytes: 48 * MB,
     }];
     if let Some(cmd) = s.shell {
         children.push(AgentChild {
             pid: pid + 2,
-            start_time: s.at,
+            start_time: now - 20,
             label: cmd.into(),
             shell: true,
-            cpu_pct: 85.0,
-            mem_bytes: 300 << 20,
+            cpu_pct: 38.0 * wobble,
+            mem_bytes: 160 * MB,
         });
     }
-    let status = match s.st {
-        St::Working => HostStatus::Working,
-        St::Blocked => HostStatus::Blocked,
-        St::Idle => HostStatus::Idle,
-    };
-    let session = format!("{:08x}-demo-4000-8000-{:012x}", 0x5e55_1000 + i, i);
-    let working = s.st == St::Working;
-    let output = if working { now } else { s.at };
-    let host = HostInfo {
-        kind: s.host,
-        target: if s.host == HostKind::Tmux {
-            format!("demo:{i}.0")
-        } else {
-            dir(s.project).display().to_string()
-        },
-        status: None,
-        title: None,
-        session: Some(session.clone()),
-        app_pid: None,
-        outer: (s.host == HostKind::Tmux).then_some(HostKind::Ghostty),
+    let host = match s.host {
+        HostKind::Herdr => Some((format!("w{i}:p1"), Some(HostKind::Ghostty))),
+        HostKind::Tmux => Some((format!("work:{i}.0"), Some(HostKind::ITerm))),
+        HostKind::Ghostty => Some((dir(s.project).display().to_string(), None)),
+        _ => None,
     };
     Agent {
         name: s.agent.into(),
         pid,
-        start_time: s.started,
-        session: Some(session.clone()),
+        start_time: now - 4 * 3600 - s.quiet,
+        session: Some(s.session.into()),
         cwd: dir(s.project),
         project: s.project.into(),
         git_branch: Some(s.branch.into()),
         argv0: s.agent.into(),
         argc: 1,
-        pids: children.iter().map(|c| c.pid).chain([pid]).collect(),
-        cpu_pct: if working { 12.0 } else { 0.3 },
-        mem_bytes: (420 + 37 * i as u64) << 20,
+        pids: vec![pid, pid + 1],
+        cpu_pct: if s.status == HostStatus::Working {
+            6.0 * wobble
+        } else {
+            0.8
+        },
+        mem_bytes: 520 * MB,
         children,
         tty_path: None,
-        tty: Some(TtyActivity {
-            output,
-            input: s.input,
-        }),
-        host: Some(host),
-        git: Some(s.git),
-        title: None,
-        summary: Some(Summary {
-            title: Some(s.title.into()),
-            last_prompt: Some(s.prompt.clone()),
-            last_reply: (!s.reply.is_empty() && !working).then(|| s.reply.clone()),
-            recap: None,
-            pending_tool: s.tool.map(str::to_string),
-            pending_since: s.tool.map(|_| s.at),
-            in_turn: s.st != St::Idle,
-            pr_url: s.pr.map(str::to_string),
-            // a read session's reply is no news
-            updated: (!s.read).then_some(s.at),
-            context_tokens: Some(s.tokens),
-            model: Some(
-                if s.agent == "codex" {
-                    "gpt-5.5"
+        tty: Some(crate::sources::TtyActivity {
+            output: now
+                - if s.status == HostStatus::Working {
+                    1
                 } else {
-                    "claude-opus-5-5"
-                }
-                .into(),
-            ),
-            cwd: Some(dir(s.project)),
-            turn_ended: (s.st == St::Idle).then_some(s.at),
+                    s.quiet
+                },
+            input: now - s.quiet,
         }),
-        waiting: false,
-        tree: Some(dir(s.project)),
-        report: Some(Report {
-            agent: s.agent.into(),
-            session: Some(session),
-            status,
-            at: s.at,
-            chain: vec![pid],
+        host: host.map(|(target, outer)| HostInfo {
+            kind: s.host,
+            target,
+            // only herdr watches the screen and reports a status
+            status: (s.host == HostKind::Herdr).then_some(s.status),
+            title: (s.host == HostKind::Herdr).then(|| s.title.into()),
+            session: None,
+            app_pid: None,
+            outer,
         }),
-        subagents: subagents_of(s, now),
+        git: Some(s.git),
+        title: Some(s.title.into()),
     }
 }
 
 fn target(
-    project: &str,
-    label: &str,
-    port: u16,
-    cpu: f32,
-    mem_mb: u64,
-    url: Option<(UrlScheme, String)>,
-    by: Option<&Agent>,
+    i: usize,
+    s: &Srv,
+    sessions: &[Sess],
+    agents: &[Agent],
+    since: u64,
+    wobble: f32,
 ) -> Target {
-    let pid = PID + 50_000 + port as u32;
+    let pid = PID + 10_000 + 10 * i as u32;
+    let launcher = match (s.by, s.orphan) {
+        (Some(n), _) => Some(agents[n].as_launcher()),
+        (None, true) => Some(Launcher {
+            kind: LauncherKind::Agent,
+            name: "claude".into(),
+            pid: Some(PID + 9_999),
+            alive: false,
+            session: Some("5e551000-aaaa-4aaa-8aaa-0000000000e1".into()),
+            cwd: Some(dir(s.project)),
+            start_time: since,
+        }),
+        (None, false) if s.container.is_some() => None,
+        (None, false) => Some(Launcher {
+            kind: LauncherKind::Terminal,
+            name: "ghostty".into(),
+            pid: None,
+            alive: true,
+            session: None,
+            cwd: None,
+            start_time: since,
+        }),
+    };
+    let branch = s
+        .branch
+        .map(str::to_string)
+        .or_else(|| s.by.map(|n| sessions[n].branch.to_string()))
+        .or_else(|| s.container.is_none().then(|| "main".into()));
+    let url = match s.scheme {
+        UrlScheme::Postgres => format!("postgres://localhost:{}", s.port),
+        _ => format!("http://localhost:{}", s.port),
+    };
     Target {
-        key: TargetKey::Port(port),
+        key: TargetKey::Port(s.port),
         kind: TargetKind::Listener,
-        ports: vec![port],
-        anchor: Anchor { pid, start_time: 0 },
-        anchor_argv: vec![],
-        pids: vec![pid],
-        pid_starts: vec![(pid, 0)],
-        project: project.into(),
-        command_label: label.into(),
-        cwd: dir(project),
-        git_branch: by.and_then(|a| a.git_branch.clone()),
-        cpu_pct: cpu,
-        mem_bytes: mem_mb << 20,
-        url: url.map(|(scheme, value)| Url { scheme, value }),
-        exposed: false,
-        container: None,
-        launcher: by.map(Agent::as_launcher),
-    }
-}
-
-/// The snapshot as of `now`, without the sessions that ended (`gone`):
-/// their servers stay, as orphans.
-fn snapshot(seq: u64, sessions: &[Sess], gone: &[bool], ended: &[Ended], now: u64) -> Snapshot {
-    let all: Vec<Agent> = sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| agent_of(i, s, now))
-        .collect();
-    let by = |p: &str| all.iter().find(|a| a.project == p);
-    let http = |p: u16| Some((UrlScheme::Http, format!("http://localhost:{p}")));
-    let mut targets = vec![
-        target(
-            "checkout",
-            "next dev",
-            3000,
-            1.2,
-            380,
-            http(3000),
-            by("checkout"),
-        ),
-        target("api", "cargo run", 8080, 0.4, 42, http(8080), by("api")),
-        target("web", "vite", 5173, 0.8, 210, http(5173), by("web")),
-        // left running by the forgotten spike, and running away
-        target(
-            "search",
-            "storybook",
-            6006,
-            164.0,
-            2900,
-            http(6006),
-            by("search"),
-        ),
-        target(
-            "checkout",
-            "postgres",
-            5432,
-            0.1,
-            64,
-            Some((UrlScheme::Postgres, "postgres://localhost:5432".to_string())),
-            None,
-        ),
-    ];
-    // up for: checkout's next dev, api, web, the spike's storybook, the database
-    let ups = [2 * 3600, 40 * 60, 5 * 3600, 3 * 86_400, 6 * 86_400];
-    for (t, up) in targets.iter_mut().zip(ups) {
-        t.anchor.start_time = now - up;
-        t.pid_starts = vec![(t.anchor.pid, now - up)];
-    }
-    targets[4].container = Some("checkout-db-1".into());
-    targets[4].launcher = Some(Launcher {
-        kind: LauncherKind::Detached,
-        name: "docker".into(),
-        pid: None,
-        alive: true,
-        session: None,
-        cwd: None,
-        start_time: 0,
-    });
-    for t in targets.iter_mut() {
-        if let Some(l) = t.launcher.as_mut() {
-            let i = all.iter().position(|a| Some(a.pid) == l.pid);
-            l.alive = !i.is_some_and(|i| gone[i]);
-        }
-    }
-    let agents = all
-        .into_iter()
-        .zip(gone)
-        .filter(|(_, &g)| !g)
-        .map(|(a, _)| a)
-        .collect();
-    Snapshot {
-        seq,
-        targets,
-        agents,
-        ended: ended.to_vec(),
-        error: None,
-    }
-}
-
-fn ended(now: u64) -> Vec<Ended> {
-    vec![Ended {
-        agent: "claude".into(),
-        id: "0e9c2b7a-demo-4000-8000-000000000001".into(),
-        at: now - 5 * 3600,
-        cwd: dir("billing"),
-        summary: Summary {
-            title: Some("Invoice PDF export".into()),
-            last_prompt: Some("Export invoices as PDF".into()),
-            last_reply: Some("PDF export works for single invoices; batches are next.".into()),
-            updated: Some(now - 5 * 3600),
-            ..Default::default()
+        ports: vec![s.port],
+        anchor: Anchor {
+            pid,
+            start_time: since,
         },
-    }]
-}
-
-/// The pane text the preview shows, by pid.
-fn screens() -> &'static Mutex<HashMap<u32, Vec<String>>> {
-    static S: OnceLock<Mutex<HashMap<u32, Vec<String>>>> = OnceLock::new();
-    S.get_or_init(Default::default)
-}
-
-/// The made-up session's screen, for the preview pane.
-pub fn screen(pid: u32) -> Option<Vec<String>> {
-    screens().lock().ok()?.get(&pid).cloned()
-}
-
-fn screen_of(s: &Sess) -> Vec<String> {
-    let mut rows = vec![format!("> {}", s.prompt), String::new()];
-    match (s.st, s.shell, s.tool) {
-        (St::Working, Some(cmd), _) => {
-            rows.push(format!("⏺ Bash({cmd})"));
-            rows.push("  ⎿  Running…".into());
-        }
-        (St::Working, None, _) => rows.push("✻ Thinking…".into()),
-        (St::Blocked, _, Some(tool)) => {
-            rows.push(format!("⏺ {}", s.reply));
-            rows.push(String::new());
-            rows.push(format!(" {tool}"));
-            rows.push(" Do you want to proceed?".into());
-            rows.push(" ❯ 1. Yes".into());
-            rows.push("   2. No, and tell the agent what to do differently".into());
-        }
-        _ => rows.push(format!("⏺ {}", s.reply)),
+        anchor_argv: vec![s.label.into()],
+        pids: vec![pid, pid + 1, pid + 2],
+        pid_starts: Vec::new(),
+        project: s.project.into(),
+        command_label: s.label.into(),
+        cwd: dir(s.project),
+        git_branch: branch,
+        cpu_pct: s.cpu * wobble,
+        mem_bytes: s.mem,
+        url: Some(Url {
+            scheme: s.scheme,
+            value: url,
+        }),
+        exposed: s.exposed,
+        container: s.container.map(str::to_string),
+        launcher,
     }
-    rows
 }
 
-/// Which session a host target names (`demo:3.0`, or the directory).
-fn find(sessions: &[Sess], target: &str) -> Option<usize> {
-    if let Some(i) = target
-        .strip_prefix("demo:")
-        .and_then(|t| t.split('.').next())
-        .and_then(|i| i.parse::<usize>().ok())
-    {
-        return (i < sessions.len()).then_some(i);
-    }
-    sessions
-        .iter()
-        .position(|s| dir(s.project).display().to_string() == target)
-}
-
-/// Like [`crate::sampler::spawn`], from the made-up sessions. A
-/// `SamplerCtl::Demo` acts on one of them.
+/// Like [`crate::sampler::spawn`], from the made-up machine. A
+/// [`SamplerCtl::Demo`] acts on it; a refresh rebuilds at once.
 pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
     let (tx, rx) = mpsc::channel();
     let (ctl_tx, ctl_rx) = mpsc::channel::<SamplerCtl>();
     thread::spawn(move || {
-        let start = crate::ui::unix_now();
-        let mut sessions = scenario(start);
-        let mut ended = ended(start);
-        let mut gone = vec![false; sessions.len()];
-        let mut seq = 0;
+        let mut world = World::new(crate::ui::unix_now());
         loop {
-            let now = crate::ui::unix_now();
-            for s in sessions.iter_mut() {
-                s.advance(now);
-            }
-            if let Ok(mut m) = screens().lock() {
-                for (i, s) in sessions.iter().enumerate() {
-                    m.insert(PID + 100 * i as u32, screen_of(s));
-                }
-            }
-            seq += 1;
-            let snap = snapshot(seq, &sessions, &gone, &ended, now);
+            let snap = world.snapshot(crate::ui::unix_now());
             if tx.send(SamplerMsg::Snapshot(Arc::new(snap))).is_err() {
                 break;
             }
             match ctl_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(SamplerCtl::Demo(target, what)) => {
-                    let Some(i) = find(&sessions, &target) else {
-                        continue;
-                    };
-                    let now = crate::ui::unix_now();
-                    let s = &mut sessions[i];
-                    match what {
-                        crate::hosts::Send::Approve => {
-                            let steps = std::mem::take(&mut s.on_yes);
-                            s.answer(steps, now);
-                        }
-                        crate::hosts::Send::Reject => {
-                            let steps = std::mem::take(&mut s.on_no);
-                            s.answer(steps, now);
-                        }
-                        crate::hosts::Send::Reply(text) if text == "/exit" || text == "/quit" => {
-                            // ended: listed as such, its servers left behind
-                            gone[i] = true;
-                            let a = agent_of(i, s, now);
-                            ended.insert(
-                                0,
-                                Ended {
-                                    agent: s.agent.into(),
-                                    id: a.session.unwrap_or_default(),
-                                    at: now,
-                                    cwd: a.cwd,
-                                    summary: a.summary.unwrap_or_default(),
-                                },
-                            );
-                        }
-                        crate::hosts::Send::Reply(text) => {
-                            s.prompt = text;
-                            let steps = std::mem::take(&mut s.on_reply);
-                            s.answer(steps, now);
-                        }
-                    }
-                }
+                Ok(SamplerCtl::Demo(act)) => world.act(act, crate::ui::unix_now()),
                 Ok(SamplerCtl::Refresh) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -706,67 +417,90 @@ pub fn spawn() -> (Receiver<SamplerMsg>, Sender<SamplerCtl>) {
     (rx, ctl_tx)
 }
 
+/// What `T` shows for a made-up server: a dev server's start-up and a few
+/// requests.
+pub fn log_lines(project: &str, label: &str, port: Option<u16>) -> Vec<String> {
+    let port = port.map(|p| p.to_string()).unwrap_or_default();
+    match label {
+        "postgres" => vec![
+            "LOG:  database system is ready to accept connections".into(),
+            "LOG:  checkpoint starting: time".into(),
+            "LOG:  checkpoint complete: wrote 12 buffers (0.1%)".into(),
+        ],
+        "cargo run" => vec![
+            "   Compiling api v0.3.0 (/Users/you/dev/api)".into(),
+            "    Finished `dev` profile in 4.21s".into(),
+            format!("     Running `target/debug/api` — listening on 0.0.0.0:{port}"),
+            "GET /v1/search 200 12ms".into(),
+            "GET /v1/search 429 1ms  rate limited (key …9f2c)".into(),
+        ],
+        "storybook" => vec![
+            "info => Starting manager..".into(),
+            format!("info => Storybook started on http://localhost:{port}"),
+            "WARN Rebuilding: 418 stories changed".into(),
+            "WARN Rebuilding: 418 stories changed".into(),
+            "WARN Rebuilding: 418 stories changed".into(),
+        ],
+        _ => vec![
+            format!("> {project}@0.1.0 dev"),
+            format!("> {label}"),
+            String::new(),
+            format!("  ➜  Local:   http://localhost:{port}/"),
+            "  ✓ Ready in 1.8s".into(),
+            " GET / 200 in 142ms".into(),
+            " GET /checkout 200 in 88ms".into(),
+        ],
+    }
+}
+
+/// What `D` shows for a made-up work tree.
+pub fn diff_lines(project: &str) -> Vec<String> {
+    vec![
+        format!(" src/{project}/index.ts | 42 +++++++++++++++++++++----"),
+        " src/lib/flags.ts        |  6 ++++-".into(),
+        " 2 files changed, 41 insertions(+), 7 deletions(-)".into(),
+        String::new(),
+        format!("+++ b/src/{project}/index.ts"),
+        "+  if (flags.payments) {".into(),
+        "+    return <SavedCards user={user} />".into(),
+        "+  }".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn scripted_steps_run_on_the_clock() {
+    fn the_demo_has_one_of_everything_a_cockpit_shows() {
         let now = 1_000_000;
-        let mut all = scenario(now);
-        let web = all.iter_mut().find(|s| s.project == "web").unwrap();
-        web.advance(now + 5);
-        assert_eq!(web.st, St::Working);
-        web.advance(now + 12);
-        assert_eq!(web.st, St::Idle);
-        assert!(web.reply.contains("214 pass"));
-    }
-
-    #[test]
-    fn approving_plays_its_script() {
-        let now = 1_000_000;
-        let mut all = scenario(now);
-        let s = &mut all[0];
-        let steps = std::mem::take(&mut s.on_yes);
-        s.play(steps, now);
-        assert_eq!(
-            (s.st, s.shell),
-            (St::Working, Some("pnpm prisma migrate dev"))
-        );
-        s.advance(now + 5);
-        s.advance(now + 11);
-        assert_eq!(s.st, St::Idle);
-    }
-
-    #[test]
-    fn an_ended_session_leaves_its_servers_orphaned() {
-        let now = 1_000_000;
-        let all = scenario(now);
-        let api = all.iter().position(|s| s.project == "api").unwrap();
-        let mut gone = vec![false; all.len()];
-        gone[api] = true;
-        let snap = snapshot(1, &all, &gone, &[], now);
-        assert!(snap.agents.iter().all(|a| a.project != "api"));
-        let server = snap.targets.iter().find(|t| t.project == "api").unwrap();
-        assert_eq!(server.launcher.as_ref().map(|l| l.alive), Some(false));
-        assert_eq!(find(&all, "demo:99.0"), None);
-    }
-
-    #[test]
-    fn the_inbox_has_one_of_everything() {
-        let now = 1_000_000;
-        let all = scenario(now);
-        let snap = snapshot(1, &all, &vec![false; all.len()], &ended(now), now);
-        let st: Vec<_> = snap.agents.iter().map(|a| a.host_status()).collect();
-        assert!(st.contains(&Some(HostStatus::Blocked)));
-        assert!(st.contains(&Some(HostStatus::Working)));
-        assert!(snap.agents.iter().any(|a| a.is_stale(now)));
-        assert!(snap.targets.iter().any(|t| t.is_heavy()));
-        // no made-up pid is a real one
-        assert!(snap
-            .agents
+        let mut w = World::new(now);
+        let snap = w.snapshot(now);
+        let orphan = snap
+            .targets
             .iter()
-            .flat_map(|a| &a.pids)
-            .all(|&p| p > 4_194_304));
+            .filter(|t| t.launcher.as_ref().is_some_and(|l| l.is_orphaned()))
+            .count();
+        assert_eq!(orphan, 1);
+        assert!(snap.targets.iter().any(|t| t.exposed));
+        assert!(snap.targets.iter().any(|t| t.container.is_some()));
+        assert!(snap.agents.iter().any(|a| a.is_stale(now)));
+        assert!(snap.agents.iter().any(|a| a.is_working(now)));
+        // no made-up pid is a real one, and none can be signalled
+        assert!(snap.targets.iter().all(|t| t.pid_starts.is_empty()));
+        assert!(snap.agents.iter().all(|a| a.pid >= PID));
+    }
+
+    #[test]
+    fn stopping_and_restarting_act_on_the_made_up_servers() {
+        let now = 1_000_000;
+        let mut w = World::new(now);
+        w.act(DemoAct::Stop(vec![TargetKey::Port(4321)]), now);
+        let snap = w.snapshot(now);
+        assert!(snap.targets.iter().all(|t| t.ports != [4321]));
+        w.act(DemoAct::Restart(vec![TargetKey::Port(3000)]), now + 50);
+        let snap = w.snapshot(now + 50);
+        let t = snap.targets.iter().find(|t| t.ports == [3000]).unwrap();
+        assert_eq!(t.anchor.start_time, now + 50);
     }
 }

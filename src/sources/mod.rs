@@ -28,8 +28,6 @@ pub struct ProcInfo {
     pub start_time: u64,
     /// Allowlisted agent markers from the process env (never the raw env).
     pub agent: Option<crate::launcher::AgentEnv>,
-    /// The terminal pane it runs in, from the same env (Zellij, kitty).
-    pub term: Option<crate::hosts::TermEnv>,
 }
 
 /// Listening socket -> PID. macOS via `netstat2`; Linux impl later.
@@ -122,7 +120,6 @@ impl ProcSource for SysinfoProcs {
                     mem_bytes: p.memory(),
                     start_time: p.start_time(),
                     agent: crate::launcher::AgentEnv::from_environ(p.environ()),
-                    term: crate::hosts::TermEnv::from_environ(p.environ()),
                 },
             );
         }
@@ -184,34 +181,6 @@ pub fn child_pids(pid: u32) -> Vec<u32> {
 #[cfg(not(target_os = "macos"))]
 pub fn child_pids(_pid: u32) -> Vec<u32> {
     Vec::new() // Linux reads every parent from /proc
-}
-
-/// `pid`'s parent, read straight from the kernel — cheap enough for a hook
-/// that runs on every tool call.
-#[cfg(target_os = "macos")]
-pub fn parent_pid(pid: u32) -> Option<u32> {
-    use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
-    pidinfo::<BSDInfo>(pid as i32, 0)
-        .ok()
-        .map(|i| i.pbi_ppid)
-        .filter(|&p| p > 1)
-}
-
-#[cfg(target_os = "linux")]
-pub fn parent_pid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `pid (comm) state ppid …`; comm can hold spaces and parens
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-        .filter(|&p| p > 1)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn parent_pid(_pid: u32) -> Option<u32> {
-    None
 }
 
 /// `pid`'s controlling terminal device (`/dev/ttys004`, `/dev/pts/3`).

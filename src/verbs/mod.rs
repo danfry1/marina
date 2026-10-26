@@ -343,133 +343,26 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 /// Fire-and-forget desktop notification: `osascript` on macOS, `notify-send`
 /// on Linux. Runs on its own thread (and reaps the child); failures — no
 /// notification daemon, headless box — are silently ignored.
-///
-/// With `jump` (a session id or pid), clicking it runs `marina jump <jump>`
-/// where the platform allows: `terminal-notifier` on macOS when installed
-/// (plain notifications can't run anything on click), and a *Jump* action
-/// on Linux.
-pub fn notify(title: &str, body: &str, jump: Option<&str>, group: Option<&str>) {
-    // only ever an id: it goes into a command line
-    let jump = jump
-        .filter(|j| crate::launcher::is_session_id(j))
-        .map(String::from);
-    let group = group
-        .filter(|g| crate::launcher::is_session_id(g))
-        .map(String::from)
-        .or_else(|| jump.clone());
-    let exe = stable_exe();
-    // terminal-notifier needs a message, and reads one starting with `-`
-    // or a plist character as something else; notify-send reads a leading
-    // `-` as an option. A leading `\` (stripped by terminal-notifier) and
-    // `--` (for notify-send) keep the text as text.
-    let body = if body.trim().is_empty() {
-        "open marina to see it".to_string()
+pub fn notify(title: &str, body: &str) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("osascript");
+        c.arg("-e").arg(format!(
+            "display notification {} with title {}",
+            applescript_str(body),
+            applescript_str(title)
+        ));
+        c
     } else {
-        body.to_string()
+        let mut c = Command::new("notify-send");
+        c.arg(title).arg(body);
+        c
     };
-    let title = title.to_string();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     thread::spawn(move || {
-        let quiet = |c: &mut Command| {
-            c.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-        };
-        if cfg!(target_os = "macos") {
-            if let (Some(id), Some(tn), Some(exe)) = (&jump, which("terminal-notifier"), &exe) {
-                let mut c = Command::new(tn);
-                let tn_safe = |t: &str| {
-                    if t.starts_with(['-', '(', '[', '{', '"', '\'', '<', '\\']) {
-                        format!("\\{t}")
-                    } else {
-                        t.to_string()
-                    }
-                };
-                c.args([
-                    "-title",
-                    &tn_safe(&title),
-                    "-message",
-                    &tn_safe(&body),
-                    "-group",
-                ])
-                .arg(format!("marina-{}", group.as_deref().unwrap_or(id)))
-                .arg("-execute")
-                // run on click by a shell with launchd's bare PATH:
-                // give it ours, so tmux/herdr are found
-                .arg(format!(
-                    "PATH={} {} jump {id}",
-                    shell_quote(&std::env::var("PATH").unwrap_or_default()),
-                    shell_quote(&exe.display().to_string())
-                ));
-                quiet(&mut c);
-                if c.status().is_ok_and(|s| s.success()) {
-                    return;
-                }
-            }
-            let mut c = Command::new("osascript");
-            c.arg("-e").arg(format!(
-                "display notification {} with title {}",
-                applescript_str(&body),
-                applescript_str(&title)
-            ));
-            quiet(&mut c);
-            let _ = c.status();
-        } else {
-            // each waits for a click; daemons that keep notices forever
-            // would pile these up, so only a few wait at once
-            static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let room = WAITING.fetch_add(1, Ordering::SeqCst) < 8;
-            let clickable = room && jump.is_some() && exe.is_some();
-            if !clickable {
-                WAITING.fetch_sub(1, Ordering::SeqCst);
-            }
-            if let (true, Some(id), Some(exe)) = (clickable, &jump, &exe) {
-                // waits for a click or dismissal, printing the action taken
-                let out = Command::new("notify-send")
-                    .args(["--action=jump=Jump", "--wait", "--", &title, &body])
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .output();
-                WAITING.fetch_sub(1, Ordering::SeqCst);
-                match out {
-                    Ok(o) if o.status.success() => {
-                        if String::from_utf8_lossy(&o.stdout).trim() == "jump" {
-                            let _ = Command::new(exe).args(["jump", id]).status();
-                        }
-                        return;
-                    }
-                    _ => {} // an older notify-send without actions
-                }
-            }
-            let mut c = Command::new("notify-send");
-            c.arg("--").arg(&title).arg(&body);
-            quiet(&mut c);
-            let _ = c.status();
-        }
+        let _ = cmd.status();
     });
-}
-
-/// `name` on `$PATH`.
-pub fn which(name: &str) -> Option<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
-}
-
-/// marina's own path, as something that survives upgrades: the `$PATH`
-/// entry that resolves to this binary (Homebrew's `bin/marina` symlink, not
-/// the versioned Cellar path it points to), else the binary itself.
-pub fn stable_exe() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let real = std::fs::canonicalize(&exe).ok()?;
-    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|d| d.join("marina"))
-        .find(|p| std::fs::canonicalize(p).is_ok_and(|r| r == real));
-    Some(on_path.unwrap_or(exe))
-}
-
-/// Single-quote for a POSIX shell.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// An AppleScript string literal. Text comes from process/project names, so

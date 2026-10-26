@@ -39,12 +39,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         };
         constraints.push(Constraint::Length(h));
     }
-    let preview_open = app.ctl.preview.is_some();
-    if preview_open {
-        // most of the screen: it's where you read what the agent said
-        let h = (frame.area().height * 45 / 100).max(10);
-        constraints.push(Constraint::Length(h));
-    }
     if log_open {
         constraints.push(Constraint::Length(app.log_height));
     }
@@ -56,11 +50,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let table_area = chunks[i];
     i += 1;
     let inspect_area = inspect_open.then(|| {
-        let a = chunks[i];
-        i += 1;
-        a
-    });
-    let preview_area = preview_open.then(|| {
         let a = chunks[i];
         i += 1;
         a
@@ -81,40 +70,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         (0, _) => String::new(),
         (n, _) => format!(" · {n} agents {}", fmt_mem(agents_summary(app).3)),
     };
-    let title = if app.inbox_open() {
-        let now = unix_now();
-        let count = |r: u8| {
-            app.snapshot
-                .agents
-                .iter()
-                .filter(|a| a.urgency(now) == r)
-                .count()
-        };
-        format!(
-            " marina · inbox · {} need you · {} done · {} working · {} sessions ",
-            count(0),
-            count(1),
-            count(2),
-            app.snapshot.agents.len()
-        )
-    } else {
-        let heavy = app.snapshot.targets.iter().filter(|t| t.is_heavy()).count();
-        let heavy = if heavy > 0 {
-            format!(" · ⚠ {heavy} heavy")
-        } else {
-            String::new()
-        };
-        format!(
-            " {}inbox (a) · ▸ SERVERS │ {} targets{heavy}{agents} · sort:{}{} ",
-            if app.demo { "DEMO · " } else { "" },
-            app.snapshot.targets.len(),
-            app.sort.label(),
-            match app.group_by {
-                GroupBy::Project => "",
-                GroupBy::Session => " · by:session",
-            }
-        )
-    };
+    let title = format!(
+        " {}marina · {} targets{agents} · sort:{}{} ",
+        if app.demo { "DEMO · " } else { "" },
+        app.snapshot.targets.len(),
+        app.sort.label(),
+        match app.group_by {
+            GroupBy::Project => "",
+            GroupBy::Session => " · by:session",
+        }
+    );
     let block = Block::bordered().title(title);
 
     if app.display.is_empty() {
@@ -138,24 +103,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ])
         .block(block);
         frame.render_widget(hint, table_area);
-    } else if app.inbox_open() {
-        app.header_hits.clear();
-        app.sync_detail();
-        // a mail client: cards on the left, the selected session on the
-        // right; stacked when the terminal is narrow
-        let (list, detail) = if table_area.width >= 120 {
-            // the list carries the asks now: give it half
-            let w = (table_area.width / 2).clamp(60, 110);
-            let c =
-                Layout::horizontal([Constraint::Length(w), Constraint::Min(40)]).split(table_area);
-            (c[0], c[1])
-        } else {
-            let c = Layout::vertical([Constraint::Percentage(45), Constraint::Min(8)])
-                .split(table_area);
-            (c[0], c[1])
-        };
-        super::agent_view::render_list(frame, app, list);
-        super::agent_view::render_detail(frame, app, detail);
     } else {
         // Drop the rightmost columns (BRANCH, then UP, then VIA) on narrow panes.
         let cols = visible_columns(table_area.width);
@@ -208,11 +155,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(inspect_panel(app), area);
     }
 
-    if let Some(area) = preview_area {
-        app.sync_detail();
-        super::agent_view::render_detail(frame, app, area);
-    }
-
     if let (Some(area), Some(l)) = (log_area, app.log.as_ref()) {
         let inner_h = area.height.saturating_sub(2) as usize;
         let start = match l.scroll {
@@ -241,36 +183,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         let lines = help_lines();
-        let full = frame.area();
-        // two columns (agents | servers + everywhere) when it wouldn't fit
-        // tall, and there's the width
-        let split = lines.len() as u16 + 2 > full.height && full.width >= 150;
-        if split {
-            let at = lines
-                .iter()
-                .position(|l| l.to_string().trim() == "SERVERS")
-                .unwrap_or(lines.len() / 2);
-            let (left, right) = lines.split_at(at);
-            let mut right = right.to_vec();
-            right.insert(0, Line::from(""));
-            let h = left.len().max(right.len()) as u16 + 2;
-            let area = centered_rect(146, h, full);
-            frame.render_widget(Clear, area);
-            let block = Block::bordered().title(" keys ");
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(inner);
-            frame.render_widget(Paragraph::new(left.to_vec()), cols[0]);
-            frame.render_widget(Paragraph::new(right), cols[1]);
-        } else {
-            let area = centered_rect(76, lines.len() as u16 + 2, full);
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(lines).block(Block::bordered().title(" keys ")),
-                area,
-            );
-        }
+        let area = centered_rect(72, lines.len() as u16 + 2, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" keys ")),
+            area,
+        );
     }
 }
 
@@ -296,106 +214,6 @@ fn header_hits(area: Rect, colw: &[u16]) -> Vec<(u16, u16, SortMode)> {
 }
 
 fn footer_line(app: &App) -> Line<'static> {
-    if let Some(m) = app.land_menu() {
-        let head = Span::styled(
-            format!("  land {} › ", m.label),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        );
-        let Some(l) = m.landing.as_ref() else {
-            return Line::from(vec![
-                head,
-                Span::styled("reading its git state…", Style::new().fg(Color::DarkGray)),
-            ]);
-        };
-        let mut state = vec![l.branch.clone().unwrap_or_else(|| "detached".into())];
-        if let Some(base) = l.base.as_ref().filter(|b| Some(*b) != l.branch.as_ref()) {
-            state.push(format!("{} ahead of {base}", l.ahead));
-            if l.behind > 0 {
-                state.push(format!("{} behind", l.behind));
-            }
-        }
-        if l.dirty > 0 {
-            state.push(format!("{} uncommitted", l.dirty));
-        }
-        if l.pushed {
-            state.push("pushed".into());
-        }
-        let on = Style::new().fg(Color::White);
-        let off = Style::new().fg(Color::DarkGray);
-        let into = match &l.base {
-            Some(b) => format!("merge into {b}"),
-            None => "merge".to_string(),
-        };
-        let mut spans = vec![
-            head,
-            Span::styled(
-                format!("{} · ", state.join(", ")),
-                Style::new().fg(Color::Gray),
-            ),
-        ];
-        for (key, what, blocked) in [
-            (
-                "p",
-                "have it open a PR".to_string(),
-                app.land_pr_blocker(m).is_some(),
-            ),
-            ("m", into, l.merge_blocker().is_some()),
-            (
-                "w",
-                "remove worktree".to_string(),
-                app.land_remove_blocker(l).is_some(),
-            ),
-        ] {
-            let style = if blocked { off } else { on };
-            spans.push(Span::styled(
-                format!("{key} "),
-                style.add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(format!("{what}  "), style));
-        }
-        spans.push(Span::styled("· Esc", off));
-        if let Some(n) = &m.note {
-            spans.push(Span::styled(
-                format!("   {n}"),
-                Style::new().fg(Color::Yellow),
-            ));
-        }
-        return Line::from(spans);
-    }
-    if let Some(d) = app.new_draft() {
-        let place = crate::launch::here()
-            .map(|p| p.name())
-            .unwrap_or("(no terminal marina can open)");
-        let wt = if d.worktree { "on" } else { "off" };
-        return Line::from(vec![
-            Span::styled(
-                format!(
-                    "  new {} in {} › ",
-                    d.agent,
-                    tildify(&d.dir.display().to_string())
-                ),
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{}▏", d.prompt), Style::new().fg(Color::White)),
-            Span::styled(
-                format!("  first prompt, optional · Tab own worktree: {wt} · Enter opens {place} · Esc cancel"),
-                Style::new().fg(Color::DarkGray),
-            ),
-        ]);
-    }
-    if let Some((who, text)) = app.reply_draft() {
-        return Line::from(vec![
-            Span::styled(
-                format!("  reply to {who} › "),
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{text}▏"), Style::new().fg(Color::White)),
-            Span::styled(
-                "  Enter send · Esc discard",
-                Style::new().fg(Color::DarkGray),
-            ),
-        ]);
-    }
     if app.is_filtering() {
         Line::styled(
             format!("  /{}▏  (Enter: apply · Esc: clear)", app.filter),
@@ -413,19 +231,9 @@ fn footer_line(app: &App) -> Line<'static> {
             format!("  [filter: {}] · / edit · Esc clear · q quit", app.filter),
             Style::new().fg(Color::DarkGray),
         )
-    } else if app.inbox_open() {
-        Line::styled(
-            "  inbox · Enter jump · p preview · r reply · y/n answer · D diff · a back · ? help · q quit",
-            Style::new().fg(Color::DarkGray),
-        )
-    } else if app.selected_agent().is_some() {
-        Line::styled(
-            "  Enter jump · p preview · r reply · y/n answer · a inbox · i inspect · ? help · q quit",
-            Style::new().fg(Color::DarkGray),
-        )
     } else {
         Line::styled(
-            "  j/k move · / filter · s sort · v by session · a inbox · i inspect · K kill · ? help · q quit",
+            "  j/k move · / filter · s sort · v by session · i inspect · K kill · ? help · q quit",
             Style::new().fg(Color::DarkGray),
         )
     }
@@ -767,8 +575,6 @@ fn entry_row(entry: &Entry, app: &App, by_key: &HashMap<&TargetKey, &Target>) ->
             None => Row::new(Vec::<Cell>::new()),
         },
         Entry::Agents => agents_section_row(app),
-        // only the inbox lists these, and draws its own rows
-        Entry::Ended(_) | Entry::Fold(_) => Row::new(Vec::<Cell>::new()),
     }
 }
 
@@ -1105,24 +911,12 @@ fn target_row(t: &Target, indent: bool, app: &App) -> Row<'static> {
     } else {
         Cell::from(port)
     };
-    // a runaway process stands out where its numbers are
-    let heavy = |hot: bool, text: String| {
-        if hot {
-            Cell::from(Span::styled(
-                text,
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Cell::from(text)
-        }
-    };
-    let measured = !t.pids.is_empty();
     let row = Row::new(vec![
         project,
         command,
         port_cell,
-        heavy(measured && t.cpu_pct >= crate::model::HEAVY_CPU, cpu),
-        heavy(measured && t.mem_bytes >= crate::model::HEAVY_MEM, mem),
+        Cell::from(cpu),
+        Cell::from(mem),
         match &t.launcher {
             Some(l) => Cell::from(Span::styled(l.short(), launcher_style(l))),
             None => Cell::from(Span::styled("—", Style::new().fg(Color::DarkGray))),
@@ -1220,55 +1014,25 @@ fn help_lines() -> Vec<Line<'static>> {
             Span::styled(d.to_string(), dim),
         ])
     };
-    let head = |t: &str| {
-        Line::from(Span::styled(
-            format!(" {t}"),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        ))
-    };
     vec![
         Line::from(""),
-        head("AGENTS"),
-        row(
-            "a",
-            "inbox ↔ servers: every agent session, what needs you first",
-        ),
-        row("Enter", "jump to the session · on an ended one: resume it"),
-        row("p", "preview its conversation · again: its live screen"),
-        row("y · n", "approve / reject what it's asking"),
-        row(
-            "r · 1–9",
-            "reply · quick reply ([agents] quick); Enter sends",
-        ),
-        row("N", "new session here (Tab: in its own git worktree)"),
-        row("d", "set aside: parked until it does something new"),
-        row("X", "end it (twice; sends /exit) · on PARKED: all of them"),
-        row(
-            "L",
-            "land its work: have it open a PR · merge into main · remove worktree",
-        ),
-        row("D", "uncommitted diff of its work tree"),
-        Line::from(""),
-        head("SERVERS"),
-        row("Enter", "fold / unfold a group"),
-        row("K · u", "kill · cancel the force-kill"),
-        row("R · T", "restart (output to a log) · tail logs"),
-        row(
-            "Y · O",
-            "copy URL · open in the browser (on a session: its server; again: the next)",
-        ),
+        row("j / k", "move (mouse: click, wheel)"),
+        row("g / G", "top / bottom"),
+        row("Enter", "fold / unfold group · on an agent: jump to it"),
+        row("D", "uncommitted diff of the agent / server's tree"),
+        row("i", "inspect selection"),
         row("s", "cycle sort (port/cpu/mem) — or click a header"),
-        row("v", "group by project / by agent session"),
-        Line::from(""),
-        head("EVERYWHERE"),
-        row("j k · g G", "move · top / bottom (mouse: click, wheel)"),
         row(
             "/",
             "filter (project · command · port · cwd · branch · via)",
         ),
-        row("i", "inspect the selection"),
-        row("[ ]", "scroll the log / detail pane · +/- resize the log"),
-        row("Esc", "close a pane / clear the filter"),
+        row("v", "group by project / agent session (lists agents)"),
+        row("K · u", "kill · cancel force-kill"),
+        row("R", "restart (output captured to a log)"),
+        row("T", "tail logs"),
+        row("[ · ]", "scroll logs · +/- resize"),
+        row("Y · O", "copy URL · open (on a session: its server)"),
+        row("Esc", "close pane / clear filter"),
         row("? · q", "this help · quit (also Ctrl+C)"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1393,12 +1157,7 @@ mod tests {
     fn help_overlay_lists_keys_version_and_config() {
         let mut app = app_with_sample();
         app.toggle_help();
-        let short = render_to_string(&mut app, 160, 30);
-        assert!(
-            short.contains(env!("CARGO_PKG_VERSION")) && short.contains("SERVERS"),
-            "two columns on a short, wide terminal: {short}"
-        );
-        let out = render_to_string(&mut app, 120, 40);
+        let out = render_to_string(&mut app, 120, 28);
         assert!(out.contains("keys"));
         assert!(out.contains("fold / unfold"));
         assert!(out.contains("tail logs"));

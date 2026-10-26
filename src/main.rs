@@ -1,16 +1,12 @@
-//! marina — one inbox for coding-agent sessions and the dev servers they start.
+//! marina — a developer-process cockpit.
 
 mod cli;
 mod config;
 mod demo;
-mod digest;
 mod docker;
-mod doctor;
 mod exec;
 mod git;
-mod hooks;
 mod hosts;
-mod launch;
 mod launcher;
 mod logs;
 mod model;
@@ -20,10 +16,8 @@ mod ports;
 mod resolve;
 mod sampler;
 mod sources;
-mod transcript;
 mod ui;
 mod verbs;
-mod watch;
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -82,16 +76,8 @@ fn main() -> io::Result<()> {
         prev_hook(info);
     }));
     let mut app = ui::App::new();
-    // the demo keeps read / set-aside in memory: it writes no state
     app.demo = demo;
-    if !demo {
-        ui::load_seen(&mut app);
-    }
-    let agents_cfg = config::load().agents;
-    app.set_quick_replies(agents_cfg.quick);
-    app.set_start_in_inbox(agents_cfg.start.as_deref() != Some("servers"));
     let notify = config::load().notify;
-    app.notify_agents = notify.agents;
     let desktop_notify = notify.desktop && !demo;
     let result = run(
         &mut terminal,
@@ -138,69 +124,6 @@ fn run(
                     if app.help_open() {
                         // Any key dismisses the help overlay.
                         app.close_help();
-                    } else if app.is_new_session() {
-                        // `N`: the first prompt for a new session
-                        match key.code {
-                            KeyCode::Esc => app.new_cancel(),
-                            KeyCode::Tab => app.new_toggle_worktree(),
-                            KeyCode::Enter if app.demo => {
-                                app.new_cancel();
-                                demo_only(app, "would start a session");
-                            }
-                            KeyCode::Enter => {
-                                if let Some((req, place)) = app.new_commit() {
-                                    let ev = ev_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let msg = launch::start(&req, place).unwrap_or_else(|e| e);
-                                        let _ = ev.send(UiEvent::Status(msg));
-                                    });
-                                }
-                            }
-                            KeyCode::Backspace => app.new_backspace(),
-                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.new_push(c)
-                            }
-                            _ => {}
-                        }
-                    } else if app.is_landing() {
-                        // `L`: p / m / w, or Esc
-                        match key.code {
-                            // Ctrl+W must never mean `w`
-                            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-                            KeyCode::Char(c) => match app.land_key(c) {
-                                ui::LandAction::None => {}
-                                ui::LandAction::Send(action) => {
-                                    run_action(app, action, &ev_tx, &ctl)
-                                }
-                                ui::LandAction::Merge(l) => {
-                                    land_off_thread(app, &ev_tx, &ctl, "merging…", move || {
-                                        git::merge_ff(&l)
-                                    })
-                                }
-                                ui::LandAction::Remove(l) => land_off_thread(
-                                    app,
-                                    &ev_tx,
-                                    &ctl,
-                                    "removing the worktree…",
-                                    move || git::remove_worktree(&l),
-                                ),
-                            },
-                            _ => app.land_cancel(),
-                        }
-                    } else if app.is_replying() {
-                        // The reply box captures keystrokes until Enter/Esc.
-                        match key.code {
-                            KeyCode::Esc => app.reply_cancel(),
-                            KeyCode::Enter => {
-                                let action = app.reply_commit();
-                                run_action(app, action, &ev_tx, &ctl);
-                            }
-                            KeyCode::Backspace => app.reply_backspace(),
-                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.reply_push(c)
-                            }
-                            _ => {}
-                        }
                     } else if app.is_filtering() {
                         // Filter input mode captures keystrokes.
                         match key.code {
@@ -213,16 +136,8 @@ fn run(
                             _ => {}
                         }
                     } else {
-                        if key.code != KeyCode::Char('X') {
-                            app.clear_pending_end();
-                        }
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Char('K' | 'R' | 'T' | 'O')
-                                if demo_only(app, "would act on a real process") => {}
-                            KeyCode::Char('Y')
-                                if demo_only(app, "would copy it to your clipboard") => {}
-                            KeyCode::Char('D') if demo_only(app, "would show its git diff") => {}
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                             KeyCode::Char('g') => app.jump_top(),
@@ -230,54 +145,11 @@ fn run(
                             KeyCode::Enter if app.selected_agent().is_some() => {
                                 verb_jump(app, &ev_tx)
                             }
-                            // a fold row (inbox): show / hide what's behind it
-                            KeyCode::Enter if app.toggle_fold() => {}
-                            // an ended session (inbox): resume it
-                            KeyCode::Enter
-                                if app.is_ended_selected() && demo_only(app, "would resume it") => {
-                            }
-                            KeyCode::Enter if app.is_ended_selected() => {
-                                if let Some((req, place)) = app.resume_selected() {
-                                    let ev = ev_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let msg = launch::start(&req, place).unwrap_or_else(|e| e);
-                                        let _ = ev.send(UiEvent::Status(msg));
-                                    });
-                                }
-                            }
                             KeyCode::Enter => app.toggle_collapse(),
                             KeyCode::Char('D') => verb_diff(app),
                             KeyCode::Char('/') => app.start_filter(),
                             KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('i') => app.toggle_inspect(),
-                            KeyCode::Char('p') => app.toggle_preview(),
-                            KeyCode::Char('a') => app.toggle_inbox(),
-                            KeyCode::Char('r') => app.start_reply(),
-                            KeyCode::Char('N') => app.start_new(),
-                            KeyCode::Char('L') if demo_only(app, "would read its git state") => {}
-                            KeyCode::Char('L') => {
-                                if let Some(dir) = app.start_land() {
-                                    let ev = ev_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let l = git::landing(&dir);
-                                        let _ = ev.send(UiEvent::Land(dir, l));
-                                    });
-                                }
-                            }
-                            KeyCode::Char('X') => {
-                                let action = app.end_session();
-                                run_action(app, action, &ev_tx, &ctl);
-                            }
-                            KeyCode::Char(c @ '1'..='9') if app.selected_agent().is_some() => {
-                                app.quick_reply(c as usize - '0' as usize)
-                            }
-                            KeyCode::Char(c @ ('y' | 'n')) => {
-                                let action = app.answer(c == 'y');
-                                run_action(app, action, &ev_tx, &ctl);
-                            }
-                            KeyCode::Char('d') if app.selected_agent().is_some() => {
-                                app.toggle_aside()
-                            }
                             KeyCode::Char('v') => app.toggle_group_by(),
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Char('K') => verb_kill(app, &ev_tx, &ctl),
@@ -286,17 +158,6 @@ fn run(
                             KeyCode::Char('Y') => verb_copy(app),
                             KeyCode::Char('O') => verb_open(app),
                             KeyCode::Char('T') => verb_tail(app, &ev_tx),
-                            // the log pane when it's open, else the detail pane
-                            KeyCode::Char('[') | KeyCode::PageUp
-                                if !app.log_open() && app.detail_visible() =>
-                            {
-                                app.detail_scroll_by(-8)
-                            }
-                            KeyCode::Char(']') | KeyCode::PageDown
-                                if !app.log_open() && app.detail_visible() =>
-                            {
-                                app.detail_scroll_by(8)
-                            }
                             KeyCode::Char('[') => app.log_scroll_up(5),
                             KeyCode::Char(']') => app.log_scroll_down(5),
                             KeyCode::Char('+') | KeyCode::Char('=') => app.log_grow(),
@@ -327,11 +188,9 @@ fn run(
         }
 
         // Orphaned servers; agent sessions finished or waiting on you.
-        let notices = app.take_notifications();
-        // the background watcher, when running, sends these itself
-        if desktop_notify && !notices.is_empty() && !watch::running() {
-            for n in ui::coalesce(notices) {
-                verbs::notify(&n.title, &n.body, n.jump.as_deref(), n.group.as_deref());
+        for msg in app.take_notifications() {
+            if desktop_notify {
+                verbs::notify("marina", &msg);
             }
         }
 
@@ -339,32 +198,8 @@ fn run(
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
                 UiEvent::Status(s) => app.set_status(s),
-                UiEvent::Land(dir, l) => app.land_ready(dir, l),
                 UiEvent::LogReady { project, path } => on_log_ready(app, project, path),
-                UiEvent::Screen {
-                    pid,
-                    generation,
-                    rows,
-                } => app.screen_ready(pid, generation, rows),
             }
-        }
-
-        // The open preview's live screen, read off the UI thread.
-        if let Some((pid, generation, host)) = app.screen_due() {
-            let ev = ev_tx.clone();
-            let demo = app.demo;
-            std::thread::spawn(move || {
-                let rows = if demo {
-                    demo::screen(pid).ok_or_else(|| "no screen".to_string())
-                } else {
-                    hosts::read_screen_or_why(&host, ui::control_rows())
-                };
-                let _ = ev.send(UiEvent::Screen {
-                    pid,
-                    generation,
-                    rows,
-                });
-            });
         }
 
         // New log lines; expire status / kill-undo window / row flashes.
@@ -465,16 +300,18 @@ fn on_agent_row(app: &mut ui::App, verb: &str) -> bool {
 /// (herdr, tmux). With no drivable host, copy a command that gets back into
 /// the session instead.
 fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
-    let Some(pid) = app.selected_agent().map(|a| a.pid) else {
-        return;
-    };
-    app.mark_read(pid);
-    if demo_only(app, "would jump to its terminal") {
-        return;
-    }
     let Some(a) = app.selected_agent() else {
         return;
     };
+    if app.demo {
+        let place = a
+            .host
+            .as_ref()
+            .map(|h| format!("the {}", h.describe()))
+            .unwrap_or_else(|| "its terminal".into());
+        app.set_status(format!("demo: Enter would jump to {place}"));
+        return;
+    }
     match a.host.clone() {
         Some(host) => {
             let ev = ev.clone();
@@ -504,82 +341,6 @@ fn verb_jump(app: &mut ui::App, ev: &Sender<UiEvent>) {
     }
 }
 
-/// In the demo, say what `what` would have done instead, and do nothing.
-fn demo_only(app: &mut ui::App, what: &str) -> bool {
-    if app.demo {
-        app.set_status(format!("demo: {what} — nothing real is touched"));
-    }
-    app.demo
-}
-
-/// Carry out a control action (approve / reject / reply) off the UI thread:
-/// herdr and tmux calls can take a moment. The demo's go to its sessions.
-fn run_action(
-    app: &mut ui::App,
-    action: ui::Action,
-    ev: &Sender<UiEvent>,
-    ctl: &Sender<SamplerCtl>,
-) {
-    if app.demo {
-        let all = match action {
-            ui::Action::None => return,
-            ui::Action::Send(host, what) => vec![(host, what)],
-            ui::Action::SendAll(all) => all,
-        };
-        app.set_status(format!("demo: sent to {} session(s)", all.len()));
-        for (host, what) in all {
-            let _ = ctl.send(SamplerCtl::Demo(host.target, what));
-        }
-        return;
-    }
-    let (host, what) = match action {
-        ui::Action::None => return,
-        ui::Action::Send(host, what) => (host, what),
-        ui::Action::SendAll(all) => {
-            let n = all.len();
-            app.set_status(format!("ending {n} sessions…"));
-            let ev = ev.clone();
-            std::thread::spawn(move || {
-                let failed: Vec<String> = all
-                    .iter()
-                    .filter_map(|(h, w)| hosts::send(h, w).err())
-                    .collect();
-                let msg = match failed.first() {
-                    None => format!("ended {n} sessions"),
-                    Some(e) => format!("ended {} of {n} — {e}", n - failed.len()),
-                };
-                let _ = ev.send(UiEvent::Status(msg));
-            });
-            return;
-        }
-    };
-    app.set_status(format!("sending to the {}…", host.describe()));
-    let ev = ev.clone();
-    std::thread::spawn(move || {
-        let msg = hosts::send(&host, &what).unwrap_or_else(|e| e);
-        let _ = ev.send(UiEvent::Status(msg));
-    });
-}
-
-/// Run a git step of `L` off the UI thread; its result goes to the status
-/// line, then the sampler rescans so the change shows.
-fn land_off_thread(
-    app: &mut ui::App,
-    ev: &Sender<UiEvent>,
-    ctl: &Sender<SamplerCtl>,
-    doing: &str,
-    step: impl FnOnce() -> Result<String, String> + std::marker::Send + 'static,
-) {
-    app.set_status(doing.to_string());
-    let ev = ev.clone();
-    let ctl = ctl.clone();
-    std::thread::spawn(move || {
-        let msg = step().unwrap_or_else(|e| e);
-        let _ = ev.send(UiEvent::Status(msg));
-        let _ = ctl.send(SamplerCtl::Refresh);
-    });
-}
-
 /// Single-quote for a POSIX shell.
 fn shell_quote(s: &str) -> String {
     if s.chars()
@@ -604,8 +365,15 @@ fn verb_diff(app: &mut ui::App) {
     };
     let (tx, rx) = mpsc::channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let demo = app.demo;
     std::thread::spawn(move || {
-        for line in git::diff_lines(&dir) {
+        let lines = if demo {
+            let project = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+            demo::diff_lines(&project.unwrap_or_default())
+        } else {
+            git::diff_lines(&dir)
+        };
+        for line in lines {
             if tx.send(line).is_err() {
                 break; // pane closed
             }
@@ -641,11 +409,18 @@ fn verb_kill(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl>) 
         }
         (ps, cs, keys)
     };
+    let label = app.selection_label();
+    // the demo's servers have no processes to signal
+    if app.demo && !keys.is_empty() {
+        app.mark_marina_action(&keys);
+        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Stop(keys)));
+        app.set_status(format!("stopped {label} (demo: nothing was signalled)"));
+        return;
+    }
     if pid_starts.is_empty() && containers.is_empty() {
         app.set_status("nothing to kill");
         return;
     }
-    let label = app.selection_label();
     app.mark_marina_action(&keys);
     if !containers.is_empty() {
         let n = containers.len();
@@ -696,6 +471,12 @@ fn verb_restart(app: &mut ui::App, ev: &Sender<UiEvent>, ctl: &Sender<SamplerCtl
         }
         (plans, cs, keys)
     };
+    if app.demo {
+        app.mark_marina_action(&keys);
+        let _ = ctl.send(SamplerCtl::Demo(msg::DemoAct::Restart(keys)));
+        app.set_status(format!("restarted {label} (demo: nothing was run)"));
+        return;
+    }
     if plans.is_empty() && containers.is_empty() {
         app.set_status(format!("can't restart {label}: command not captured"));
         return;
@@ -760,6 +541,10 @@ fn verb_copy(app: &mut ui::App) {
 fn verb_open(app: &mut ui::App) {
     match session_url(app, 'O') {
         Some(Ok((url, more))) => {
+            if app.demo {
+                app.set_status(format!("demo: O would open {url}{more}"));
+                return;
+            }
             let _ = verbs::open_url(&url);
             app.set_status(format!("opening {url}{more}"));
             return;
@@ -776,6 +561,9 @@ fn verb_open(app: &mut ui::App) {
     }
     let url = app.selected_target().and_then(|t| t.url.clone());
     match url {
+        Some(u) if u.scheme.is_web() && app.demo => {
+            app.set_status(format!("demo: O would open {}", u.value));
+        }
         Some(u) if u.scheme.is_web() => {
             let _ = verbs::open_url(&u.value);
             app.set_status(format!("opening {}", u.value));
@@ -800,6 +588,16 @@ fn verb_tail(app: &mut ui::App, ev: &Sender<UiEvent>) {
         app.set_status("select a service (not a group) to tail");
         return;
     };
+    if app.demo {
+        let lines = demo::log_lines(&t.project, &t.command_label, t.ports.first().copied());
+        let title = format!("{} · {} (demo)", t.project, t.command_label);
+        let (tx, rx) = mpsc::channel();
+        for l in lines {
+            let _ = tx.send(l);
+        }
+        app.open_log(title, rx, Arc::new(AtomicBool::new(false)));
+        return;
+    }
     if let Some(c) = &t.container {
         let mut cmd = std::process::Command::new("docker");
         cmd.args(["logs", "-f", "--tail", "200", c]);
