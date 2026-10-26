@@ -57,6 +57,8 @@ marina restart <selector>   # kill the subtree, wait for the port to free, re-ex
                             # in the same cwd; output is captured to
                             # ~/.local/state/marina/logs/<project>.log
 marina url <selector>       # print matching URLs (add --json for structure)
+marina open [selector]      # open in the browser; bare: servers in this directory;
+                            # --mine: the ones this session started
 marina who <port>           # what's holding a port — a dev target, another
                             # process (named), or free (exit 1). --json available
 marina free <port>          # stop the dev target on a port and wait until the
@@ -117,13 +119,14 @@ Exit codes — check them: `0` ok · `1` no match · `2` usage error.
   `stale` = idle with no terminal input for over a day), `cwd`, `branch`, `cpu_pct`,
   `mem_bytes`, `shells` (commands it's running now), `helpers` (MCP servers, …)
   and `servers` (dev servers it started), plus `title` (the task, under
-  herdr), `host` (`{kind, target, outer}` — the herdr/tmux pane, or the iterm/terminal/wezterm tty or ghostty directory; `outer` is the terminal app a herdr/tmux client runs in), `summary` (with `--long` only, else `null` — Claude Code: `last_prompt`, `last_reply`, `recap`, `pending_tool`, `pr_url`, `updated_secs_ago`, read from the transcript tail), `git` (uncommitted /
+  herdr), `host` (`{kind, target, outer}` — the herdr/tmux pane, or the iterm/terminal/wezterm tty or ghostty directory; `outer` is the terminal app a herdr/tmux client runs in), `git` (uncommitted /
   untracked / unpushed counts) and `looks_finished` (stale, no servers, clean
   tree). `state` can also be `blocked` (waiting on a question). It's
   read-only — marina has no way to stop an agent session; tell the user which
   one and let them exit it.
 - **"restart the api"** → `marina restart api` (if ambiguous, list first and confirm).
-- **"open / give me the URL for the frontend"** → `marina url <project>`.
+- **"give me the URL for the frontend"** → `marina url <project>`; **"open it"** →
+  `marina open <project>` (or `marina open --mine` for the server you started).
 
 ## Good to know
 

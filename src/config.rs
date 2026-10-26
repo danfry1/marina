@@ -27,19 +27,9 @@
 //!
 //! [notify]
 //! desktop = false       # no desktop notifications at all (default: true)
-//! agents  = false       # no "finished" / "needs you" notices for agent
-//!                       # sessions (default: true)
 //!
 //! [ports]
 //! range = [4100, 4999]  # where `marina port` assigns from (default 3100-3999)
-//!
-//! [agents]
-//! transcripts = false   # don't read the tail of Claude Code transcripts for
-//!                       # session previews and the inbox (default: true)
-//! quick = ["commit it", "push it", "run the tests", "continue"]
-//!                       # replies on keys 1-9 (these are the default)
-//! start = "servers"     # open on the servers view, not the agent inbox
-//!                       # (default: the inbox, when agent sessions run)
 //! ```
 
 use std::path::PathBuf;
@@ -62,38 +52,6 @@ pub struct ConfigFile {
     pub notify: NotifyCfg,
     #[serde(default)]
     pub ports: PortsCfg,
-    #[serde(default)]
-    pub agents: AgentsCfg,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AgentsCfg {
-    /// Read the tail of Claude Code transcripts (`~/.claude/projects`) for
-    /// a session's last prompt, reply and recap.
-    #[serde(default = "yes")]
-    pub transcripts: bool,
-    /// Canned replies on keys 1-9.
-    #[serde(default = "quick_default")]
-    pub quick: Vec<String>,
-    /// The view marina opens on: `inbox` (default) or `servers`.
-    #[serde(default)]
-    pub start: Option<String>,
-}
-
-fn quick_default() -> Vec<String> {
-    ["commit it", "push it", "run the tests", "continue"]
-        .map(String::from)
-        .to_vec()
-}
-
-impl Default for AgentsCfg {
-    fn default() -> Self {
-        AgentsCfg {
-            transcripts: true,
-            quick: quick_default(),
-            start: None,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -113,22 +71,15 @@ impl PortsCfg {
 
 #[derive(Debug, Deserialize)]
 pub struct NotifyCfg {
-    /// Desktop notifications (orphaned servers, agent finished / needs
-    /// you). The TUI status line shows them either way.
+    /// Desktop notifications (servers left running by an ended agent
+    /// session). The TUI status line shows them either way.
     #[serde(default = "yes")]
     pub desktop: bool,
-    /// Notices when an agent session finishes a stretch of work or starts
-    /// waiting on a question.
-    #[serde(default = "yes")]
-    pub agents: bool,
 }
 
 impl Default for NotifyCfg {
     fn default() -> Self {
-        NotifyCfg {
-            desktop: true,
-            agents: true,
-        }
+        NotifyCfg { desktop: true }
     }
 }
 
@@ -267,15 +218,9 @@ mod tests {
         let cfg: ConfigFile = toml::from_str("[notify]\ndesktop = false").unwrap();
         assert!(!cfg.notify.desktop);
         let cfg: ConfigFile = toml::from_str("[notify]").unwrap();
-        assert!(cfg.notify.desktop && cfg.notify.agents);
-        let cfg: ConfigFile = toml::from_str("").unwrap();
-        assert!(cfg.agents.transcripts, "on by default");
-        let cfg: ConfigFile = toml::from_str("[agents]\ntranscripts = false").unwrap();
-        assert!(!cfg.agents.transcripts);
-        assert_eq!(cfg.agents.quick[0], "commit it", "defaults kept");
-        let cfg: ConfigFile = toml::from_str("[agents]\nquick = [\"ship it\"]").unwrap();
-        assert_eq!(cfg.agents.quick, vec!["ship it"]);
+        assert!(cfg.notify.desktop);
+        // a config written for an older marina still loads
         let cfg: ConfigFile = toml::from_str("[notify]\nagents = false").unwrap();
-        assert!(cfg.notify.desktop && !cfg.notify.agents);
+        assert!(cfg.notify.desktop);
     }
 }

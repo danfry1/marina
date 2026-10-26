@@ -3,12 +3,12 @@
 name = "marina-tui"
 version = "0.7.0"
 edition = "2021"
-description = "One inbox for your coding-agent sessions (Claude Code, Codex, opencode) and the dev servers they start"
+description = "A developer-process cockpit — the dev servers and processes you care about, resolved into names you recognize"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/danfry1/marina"
 homepage = "https://github.com/danfry1/marina"
-keywords = ["tui", "ai-agents", "claude-code", "codex", "devtools"]
+keywords = ["tui", "cli", "ports", "devtools", "process"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/demo", "/.github", "/docs", "/.agents"]
 
@@ -22,7 +22,7 @@ ratatui = "0.30"          # rendering (diff buffer) + re-exports crossterm
 sysinfo = "0.39"          # process cpu/mem/cwd/argv/parent (+ cpu delta math)
 netstat2 = "0.11"         # listening socket -> pid
 serde = { version = "1", features = ["derive"] } # config structs
-serde_json = { version = "1", features = ["preserve_order"] } # package.json names; edits agents' settings without reordering them
+serde_json = "1"          # parse package.json name
 toml = "1.1"              # parse config + Cargo.toml / pyproject.toml name
 regex = "1"               # config rule matching
 

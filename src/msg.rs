@@ -19,8 +19,6 @@ pub enum SamplerCtl {
     /// Rebuild a snapshot now (right after a verb) instead of waiting out the
     /// adaptive-cadence sleep — a killed row disappears immediately.
     Refresh,
-    /// `marina demo`: send this to the made-up session at that host target.
-    Demo(String, crate::hosts::Send),
 }
 
 /// Background verb / log-discovery threads -> UI. Drained every loop tick.
@@ -32,14 +30,5 @@ pub enum UiEvent {
     LogReady {
         project: String,
         path: Option<PathBuf>,
-    },
-    /// The git state of a session's tree, read off-thread for `L`.
-    Land(PathBuf, Option<crate::git::Landing>),
-    /// An agent session's screen, read off-thread for the preview pane.
-    Screen {
-        pid: u32,
-        generation: u64,
-        /// The rows, or why they couldn't be read.
-        rows: Result<Vec<String>, String>,
     },
 }

@@ -9,8 +9,7 @@
 //!   marina free <port>… [--json] stop whatever dev target holds a port
 //!   marina port [name] [--json]  a stable free port for this project/worktree
 //!   marina port --list | --release [name]
-//!   marina agents [sel]… [--json|--long] running coding-agent sessions, their
-//!                                  shells, and what each last said
+//!   marina agents [sel]… [--json] running coding-agent sessions + their shells
 //!   marina version              print the version
 //!
 //! A <selector> matches by project name (exact or substring, case-insensitive),
@@ -41,7 +40,7 @@ use crate::ui::{fmt_uptime, tildify};
 use crate::verbs;
 
 pub const USAGE: &str = "\
-marina — one inbox for your coding agents and the dev servers they start
+marina — developer-process cockpit
 
 USAGE:
     marina                       launch the TUI
@@ -58,23 +57,6 @@ USAGE:
     marina port --list           show assigned ports
     marina port --release [name] give this project's port back
     marina agents [sel]... [--json]  coding-agent sessions, their shells + servers
-                     [--long]        … and what each last said: recap, last
-                                     prompt and reply, what it's waiting on
-                                     (with --json: the `summary` field)
-    marina digest [24h|3d|today] [--json]   what your agents did: per project,
-                                 time working, tokens, commits, PRs, recaps
-    marina jump <session>        focus an agent session's terminal (session id,
-                                 pid, or project) — what clicking a notice does
-    marina watch                 send agent notices without the TUI open
-          [--install|--uninstall|--status]   …as a login service (launchd /
-                                 systemd), and manage it
-    marina hooks [--install|--uninstall]   have Claude Code, Codex and opencode
-                                 report when they're working, waiting on you
-                                 or done, instead of marina inferring it
-    marina doctor                what marina can see and do here, and how to
-                                 set up the rest (hooks, notices, watcher)
-    marina demo                  the TUI on made-up sessions — try it with no
-                                 agents running; nothing real is touched
     marina version               print the version
 
 SELECTOR:
@@ -92,10 +74,6 @@ SCOPE (ls / kill / restart / url / open; usable instead of, or with, selectors):
 pub fn dispatch(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     let rest = &args[1..];
-    // run by the agents themselves: no flag checks, never an error
-    if cmd == "hook" {
-        return Some(crate::hooks::run_hook(rest));
-    }
     let flags: Vec<&str> = rest
         .iter()
         .map(String::as_str)
@@ -109,15 +87,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if let Some(bad) = flags.iter().find(|f| {
         !matches!(
             **f,
-            "--json"
-                | "--mine"
-                | "--orphaned"
-                | "--list"
-                | "--release"
-                | "--long"
-                | "--install"
-                | "--uninstall"
-                | "--status"
+            "--json" | "--mine" | "--orphaned" | "--list" | "--release"
         )
     }) {
         eprintln!("marina: unknown flag {bad:?}\n");
@@ -142,23 +112,11 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         eprintln!("marina: {cmd} doesn't take --mine / --orphaned");
         return Some(2);
     }
-    let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
-    if ["--install", "--uninstall", "--status"]
-        .iter()
-        .any(|f| flags.contains(f))
-        && !matches!(cmd, "watch" | "hooks")
-    {
-        eprintln!("marina: --install / --uninstall / --status only apply to `marina watch` and `marina hooks`");
-        return Some(2);
-    }
     if json && cmd == "open" {
         eprintln!("marina: open doesn't take --json (marina url --json prints the URLs)");
         return Some(2);
     }
-    if flags.contains(&"--long") && cmd != "agents" {
-        eprintln!("marina: --long only applies to `marina agents`");
-        return Some(2);
-    }
+    let (list, release) = (flags.contains(&"--list"), flags.contains(&"--release"));
     if (list || release) && cmd != "port" {
         eprintln!("marina: --list / --release only apply to `marina port`");
         return Some(2);
@@ -172,30 +130,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "who" => who(&selectors, json),
         "free" => free(&selectors, json),
         "port" => port(&selectors, json, list, release),
-        "agents" => agents(&selectors, json, flags.contains(&"--long")),
-        "jump" => jump(&selectors),
-        "digest" => crate::digest::run(selectors.first().copied(), json),
-        "watch" => {
-            if flags.contains(&"--install") {
-                crate::watch::install()
-            } else if flags.contains(&"--uninstall") {
-                crate::watch::uninstall()
-            } else if flags.contains(&"--status") {
-                crate::watch::status()
-            } else {
-                crate::watch::run()
-            }
-        }
-        "doctor" => crate::doctor::run(),
-        "hooks" => {
-            if flags.contains(&"--install") {
-                crate::hooks::install()
-            } else if flags.contains(&"--uninstall") {
-                crate::hooks::uninstall()
-            } else {
-                crate::hooks::status()
-            }
-        }
+        "agents" => agents(&selectors, json),
         "version" | "--version" | "-V" => {
             println!("marina {}", env!("CARGO_PKG_VERSION"));
             0
@@ -371,7 +306,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
+fn agents(selectors: &[&str], json: bool) -> i32 {
     let snap = snapshot(true);
     let picked: Vec<&Agent> = snap
         .agents
@@ -381,17 +316,7 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
     if json {
         let view: Vec<AgentJson> = picked
             .iter()
-            .map(|a| {
-                let mut j = AgentJson::new(a, &servers_of(&snap, a));
-                if !long {
-                    // conversation text only when asked for
-                    j.summary = None;
-                    for s in &mut j.subagents {
-                        s.said = None;
-                    }
-                }
-                j
-            })
+            .map(|a| AgentJson::new(a, &servers_of(&snap, a)))
             .collect();
         match serde_json::to_string_pretty(&view) {
             Ok(s) => println!("{s}"),
@@ -406,10 +331,6 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
     if picked.is_empty() {
         println!("no agent sessions running");
         return if selectors.is_empty() { 0 } else { 1 };
-    }
-    if long {
-        print_long(&snap, picked);
-        return 0;
     }
     let pw = picked
         .iter()
@@ -468,164 +389,6 @@ fn agents(selectors: &[&str], json: bool, long: bool) -> i32 {
         );
     }
     0
-}
-
-/// `marina jump <session>`: focus that agent session's terminal, as Enter
-/// does in the TUI (and as clicking a notice does).
-fn jump(selectors: &[&str]) -> i32 {
-    let Some(sel) = selectors.first() else {
-        eprintln!("jump: which session? (a session id, pid, or project)");
-        return 2;
-    };
-    let snap = snapshot(false);
-    // an exact pid or session id (what a notice passes) wins outright
-    let exact: Vec<&Agent> = snap
-        .agents
-        .iter()
-        .filter(|a| a.pid.to_string() == *sel || a.session.as_deref() == Some(*sel))
-        .collect();
-    let hits: Vec<&Agent> = if exact.is_empty() {
-        snap.agents
-            .iter()
-            .filter(|a| agent_matches(a, sel))
-            .collect()
-    } else {
-        exact
-    };
-    let a = match hits.as_slice() {
-        [a] => *a,
-        [] => {
-            eprintln!("jump: no agent session matches {sel:?}");
-            return 1;
-        }
-        many => {
-            eprintln!(
-                "jump: {sel:?} matches {} sessions — be more specific:",
-                many.len()
-            );
-            for a in many {
-                eprintln!(
-                    "  {} {} {}",
-                    a.pid,
-                    a.project,
-                    a.session
-                        .as_deref()
-                        .map(|s| crate::launcher::short_id(s, 8))
-                        .unwrap_or("—")
-                );
-            }
-            return 1;
-        }
-    };
-    match &a.host {
-        Some(h) => match crate::hosts::jump(h, &a.name) {
-            Ok(msg) => {
-                println!("{msg}");
-                0
-            }
-            Err(e) => {
-                eprintln!("jump: {e}");
-                1
-            }
-        },
-        None => {
-            let resume = a
-                .as_launcher()
-                .resume_hint()
-                .unwrap_or_else(|| a.name.clone());
-            println!(
-                "no terminal marina can drive — resume it with: cd {} && {resume}",
-                a.cwd.display()
-            );
-            1
-        }
-    }
-}
-
-/// `--long`: each session, what wants you first, with what it last said.
-fn print_long(snap: &crate::model::Snapshot, mut picked: Vec<&Agent>) {
-    let now = now_secs();
-    picked.sort_by_key(|a| (a.urgency(now), std::cmp::Reverse(a.last_active())));
-    let field = |k: &str, v: &str, lines: usize| {
-        let mut out = v.lines().map(str::trim).filter(|l| !l.is_empty());
-        if let Some(first) = out.next() {
-            println!("  {k:<8}{first}");
-            for l in out.take(lines.saturating_sub(1)) {
-                println!("  {:<8}{l}", "");
-            }
-        }
-    };
-    for (i, a) in picked.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        let state = match a.urgency(now) {
-            0 => "NEEDS YOU".to_string(),
-            1 => "done".to_string(),
-            2 => a.activity(now),
-            _ => match a.settled_at() {
-                0 => a.activity(now),
-                t => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t))),
-            },
-        };
-        let place = a
-            .host
-            .as_ref()
-            .map(|h| h.short())
-            .unwrap_or_else(|| "no terminal".into());
-        let git = a.git.map(|g| format!(" {}", g.short())).unwrap_or_default();
-        println!(
-            "{}·{}  {state} · {place} · {}{git}{}",
-            a.name,
-            a.project,
-            crate::ui::tildify(&a.cwd.display().to_string()),
-            a.session
-                .as_deref()
-                .map(|s| format!(" · {}", crate::launcher::short_id(s, 8)))
-                .unwrap_or_default(),
-        );
-        if let Some(t) = a.title() {
-            println!("  {t}");
-        }
-        let servers: Vec<String> = servers_of(snap, a)
-            .iter()
-            .flat_map(|t| t.ports.iter().map(|p| format!(":{p}")))
-            .collect();
-        if !servers.is_empty() {
-            field("servers", &servers.join(" "), 1);
-        }
-        // running ones, then the three most recently finished
-        let done = a.subagents.iter().filter(|s| !s.running).take(3);
-        for sub in a.subagents.iter().filter(|s| s.running).chain(done) {
-            let state = if sub.running {
-                sub.doing.clone().unwrap_or_else(|| "running".into())
-            } else {
-                "done".into()
-            };
-            field("spawned", &format!("{} — {state}", sub.task), 1);
-        }
-        let Some(s) = &a.summary else {
-            continue;
-        };
-        if let Some(t) = a.pending_tool().filter(|_| a.is_blocked()) {
-            field("waiting", &format!("to run {t}"), 1);
-        }
-        if let Some(ask) = s.ask() {
-            field("asks", &ask, 2);
-        }
-        if let Some(r) = &s.recap {
-            field("recap", r, 3);
-        }
-        if let Some(p) = &s.last_prompt {
-            field("you", p, 2);
-        }
-        if let Some(r) = &s.last_reply {
-            field("reply", r, 4);
-        }
-        if let Some(pr) = &s.pr_url {
-            field("pr", pr, 1);
-        }
-    }
 }
 
 /// `chrome-devtools-mcp ×19 785MB, mobile-mcp ×2 90MB` — the first `n`.
@@ -1395,7 +1158,7 @@ struct AgentJson {
     session: Option<String>,
     /// How to get back into it (`claude --resume <id>`, …).
     resume: Option<String>,
-    /// `working` (a shell or subagent running, or recent terminal output), `blocked`
+    /// `working` (a shell running, or recent terminal output), `blocked`
     /// (waiting on a question, host-reported), `idle`, or `stale` (idle, no
     /// terminal input for over a day).
     state: &'static str,
@@ -1421,40 +1184,6 @@ struct AgentJson {
     git: Option<GitJson>,
     /// Stale, no servers, and a clean, pushed tree.
     looks_finished: bool,
-    /// What it last said, from its transcript (Claude Code): only with
-    /// `--long`, since it carries conversation text; `null` otherwise.
-    summary: Option<SummaryJson>,
-    /// Subagents it started (Claude Code's Agent tool, Codex threads):
-    /// running ones and those finished in the last half hour.
-    subagents: Vec<SubagentJson>,
-}
-
-#[derive(Serialize)]
-struct SubagentJson {
-    id: String,
-    task: String,
-    kind: Option<String>,
-    background: bool,
-    running: bool,
-    started_secs_ago: Option<u64>,
-    updated_secs_ago: u64,
-    /// The tool call it's on, while running.
-    doing: Option<String>,
-    /// What it last said: only with `--long`.
-    said: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SummaryJson {
-    last_prompt: Option<String>,
-    last_reply: Option<String>,
-    /// Claude's own recap of the session, when written after the last reply.
-    recap: Option<String>,
-    /// A tool call with no result yet: running, or awaiting approval.
-    pending_tool: Option<String>,
-    pr_url: Option<String>,
-    /// Seconds since its transcript last recorded anything.
-    updated_secs_ago: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1510,10 +1239,7 @@ impl AgentJson {
             pid: a.pid,
             session: a.session.clone(),
             resume: a.as_launcher().resume_hint(),
-            // asking you something outranks subagents still at work
-            state: if a.is_blocked() && a.shells().next().is_none() {
-                "blocked"
-            } else if a.is_working(now) {
+            state: if a.is_working(now) {
                 "working"
             } else if a.is_blocked() {
                 "blocked"
@@ -1554,29 +1280,6 @@ impl AgentJson {
                 behind: g.behind,
             }),
             looks_finished: a.looks_finished(now, servers.len()),
-            summary: a.summary.as_ref().map(|s| SummaryJson {
-                last_prompt: s.last_prompt.clone(),
-                last_reply: s.last_reply.clone(),
-                recap: s.recap.clone(),
-                pending_tool: s.pending_tool.clone(),
-                pr_url: s.pr_url.clone(),
-                updated_secs_ago: s.updated.map(|u| now.saturating_sub(u)),
-            }),
-            subagents: a
-                .subagents
-                .iter()
-                .map(|s| SubagentJson {
-                    id: s.id.clone(),
-                    task: s.task.clone(),
-                    kind: s.kind.clone(),
-                    background: s.background,
-                    running: s.running,
-                    started_secs_ago: s.started.map(|t| now.saturating_sub(t)),
-                    updated_secs_ago: now.saturating_sub(s.updated),
-                    doing: s.doing.clone(),
-                    said: s.said.clone(),
-                })
-                .collect(),
         }
     }
 }
@@ -1787,12 +1490,10 @@ mod tests {
             "host",
             "git",
             "looks_finished",
-            "summary",
-            "subagents",
         ] {
             assert!(obj.contains_key(field), "missing JSON field {field}");
         }
-        assert_eq!(obj.len(), 21);
+        assert_eq!(obj.len(), 19);
         assert_eq!(j["resume"], "claude --resume 41616c1a-c2d3");
         assert_eq!(j["shells"][0]["command"], "cargo test");
         assert_eq!(j["servers"][0]["ports"][0], 3000);

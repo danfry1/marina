@@ -93,34 +93,6 @@ pub struct Agent {
     /// The session's task title from the agent itself (opencode), when no
     /// host reports one.
     pub title: Option<String>,
-    /// What the session last said, from its transcript (Claude Code).
-    pub summary: Option<crate::transcript::Summary>,
-    /// Inferred, for sessions no host reports on: a turn is under way (its
-    /// transcript ends in your prompt, or a tool call or result, not the
-    /// record a turn ends with), yet nothing runs — no shell, a still screen.
-    /// A thinking agent animates its screen and a running tool has a child
-    /// or a spinner; this is an approval prompt or a question to the human.
-    pub waiting: bool,
-    /// The git work tree it's in: the nearest directory up from `cwd` with
-    /// a `.git` (a linked worktree has its own). Sessions sharing one can
-    /// overwrite each other's edits.
-    pub tree: Option<PathBuf>,
-    /// What the agent last reported of itself, through marina's hooks.
-    pub report: Option<crate::hooks::Report>,
-    /// Subagents it started (Claude Code's Agent tool, Codex threads):
-    /// running ones, and those finished in the last half hour.
-    pub subagents: Vec<crate::transcript::Subagent>,
-}
-
-/// A target this busy (smoothed, whole subtree) or this big is called heavy
-/// — a runaway test runner, a leak — and flagged in the servers view.
-pub const HEAVY_CPU: f32 = 90.0;
-pub const HEAVY_MEM: u64 = 2 << 30;
-
-impl Target {
-    pub fn is_heavy(&self) -> bool {
-        !self.pids.is_empty() && (self.cpu_pct >= HEAVY_CPU || self.mem_bytes >= HEAVY_MEM)
-    }
 }
 
 /// Smoothed CPU% at or above which an agent with no shell and no terminal
@@ -142,17 +114,6 @@ pub struct AgentChild {
     pub shell: bool,
     pub cpu_pct: f32,   // subtree, unsmoothed
     pub mem_bytes: u64, // subtree
-}
-
-/// The git work tree containing `dir`: the nearest ancestor (or itself)
-/// holding a `.git` directory or file — except a repo at `$HOME` (dotfiles),
-/// which would make every session under it look like it shares one.
-pub fn work_tree(dir: &std::path::Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    dir.ancestors()
-        .find(|d| d.join(".git").exists())
-        .filter(|d| Some(d.to_path_buf()) != home)
-        .map(PathBuf::from)
 }
 
 /// Helpers that several sessions each run their own copy of — every Claude
@@ -195,57 +156,12 @@ impl Agent {
         }
     }
 
-    /// How much it wants you, for the inbox: 0 waiting on you, 1 finished
-    /// (herdr's *done*), 2 working, 3 idle, 4 stale.
-    pub fn urgency(&self, now: u64) -> u8 {
-        if self.is_blocked() {
-            0
-        } else if self.host_status() == Some(HostStatus::Done) {
-            1
-        } else if self.is_working(now) {
-            2
-        } else if self.is_stale(now) {
-            4
-        } else {
-            3
-        }
-    }
-
-    /// Unix seconds it last did anything: when its transcript last
-    /// recorded something, else its terminal's last output. (Terminal
-    /// output alone misleads: a multiplexer redrawing every pane touches
-    /// them all at once.) While working, now-ish either way.
-    pub fn last_active(&self) -> u64 {
-        let tty = self.tty.map(|t| t.output).unwrap_or(0);
-        match self.summary.as_ref().and_then(|s| s.updated) {
-            Some(said) if self.shells().next().is_none() => said,
-            Some(said) => said.max(tty),
-            None => tty,
-        }
-    }
-
-    /// When it last settled — its last turn ended — for a stable inbox
-    /// order: unchanged while it works. Falls back to `last_active`.
-    pub fn settled_at(&self) -> u64 {
-        self.summary
-            .as_ref()
-            .and_then(|s| s.turn_ended)
-            .unwrap_or_else(|| self.last_active())
-    }
-
-    /// The session's task title: the host's (herdr), else the agent's own,
-    /// else its transcript's.
+    /// The session's task title: the host's (herdr), else the agent's own.
     pub fn title(&self) -> Option<&str> {
         self.host
             .as_ref()
             .and_then(|h| h.title.as_deref())
             .or(self.title.as_deref())
-            .or(self.summary.as_ref().and_then(|s| s.title.as_deref()))
-    }
-
-    /// How many of its subagents are still at work.
-    pub fn subagents_running(&self) -> usize {
-        self.subagents.iter().filter(|s| s.running).count()
     }
 
     pub fn shells(&self) -> impl Iterator<Item = &AgentChild> {
@@ -257,7 +173,7 @@ impl Agent {
     /// streams; an idle one leaves the screen alone). Without a terminal, CPU
     /// is the fallback: an idle agent TUI sits around 1%.
     pub fn is_working(&self, now: u64) -> bool {
-        if self.shells().next().is_some() || self.subagents_running() > 0 {
+        if self.shells().next().is_some() {
             return true;
         }
         // A host that watches the screen knows better than timestamps.
@@ -277,69 +193,13 @@ impl Agent {
         self.tty.map(|t| t.input).unwrap_or(self.start_time)
     }
 
-    /// What a host (herdr) says it's doing, else what it reported itself.
-    pub fn host_status(&self) -> Option<HostStatus> {
-        self.host
-            .as_ref()
-            .and_then(|h| h.status)
-            .or_else(|| self.reported())
-    }
-
-    /// Its own last report (hooks), unless overtaken: its transcript
-    /// recorded something since (you typed, or interrupted it). A running
-    /// shell after an approval prompt means you approved.
-    pub fn reported(&self) -> Option<HostStatus> {
-        let r = self.report.as_ref()?;
-        let newer = self.summary.as_ref().and_then(|s| s.updated);
-        if newer.is_some_and(|u| u > r.at + crate::hooks::REPORT_SLACK) {
-            return None;
-        }
-        match r.status {
-            HostStatus::Blocked if self.shells().next().is_some() => Some(HostStatus::Working),
-            st => Some(st),
-        }
+    fn host_status(&self) -> Option<HostStatus> {
+        self.host.as_ref().and_then(|h| h.status)
     }
 
     /// Waiting on a human: an approval prompt or a question (host-reported).
     pub fn is_blocked(&self) -> bool {
-        match self.host_status() {
-            Some(st) => st == HostStatus::Blocked,
-            None => self.waiting,
-        }
-    }
-
-    /// The pending tool call, with paths inside its directory made relative:
-    /// `Write: hello.txt` rather than the whole absolute path.
-    pub fn pending_tool(&self) -> Option<String> {
-        let t = self.summary.as_ref()?.pending_tool.as_deref()?;
-        let dir = format!("{}/", self.cwd.display());
-        Some(t.replace(&dir, ""))
-    }
-
-    /// Set `waiting` (see there) as of `now`.
-    pub fn infer_waiting(&mut self, now: u64) {
-        let Some(s) = self
-            .summary
-            .as_ref()
-            .filter(|s| s.pending_tool.is_some() || s.in_turn)
-        else {
-            self.waiting = false;
-            return;
-        };
-        let idle = self.host_status().is_none() && self.shells().next().is_none();
-        let still = self
-            .tty
-            .is_some_and(|t| now.saturating_sub(t.output) > WORKING_OUTPUT_SECS);
-        // An approved Bash call starts its shell at once, so one pending for
-        // a few seconds with no shell is at its prompt — whose screen
-        // Claude Code keeps redrawing, so "still" can't tell.
-        let bash_unstarted = s
-            .pending_tool
-            .as_deref()
-            .is_some_and(|t| t.starts_with("Bash:"))
-            && s.pending_since
-                .is_some_and(|at| now.saturating_sub(at) > WORKING_OUTPUT_SECS);
-        self.waiting = idle && self.tty.is_some() && (still || bash_unstarted);
+        self.host_status() == Some(HostStatus::Blocked)
     }
 
     /// Not working, and its terminal has had no input for over a day —
@@ -361,20 +221,10 @@ impl Agent {
     /// What it's doing, for a column: `$ cargo test`, `$ vite +1`, `working`,
     /// `idle 12m` (since its terminal last changed).
     pub fn activity(&self, now: u64) -> String {
-        let subs = match self.subagents_running() {
-            0 => String::new(),
-            1 => " · 1 subagent".into(),
-            n => format!(" · {n} subagents"),
-        };
-        if !subs.is_empty() && self.shells().next().is_none() && !self.is_blocked() {
-            return subs.trim_start_matches(" · ").to_string();
-        }
         let mut shells = self.shells();
-        let activity = match (shells.next(), shells.count()) {
+        match (shells.next(), shells.count()) {
             (Some(c), 0) => format!("$ {}", c.label),
             (Some(c), more) => format!("$ {} +{more}", c.label),
-            // its subagents keep it working, but it can still be asking you
-            (None, _) if !subs.is_empty() && self.is_blocked() => "needs you".into(),
             (None, _) if self.is_working(now) => "working".into(),
             (None, _) if self.is_blocked() => "needs you".into(),
             (None, _) if self.host_status() == Some(HostStatus::Done) => "done".into(),
@@ -382,8 +232,7 @@ impl Agent {
                 Some(t) => format!("idle {}", crate::ui::fmt_age(now.saturating_sub(t.output))),
                 None => "idle".into(),
             },
-        };
-        format!("{activity}{subs}")
+        }
     }
 
     /// Fixture: a claude session in `/Users/me/dev/<dir>` running one shell
@@ -420,11 +269,6 @@ impl Agent {
             host: None,
             git: None,
             title: None,
-            summary: None,
-            waiting: false,
-            tree: None,
-            report: None,
-            subagents: Vec::new(),
         }
     }
 }
@@ -461,8 +305,6 @@ pub struct Snapshot {
     pub targets: Vec<Target>,
     /// Live coding-agent sessions, kept apart from `targets` (see [`Agent`]).
     pub agents: Vec<Agent>,
-    /// Claude Code sessions that exited recently and can be resumed.
-    pub ended: Vec<crate::transcript::Ended>,
     /// A data-source failure (e.g. the port scan errored). Shown persistently
     /// in the UI — an empty cockpit must never silently mean "enumeration broke".
     pub error: Option<String>,
@@ -474,7 +316,6 @@ impl Snapshot {
             seq: 0,
             targets: Vec::new(),
             agents: Vec::new(),
-            ended: Vec::new(),
             error: None,
         }
     }
@@ -579,7 +420,6 @@ impl Snapshot {
             seq: 0,
             targets,
             agents: Vec::new(),
-            ended: Vec::new(),
             error: None,
         }
     }
@@ -587,131 +427,6 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_pending_tool_with_nothing_running_is_waiting() {
-        use crate::sources::TtyActivity;
-        let mut a = Agent::sample(1, "aaaa", "x");
-        a.children.retain(|c| !c.shell); // no shell running
-        a.summary = Some(crate::transcript::Summary {
-            pending_tool: Some("Bash: cargo publish".into()),
-            ..Default::default()
-        });
-        a.tty = Some(TtyActivity {
-            output: 100,
-            input: 100,
-        });
-        a.infer_waiting(103);
-        assert!(!a.waiting, "the screen moved 3s ago: still running");
-        // a Bash prompt keeps redrawing, but its command never started
-        a.summary.as_mut().unwrap().pending_since = Some(90);
-        a.tty = Some(TtyActivity {
-            output: 119,
-            input: 100,
-        });
-        a.infer_waiting(120);
-        assert!(a.waiting, "Bash pending 30s with no shell");
-        a.summary.as_mut().unwrap().pending_since = None;
-        a.tty = Some(TtyActivity {
-            output: 100,
-            input: 100,
-        });
-        a.infer_waiting(120);
-        assert!(a.waiting && a.is_blocked() && a.urgency(120) == 0);
-        a.summary.as_mut().unwrap().pending_tool = None;
-        a.infer_waiting(120);
-        assert!(!a.waiting, "nothing pending");
-        a.summary.as_mut().unwrap().pending_tool = Some("Bash: sleep 60".into());
-        a.children = Agent::sample(1, "aaaa", "x").children; // its shell runs
-        a.infer_waiting(120);
-        assert!(!a.waiting, "a running command isn't a question");
-    }
-
-    #[test]
-    fn work_trees_stop_at_the_nearest_git() {
-        let base = std::env::temp_dir().join(format!("marina-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
-        std::fs::create_dir_all(base.join("repo/src/deep")).unwrap();
-        std::fs::create_dir_all(base.join("repo/wt")).unwrap();
-        std::fs::write(base.join("repo/wt/.git"), "gitdir: x").unwrap(); // a linked worktree
-        assert_eq!(
-            work_tree(&base.join("repo/src/deep")),
-            Some(base.join("repo"))
-        );
-        assert_eq!(work_tree(&base.join("repo/wt")), Some(base.join("repo/wt")));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_runaway_target_is_heavy() {
-        let mut t = Snapshot::sample().targets.remove(0);
-        t.pids = vec![t.anchor.pid];
-        t.cpu_pct = 12.0;
-        t.mem_bytes = 300 << 20;
-        assert!(!t.is_heavy());
-        t.cpu_pct = 180.0;
-        assert!(t.is_heavy(), "a vitest pinning two cores");
-        t.cpu_pct = 1.0;
-        t.mem_bytes = 4 << 30;
-        assert!(t.is_heavy(), "a leak");
-        t.pids.clear();
-        assert!(!t.is_heavy(), "a container: nothing measured");
-    }
-
-    #[test]
-    fn a_session_works_while_its_subagents_do() {
-        let mut a = Agent::sample(1, "aaaa1111", "a");
-        a.children.retain(|c| !c.shell);
-        a.tty = Some(crate::sources::TtyActivity {
-            output: 100,
-            input: 100,
-        });
-        assert!(!a.is_working(10_000));
-        a.subagents.push(crate::transcript::Subagent {
-            task: "Review the PR".into(),
-            running: true,
-            ..Default::default()
-        });
-        assert!(a.is_working(10_000));
-        assert_eq!(a.activity(10_000), "1 subagent");
-        a.waiting = true;
-        assert!(a.activity(10_000).starts_with("needs you"));
-    }
-
-    #[test]
-    fn its_own_report_wins_until_something_newer_happens() {
-        let mut a = Agent::sample(100, "s", "app");
-        a.children.clear();
-        a.tty = Some(crate::sources::TtyActivity {
-            output: 119,
-            input: 0,
-        });
-        let report = |status| crate::hooks::Report {
-            agent: "claude".into(),
-            session: Some("s".into()),
-            status,
-            at: 100,
-            chain: vec![100],
-        };
-        a.report = Some(report(HostStatus::Blocked));
-        assert!(a.is_blocked() && a.urgency(120) == 0, "it said so");
-        // the screen redraws, but it reported the turn over
-        a.report = Some(report(HostStatus::Idle));
-        assert!(!a.is_working(120) && !a.is_blocked());
-        // a prompt typed since: the transcript is newer, so infer again
-        a.summary = Some(crate::transcript::Summary {
-            updated: Some(110),
-            ..Default::default()
-        });
-        assert_eq!(a.reported(), None);
-        assert!(a.is_working(120), "its screen is moving");
-        // approved: a shell runs, so it isn't waiting any more
-        a.summary = None;
-        a.report = Some(report(HostStatus::Blocked));
-        a.children = Agent::sample(100, "s", "app").children;
-        assert!(!a.is_blocked() && a.is_working(120));
-    }
-
     #[test]
     fn repeated_helpers_total_copies_across_sessions() {
         let mut a = Agent::sample(1, "aaaa", "x");

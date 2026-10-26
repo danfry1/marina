@@ -175,14 +175,6 @@ A thin layer over two mature crates — not raw syscalls.
 3. **`resolve`** — heuristic pipeline + cache + user-override config.
 4. **`verbs`** — kill-tree, restart, copy/open, best-effort log discovery.
 5. **`ui`** — Ratatui widgets, view state, event loop, sort/hysteresis/navigation.
-6. **`demo`** — `marina demo`: a stand-in for the sampler thread that sends
-   snapshots of made-up sessions, scripted against the clock (one finishes,
-   one stops to ask). Approve / reject / reply / end arrive as
-   `SamplerCtl::Demo` and play that session's script; every other verb is
-   stopped in `main` (`demo_only`) and only says what it would do; seen and
-   set-aside stay in memory. Its pids sit above any OS's pid range, so a verb
-   that slipped through could reach no process. `demo/inbox.tape` records the
-   README's inbox GIF from it.
 
 ### Anchor & subtree boundary
 
@@ -243,7 +235,6 @@ enum SamplerMsg { Snapshot(Arc<Snapshot>) }
 // UI -> sampler. Dropping the sender shuts the thread down.
 enum SamplerCtl {
     Refresh,   // rebuild NOW (sent right after a verb) instead of sleeping
-    Demo(String, Send), // `marina demo`: act on the made-up session at that host target
 }
 
 // background verb / log-discovery threads -> UI, drained each loop tick
@@ -479,8 +470,7 @@ values are never read), and other variables — including tokens agents export
 alongside them — are never stored. Session ids are validated as
 `[A-Za-z0-9_-]{1,80}`.
 Claude Code's own `~/.claude/sessions/*` files are deliberately not read (they
-hold auth tokens); only session transcripts' tails are, for summaries (see
-*Agent control*).
+hold auth tokens).
 
 ### Agent sessions — IMPLEMENTED
 
@@ -528,8 +518,7 @@ and no terminal input (keystrokes, or focus events from switching to it) for
 over a day. An agent without a terminal falls back to CPU (≥ 4% = working)
 and open time. CPU alone was tried first and misread working sessions as
 idle (a thinking agent can sit at 2–3%), and Claude Code transcript mtimes
-are touched in idle sessions too, so activity never comes from transcripts
-(their contents feed only the summaries under *Agent control*).
+are touched in idle sessions too, so marina reads nothing under `~/.claude`.
 
 **Terminal hosts** (`hosts.rs`): the multiplexer an agent's terminal lives
 in, when marina can drive it — herdr (matched by pid via `herdr pane
@@ -564,207 +553,6 @@ above it) — shown as `herdr·ghostty` in an agent row's VIA column, and
 raised by pid after the pane switch so the jump lands even from another
 window.
 
-**Agent control** (`transcript.rs`, `ui/control.rs`, `ui/agent_view.rs`):
-- *Summaries*: for a Claude Code session with a known id, the tail of
-  `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/<id>.jsonl` (256KB, widened
-  once to 4MB when the last reply is further back) gives the newest
-  `ai-title`, `last-prompt`, assistant text, an `away_summary` written after
-  it (recap), `pr-link`, and — when the newest message is an assistant
-  `tool_use` — the pending tool. Metadata records are skipped by their
-  leading `{"type":…` without parsing (request blobs are huge); sidechain
-  (subagent) records are ignored. Cached per session, re-read when the file
-  changes, at most every 2s. `[agents] transcripts = false` disables it.
-- *Subagents* (`Agent::subagents`, `transcript::Subagent`): Claude Code
-  writes each subagent to `<id>/subagents/agent-<sub>.jsonl` beside the
-  session's transcript, with an `agent-<sub>.meta.json` (description,
-  `agentType`, `requestShape`; `finished: true` once its turn ends — absent
-  while it works). One is running until then, and stops counting as running
-  after 30 minutes without a record (a session killed mid-turn). Codex
-  spawned threads have their own rollouts, whose `session_meta` names the
-  parent (`source.subagent.thread_spawn.parent_thread_id`, with a nickname
-  and role); the last two days' rollouts written in the last half hour are
-  scanned every 5s, each file's head read once; one is running while its
-  turn is open. Finished subagents are kept for 30 minutes. Each file is
-  re-read only when its stamp changes. A session with a running subagent
-  `is_working`, so it sorts under *working*, isn't "done", and `X` refuses
-  to end it. A subagent's shells are children of the session's process, so
-  they show as the session's own.
-- *Preview* (`p`): the summary, or the session's live screen via
-  `herdr agent read --source visible` / `tmux capture-pane` / iTerm2's
-  `contents of session` (AppleScript, by tty), read
-  off-thread every 1.5s while open.
-- *Answering*: offered when the session is waiting (a host status is
-  trusted; otherwise the inference, or a screen read in the last ~3s
-  showing a dialog). `hosts::send` re-reads the screen at send time:
-  `y` sends Enter only when `highlighted_choice` starts with "Yes"; `n`
-  sends Esc only when `shows_dialog` (a `❯ 1.` row or "Enter to confirm"
-  in the bottom 14 rows) or herdr reports *blocked*; `r` sends Esc first
-  only then, then the prompt (`herdr agent prompt`, with a leading `-`
-  space-prefixed as herdr has no `--`; tmux `send-keys -l -- text` +
-  Enter; iTerm2 `write text … newline no`, which arrives as keystrokes,
-  not a paste, then `write text ""` for the `\r`). Screen reads carry a generation bumped on every send, so a read
-  in flight is dropped; the cached screen is dropped when the preview
-  closes or the selection moves. Arguments go as argv, never through a
-  shell. Beyond herdr and tmux, the hosts typed into are those that address
-  a session's pane exactly and can read its screen, so the same checks
-  hold: Zellij (`<session> <pane>` from the agent's `ZELLIJ_*` env;
-  `dump-screen` / `write-chars` / `write 13|27`, all `--pane-id`), kitty
-  (`<window> <socket>` from `KITTY_WINDOW_ID` / `KITTY_LISTEN_ON`; `kitten
-  @ --to` `get-text` / `send-key` / `send-text --stdin`, since its argument
-  form interprets escapes), WezTerm (tty → pane via `cli list`; `get-text`
-  / `send-text --no-paste`) and iTerm2 (by tty). `hosts::TermEnv` keeps
-  only those four variables, with values restricted to `[A-Za-z0-9-_.:/@]`.
-  A kitty without a listening socket gets no host (and a `doctor` hint).
-  Ghostty can take input but its screen can't be read and its terminals
-  are matched by directory, so it stays jump-only. The sampler's dialog
-  check reads tmux, Zellij, WezTerm and kitty screens; iTerm2 is scripted
-  only on a keystroke, so sampling never raises an automation prompt.
-- *Waiting*, without a host status: `Agent::infer_waiting` — a turn under
-  way (`in_turn`: the newest user/assistant/system record is a prompt, a
-  tool result or a tool call, not the `system` record a turn ends with),
-  no shell child, and either no terminal output for over 5s or a Bash
-  call pending over 5s (an approved Bash call starts its shell at once;
-  Claude Code redraws a Bash prompt every couple of seconds). Claude Code
-  doesn't always flush a tool call before asking to run it, hence
-  `in_turn`. A thinking agent animates its screen; a running tool has a
-  child or a spinner.
-  It feeds `is_blocked`, so the inbox, notices and `y`/`n` use it.
-- *Reports* (`hooks.rs`): `marina hooks --install` registers
-  `marina hook <agent>` as a Claude Code / Codex command hook (same JSON
-  shape: `SessionStart`/`Stop` → idle, `UserPromptSubmit`/`PostToolUse`/
-  `PreToolUse` → working, `PermissionRequest`, a `PreToolUse` of
-  `AskUserQuestion`/`request_user_input`, and Claude's permission /
-  elicitation `Notification` → blocked), and writes two opencode plugins:
-  `plugins/marina.js` (1.x server events) and `plugins/marina/tui.js`
-  (opencode 2's TUI `api.data.listen` feed: `session.execution.*`,
-  `permission.*`, `form.*`). Each call writes `reports/<agent>-<session>.json`
-  (status, time, the hook's six nearest ancestors) atomically and prints
-  nothing — Claude Code adds a prompt hook's stdout to the conversation.
-  The sampler re-reads changed files each tick and takes, per agent, the
-  newest report made since it started whose ancestry holds its pid (which
-  also gives it its current session id) or that names its session.
-  `Agent::host_status` is herdr's status, else `Agent::reported`: the report,
-  unless the transcript recorded something more than 5s after it (a prompt
-  typed, a turn interrupted — no hook fires for an interrupt), and a blocked
-  report with a shell running reads as working (approved). Settings files
-  are edited with order kept (`serde_json/preserve_order`), other hooks
-  untouched, a `.marina-backup` of the previous file.
-- *Set aside* (`d`): `aside.json` maps session id → its transcript time
-  then; the session is parked until the transcript is newer.
-- *Unread*: `seen.json` in the state dir maps session id → the transcript
-  time last seen. A session is unread when its transcript's newest record
-  is newer and it isn't working; it's marked read when shown in the inbox
-  or preview detail, or jumped to. With no file, the first snapshot seeds
-  it, so a first run starts with everything read.
-- *Last active* is the transcript's newest record time when there is one —
-  terminal output misleads, as a multiplexer redrawing touches every pane.
-- *Inbox* (`a`): groups by `App::inbox_urgency` — needs you (waiting),
-  your turn (not working, and `Summary::ask` within 3 days, herdr *done*,
-  or unread), working, parked (folded, `Entry::Fold(0)`), then ended
-  (folded, `Entry::Fold(1)`); a filter unfolds both. Within a group,
-  newest finished turn first (`Agent::settled_at`); the order holds for 8s
-  after a keypress. `Summary::ask` is the recap's "Next…" sentence, else
-  the question (with the sentence before it when short) or instruction to
-  you that the reply ends with; `Summary::did` is the recap before that,
-  else the reply's first sentence. Rows are one line: what's asked,
-  running, or (parked) the title. `App::inbox_reason` gives the detail's
-  *why* line, naming the source (herdr, the agent's report, or inference).
-  `X` on the parked fold ends every parked session marina can type into
-  (`Action::SendAll`), after a second press.
-
-**Landing** (`L`, `git::Landing`): `git::landing` reads, off the UI
-thread, the session's tree (`rev-parse --show-toplevel`), the main
-checkout (the first `git worktree list --porcelain` entry, or `bare`),
-both branches (full `symbolic-ref`), uncommitted, untracked and ignored
-files (`status --ignored=matching`; ignored paths under known dependency
-and build folders don't count), `rev-list --left-right --count
-base...HEAD`, whether `@{u}` is up to date, and whether any ref contains
-HEAD. Any command failing or timing out (15s) makes the whole reading
-`None` — unknown is never read as "nothing there". The reply carries the
-directory it was for; one for a menu since closed or replaced is dropped. `merge_blocker` / `remove_blocker` (plus "a session still runs
-there") decide what the footer offers. `p` sends the agent a prompt rather
-than running git itself, so the commit message and PR description are
-written by what did the work. `m` is `git merge --ff-only` in the main
-checkout; `w` is `git worktree remove` (never `--force`) and then
-`git branch -d` (which refuses an unmerged branch) when the branch has
-nothing the base hasn't; an unmerged branch stays, so a worktree on a
-branch can go with nothing lost, while a detached one needs its HEAD in
-some ref. Ignored files block it: `worktree remove` deletes them without
-asking. Both re-read the state and re-check before acting,
-so a stale menu can't merge or remove something that changed since.
-
-**Watcher** (`watch.rs`): `marina watch` runs the sampler and `App` headless
-every 2s and sends the same notices (`App::take_notifications`) as desktop
-notifications. It holds an exclusive `flock` on `<state dir>/watch.pid`
-for its life; the TUI asks the lock (`watch::running`), not the pid inside,
-which can be stale or reused, and leaves desktop notifications to the
-watcher. `--install` writes a launchd agent
-(`~/Library/LaunchAgents/dev.marina.watch.plist`, RunAtLoad + KeepAlive,
-the installing shell's PATH and XDG directories, log in the state dir,
-capped at 1MB) and bootstraps it (retrying while a previous job is torn
-down), or a systemd user unit on Linux (values quoted and `%`/`$`
-escaped; daemon-reload and restart on reinstall); the program path is the `$PATH` entry that
-resolves to the running binary, so a Homebrew upgrade doesn't break it.
-Notices carry a jump key (session id, else pid); `verbs::notify` makes
-them clickable with `terminal-notifier -execute "PATH=… <marina> jump <id>"`
-(macOS, when installed; the click runs with launchd's bare PATH otherwise)
-or `notify-send --action` (Linux, at most 8 waiting at once). The id is
-validated as a session id before it reaches a command line.
-
-**Shared trees**: `Agent::tree` is the nearest ancestor of its cwd with a
-`.git` (directory or file, so linked worktrees are distinct), cached by cwd;
-a repo at `$HOME` doesn't count. Sessions
-sharing one get `⇄N` and a detail warning; when two or more are working
-in one at once, a notice fires once, and not again until that tree has
-gone 10 minutes without two working in it (`busy_trees`).
-
-**Quick replies**: `1`–`9` open the reply box pre-filled from
-`[agents] quick`; nothing is sent until Enter.
-
-**Lifecycle** (`launch.rs`): `N` builds a `Launch` (directory of the
-selected row, agent, first prompt, worktree flag) and starts it in
-`launch::here()` — tmux (`$TMUX`, checked first: tmux inside a herdr pane
-inherits herdr's variables), herdr (`HERDR_PANE_ID`: `workspace create
---cwd --focus`, then `agent start --kind <agent> --pane <root> -- <args>`),
-or the terminal app from `TERM_PROGRAM` (Ghostty: a new window whose
-`initial input` is the command; iTerm2: `write text`; Terminal: `do
-script`). The command line is `cd '<dir>' && <agent> '<arg>'…`, every value
-single-quoted, passed to AppleScript as argv. A worktree is `git worktree
-add -b marina/<stamp> <repo>-<stamp>` beside the repo, keeping the
-subdirectory. `X` sends `/exit` (`/quit` for Codex) through `hosts::send`
-after a second press within 4s. *Ended* sessions (`transcript::Ended`,
-with the agent to resume it with) are written between a minute and two
-days ago, not live, in a directory that still exists (at most 8 overall,
-rescanned every 30s): Claude Code transcripts with a reply; Codex rollouts
-last written in that window (any day directory: a resumed thread keeps
-the file it started in; files found unlistable are skipped until they
-change) whose `session_meta.source` is `cli`
-(desktop-app threads, `exec` runs and spawned subagents are left out —
-`codex resume` is for the CLI's own) and that ended with a reply; and
-opencode's top-level, unarchived sessions with any message, from
-`sqlite3 -readonly -json` on its `opencode.db` — `session_v2` /
-`session_message` (opencode 2), else `session` / `message` (1.x); if the
-read-only open fails (WAL files removed on close), `immutable=1` (opencode's own
-`session list` is per-project and may start its service; without
-`sqlite3`, none — its placeholder "New session - …" title is dropped).
-A running session marina couldn't identify keeps its agent's ended
-sessions in that directory off the list, so it isn't offered twice.
-`Enter` resumes one through the same launcher (`launch::agent_args`).
-
-**Other agents' history**: Codex rollouts (`$CODEX_HOME/sessions/**/rollout-…-<thread id>.jsonl`)
-give the cwd (first `session_meta` line), user messages, assistant
-messages, `task_complete` / `task_started` (end and start of a turn, for
-`in_turn`) and `token_count`; opencode's `session export <id>` (only
-while its service runs, at most every 5s) gives the title, token totals,
-messages and an `idle` end-of-turn marker.
-
-**Digest** (`digest.rs`): transcripts written since the window's start
-(`today` = local midnight, or `90m` / `24h` / `3d`); from each tail (8MB):
-`turn_duration` records in the window (time working, turns; subagents'
-excluded), assistant `usage` (input + cache tokens, output tokens),
-`pr-link`s, the first cwd, and the summary's recap or reply. Grouped by
-work tree, with `git log --since` commit counts and subjects per repo.
-
 **History**: the UI keeps ~2 minutes of cpu/mem per target and agent
 (`App::history`, pruned with the rows); `i` renders it as a sparkline with
 the peak and memory drift. Helpers several sessions each run a copy of
@@ -778,11 +566,6 @@ Shown as a badge before the branch (`●4 ↑2`, `✓`); `D` streams `diff --sta
 untracked files and the patch into the log pane. *Looks finished* = stale, no
 live servers, clean and pushed tree — closing it loses nothing, and the
 session can be resumed.
-
-**Agent notices** (`App::agent_notices`): a working streak of 30s+ followed by
-10s quiet → `<label> finished after <d>`; a host-reported blocked state →
-`<label> needs you`, once per transition. Status line plus desktop
-notification; `[notify] agents = false` disables.
 
 Surfaces: the project view ends with a folded `agents` section (its own
 `Entry::Agents`, so it can't collide with a project of that name; `Enter`
