@@ -1,6 +1,6 @@
 // A small marina in the browser: `marina demo`'s made-up machine (src/demo.rs)
 // in the servers view, with the keys that matter (j/k, g/G, Enter, X, R, t,
-// d, o, y, s, v, ?). It copies how marina looks and behaves; it doesn't run
+// d with Tab { } n N z, o, y, s, v, ?). It copies how marina looks and behaves; it doesn't run
 // marina, and nothing it does leaves the page.
 (function () {
   "use strict";
@@ -26,9 +26,9 @@
   var S, tick = 0;
   function agents() {
     return [
-      { id: "claude·checkout", agent: "claude", project: "checkout", branch: "saved-cards", tree: "●12", shell: "pnpm test checkout", host: "herdr·ghostty", place: "herdr pane w0:p1 in Ghostty", quiet: 60 },
+      { id: "claude·checkout", agent: "claude", project: "checkout", branch: "saved-cards", tree: "●3", shell: "pnpm test checkout", host: "herdr·ghostty", place: "herdr pane w0:p1 in Ghostty", quiet: 60 },
       { id: "claude·web", agent: "claude", project: "web", branch: "main", tree: "●2", shell: "pnpm vitest run", host: "herdr·ghostty", place: "herdr pane w2:p1 in Ghostty", quiet: 20 },
-      { id: "codex·api", agent: "codex", project: "api", branch: "rate-limit", tree: "●4", shell: null, host: "tmux·iterm", place: "tmux pane work:1.0 in iTerm2", quiet: 180 },
+      { id: "codex·api", agent: "codex", project: "api", branch: "rate-limit", tree: "●2", shell: null, host: "tmux·iterm", place: "tmux pane work:1.0 in iTerm2", quiet: 180 },
       { id: "codex·search", agent: "codex", project: "search", branch: "pgvector-spike", tree: "✓", shell: null, host: "ghostty", place: "Ghostty terminal in ~/dev/search", quiet: 3 * 86400 },
     ];
   }
@@ -43,10 +43,64 @@
     ];
   }
 
+  // ---- What `d` shows: each session's work tree (src/demo.rs) ---------------
+
+  var PATCH = {
+      "checkout": "diff --git a/src/checkout/index.tsx b/src/checkout/index.tsx\n--- a/src/checkout/index.tsx\n+++ b/src/checkout/index.tsx\n@@ -1,4 +1,5 @@\n import { CardForm } from './CardForm'\n+import { SavedCards } from './SavedCards'\n import { useFlags } from '../lib/flags'\n \n type Props = { user: User }\n@@ -12,9 +13,13 @@ export function Checkout({ user }: Props) {\n   const flags = useFlags()\n-  const cards = user.cards\n+  const cards = user.savedCards ?? []\n \n-  return <CardForm user={user} />\n+  if (flags.savedCards && cards.length > 0) {\n+    return <SavedCards cards={cards} onNew={() => setAdding(true)} />\n+  }\n+\n+  return <CardForm user={user} />\n }\n \n export default Checkout\ndiff --git a/src/lib/flags.ts b/src/lib/flags.ts\n--- a/src/lib/flags.ts\n+++ b/src/lib/flags.ts\n@@ -3,5 +3,6 @@\n export const defaults = {\n-  payments: false,\n+  payments: true,\n+  savedCards: true,\n   search: true,\n }\n",
+      "api": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,6 +1,8 @@\n mod routes;\n+mod limit;\n \n use axum::Router;\n+use limit::RateLimit;\n \n #[tokio::main]\n async fn main() {\n@@ -18,7 +20,8 @@ async fn main() {\n     let app = Router::new()\n         .nest(\"/v1\", routes::public())\n-        .nest(\"/admin\", routes::admin());\n+        .nest(\"/admin\", routes::admin())\n+        .layer(RateLimit::per_minute(120));\n \n     serve(app).await\n }\n",
+      "web": "diff --git a/src/lib/date.test.ts b/src/lib/date.test.ts\n--- a/src/lib/date.test.ts\n+++ b/src/lib/date.test.ts\n@@ -1,10 +1,15 @@\n-import { describe, expect, it } from 'vitest'\n+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'\n import { relative } from './date'\n \n describe('relative', () => {\n+  beforeEach(() => {\n+    vi.useFakeTimers()\n+    vi.setSystemTime(new Date('2026-03-01T12:00:00Z'))\n+  })\n+  afterEach(() => vi.useRealTimers())\n+\n   it('says yesterday', () => {\n-    const d = new Date(Date.now() - 86_400_000)\n+    const d = new Date('2026-02-28T12:00:00Z')\n     expect(relative(d)).toBe('yesterday')\n   })\n })\ndiff --git a/src/lib/date.ts b/src/lib/date.ts\n--- a/src/lib/date.ts\n+++ b/src/lib/date.ts\n@@ -4,5 +4,5 @@ const DAY = 86_400_000\n export function relative(d: Date): string {\n-  const days = Math.floor((Date.now() - d.getTime()) / DAY)\n+  const days = Math.round((Date.now() - d.getTime()) / DAY)\n   if (days === 1) return 'yesterday'\n   return `${days} days ago`\n }\n"
+  };
+  var UNTRACKED = {
+      "checkout": [
+          [
+              "src/checkout/SavedCards.tsx",
+              "import type { Card } from '../lib/types'\n\ntype Props = { cards: Card[]; onNew: () => void }\n\nexport function SavedCards({ cards, onNew }: Props) {\n  return (\n    <ul className=\"saved-cards\">\n      {cards.map((c) => (\n        <li key={c.id}>•••• {c.last4} · {c.brand}</li>\n      ))}\n      <li><button onClick={onNew}>Use a new card</button></li>\n    </ul>\n  )\n}\n"
+          ]
+      ],
+      "api": [
+          [
+              "src/limit.rs",
+              "//! A token bucket per API key.\n\nuse std::time::{Duration, Instant};\n\npub struct RateLimit {\n    per: Duration,\n    burst: u32,\n}\n\nimpl RateLimit {\n    pub fn per_minute(n: u32) -> Self {\n        RateLimit { per: Duration::from_secs(60) / n, burst: n }\n    }\n}\n"
+          ]
+      ]
+  };
+
+  // `git diff` text → files: { path, status, added, removed, lines }
+  function parsePatch(text) {
+    var files = [], f = null, hunk = false;
+    text.split("\n").forEach(function (l) {
+      var m = /^diff --git a\/(.*) b\/(.*)$/.exec(l);
+      if (m) { f = { path: m[2], status: "M", added: 0, removed: 0, lines: [] }; files.push(f); hunk = false; return; }
+      if (!f) return;
+      if (l.indexOf("@@") === 0) { hunk = true; f.lines.push(l); return; }
+      if (!hunk) return;
+      if (l === "") return; // the patch's last newline
+      if (l[0] === "+") f.added++;
+      if (l[0] === "-") f.removed++;
+      f.lines.push(l);
+    });
+    return files;
+  }
+  function diffFiles(project) {
+    var files = parsePatch(PATCH[project] || "");
+    (UNTRACKED[project] || []).forEach(function (u) {
+      var body = u[1].replace(/\n$/, "").split("\n").map(function (l) { return "+" + l; });
+      files.push({ path: u[0], status: "?", added: body.length, removed: 0, lines: ["@@ -0,0 +1," + body.length + " @@"].concat(body) });
+    });
+    return files;
+  }
+  function treeSummary(project) {
+    var f = diffFiles(project), t = f.filter(function (x) { return x.status !== "?"; }), u = f.length - t.length;
+    if (!f.length) return "clean";
+    var a = 0, r = 0;
+    t.forEach(function (x) { a += x.added; r += x.removed; });
+    return t.length + " file" + (t.length === 1 ? "" : "s") + " +" + a + " −" + r + (u ? " · " + u + " untracked" : "");
+  }
+
   function init() {
     S = {
       servers: servers(now()), agents: agents(), sel: 0, sort: "port", by: "project",
-      agentsOpen: false, folded: {}, log: null, help: false, notice: null, confirm: null,
+      agentsOpen: false, folded: {}, log: null, zoom: false, paneH: 7, help: false, notice: null, confirm: null,
       touched: S ? S.touched : false, hint: false,
     };
     tell("⚠ /ended to review · 1 server left running by ended agent sessions", "yellow", true);
@@ -119,14 +173,34 @@
       render();
       return true;
     }
-    var n = entries().length, e = current();
+    var n = entries().length, e = current(), dv = S.log && S.log.kind === "diff" ? S.log : null;
+    if (k === "Tab" && !dv) return false; // the page's own Tab
+    if (S.log && S.zoom && /^(j|k|g|G|ArrowDown|ArrowUp|Home|End)$/.test(k)) {
+      paneMove(k);
+      render();
+      return true;
+    }
     switch (k) {
       case "j": case "ArrowDown": S.sel = Math.min(n - 1, S.sel + 1); break;
       case "k": case "ArrowUp": S.sel = Math.max(0, S.sel - 1); break;
       case "g": case "Home": S.sel = 0; break;
       case "G": case "End": S.sel = n - 1; break;
       case "?": S.help = true; break;
-      case "Escape": S.log = null; break;
+      case "Escape": if (S.zoom) S.zoom = false; else closePane(); break;
+      case "Tab": diffToggle(dv); break;
+      case "{": case "}": if (dv) diffStep(dv, k === "}" ? 1 : -1); break;
+      case "[": case "]":
+        if (dv && dv.mode === "files") diffStep(dv, k === "]" ? 1 : -1);
+        else if (S.log) scrollPane(k === "]" ? 5 : -5);
+        break;
+      case "n": case "N":
+        if (dv) diffHunk(dv, k === "n");
+        else tell(k + " moves between diff hunks · d opens a diff");
+        break;
+      case "z":
+        if (S.log) S.zoom = !S.zoom;
+        else tell("z zooms an open log or diff — t or d opens one");
+        break;
       case "s":
         S.sort = S.sort === "port" ? "cpu" : S.sort === "cpu" ? "mem" : "port";
         break;
@@ -142,12 +216,13 @@
       case "d": diff(e); break;
       case "o": case "y": url(e, k); break;
       case "K": case "x": tell(k + " isn't a key here — X (Shift-x) kills · ? lists them"); break;
-      case "q": if (S.log) S.log = null; else tell("q quits marina — this one stays"); break;
+      case "q": if (S.log) closePane(); else tell("q quits marina — this one stays"); break;
       default:
         if (!/^[a-zA-Z0-9]$/.test(k)) return false;
         // marina's other keys (fold, inspect, reverse sort) aren't emulated here
         tell("hliS".indexOf(k) >= 0 ? k + " works in marina, not in this demo · ? lists what does" : k + " isn't a key here · ? lists them");
     }
+    followDiff();
     render();
     return true;
   }
@@ -210,12 +285,77 @@
     S.log = { kind: "log", title: s.container ? "docker logs " + s.container : "~/dev/" + s.project + "/.dev.log", lines: logLines(s) };
     tell("tailing " + s.project + " · " + s.cmd);
   }
+  // the work tree d diffs for a row: an agent's, or a server's (a container has none)
+  function treeOf(e) {
+    if (!e) return null;
+    if (e.kind === "agent") return e.a.project;
+    if (e.kind === "server" && !e.s.container) return e.s.project;
+    return null;
+  }
   function diff(e) {
-    var p = e && (e.kind === "agent" ? e.a.project : e.kind === "server" ? e.s.project : null);
-    if (S.log && S.log.kind === "diff") { S.log = null; return; }
+    var p = treeOf(e);
+    if (S.log && S.log.kind === "diff") { closePane(); return; }
     if (!p) { tell("select an agent session or a server to see its diff"); return; }
-    S.log = { kind: "diff", title: "~/dev/" + p, lines: [" src/" + p + "/index.ts | 42 +++++++++++++++++++++----", " src/lib/flags.ts        |  6 ++++-",
-      " 2 files changed, 41 insertions(+), 7 deletions(-)", "", "+  if (flags.payments) {", "+    return <SavedCards user={user} />", "+  }"] };
+    openDiff(p);
+  }
+  function openDiff(p) {
+    S.log = { kind: "diff", project: p, title: "~/dev/" + p, files: diffFiles(p), cursor: 0, mode: "files", scroll: 0 };
+  }
+  function closePane() {
+    if (S.log) tell(S.log.kind === "diff" ? "closed the diff" : "closed the log");
+    S.log = null;
+    S.zoom = false;
+  }
+  // with the diff open, a row in another work tree shows that tree's diff
+  function followDiff() {
+    if (!S.log || S.log.kind !== "diff") return;
+    var p = treeOf(current());
+    if (p && p !== S.log.project) openDiff(p);
+  }
+  function diffToggle(d) {
+    if (d.mode === "files" && !d.files.length) return;
+    d.mode = d.mode === "files" ? "patch" : "files";
+    d.scroll = 0;
+  }
+  function diffStep(d, by) {
+    var to = Math.max(0, Math.min(d.files.length - 1, d.cursor + by));
+    if (to !== d.cursor) { d.cursor = to; d.scroll = 0; }
+  }
+  function isHunk(l) { return l.indexOf("@@") === 0; }
+  // n / N: the next / previous hunk, running on into the next / previous file
+  function diffHunk(d, fwd) {
+    if (d.mode === "files") { diffStep(d, fwd ? 1 : -1); return; }
+    var lines = d.files[d.cursor].lines, i;
+    if (fwd) { for (i = d.scroll + 1; i < lines.length; i++) if (isHunk(lines[i])) { d.scroll = i; return; } }
+    else { for (i = Math.min(d.scroll, lines.length) - 1; i >= 0; i--) if (isHunk(lines[i])) { d.scroll = i; return; } }
+    if (fwd && d.cursor + 1 < d.files.length) { d.cursor++; d.scroll = 0; return; }
+    if (!fwd && d.cursor > 0) {
+      d.cursor--;
+      var prev = d.files[d.cursor].lines;
+      for (i = prev.length - 1; i > 0 && !isHunk(prev[i]); i--);
+      d.scroll = Math.max(0, i);
+      return;
+    }
+    tell(fwd ? "last hunk" : "first hunk");
+  }
+  function paneRows() {
+    var l = S.log;
+    if (l.kind === "log") return l.lines.length;
+    return l.mode === "files" ? l.files.length : l.files[l.cursor].lines.length;
+  }
+  function scrollPane(by) {
+    var l = S.log, max = Math.max(0, paneRows() - S.paneH);
+    l.scroll = Math.max(0, Math.min(max, (l.scroll || 0) + by));
+  }
+  // j k g G while zoomed: through the pane
+  function paneMove(k) {
+    var l = S.log, files = l.kind === "diff" && l.mode === "files";
+    var down = k === "j" || k === "ArrowDown", up = k === "k" || k === "ArrowUp", top = k === "g" || k === "Home";
+    if (files) {
+      if (down || up) diffStep(l, down ? 1 : -1);
+      else l.cursor = top ? 0 : l.files.length - 1;
+    } else if (down || up) scrollPane(down ? 1 : -1);
+    else l.scroll = top ? 0 : Math.max(0, paneRows() - S.paneH);
   }
   function url(e, k) {
     var s = e && e.kind === "server" ? e.s : null;
@@ -267,7 +407,7 @@
     if (!e) return "";
     if (e.kind === "fold") return S.agents.length + " agent sessions · 2 working · 1 idle and open >1d (520MB) · helpers: chrome-devtools-mcp ×4 192MB · Enter folds/unfolds";
     if (e.kind === "group") { var l = serversOf(e); return e.name + " · " + l.length + " server" + (l.length === 1 ? "" : "s") + " · X " + (S.by === "session" ? "stops its servers" : "kills all"); }
-    if (e.kind === "agent") return e.a.id + " · " + (e.a.shell ? "$ " + e.a.shell : "idle " + age(e.a.quiet)) + " · Enter jumps (" + e.a.host + ") · in the " + e.a.place + " · d its diff";
+    if (e.kind === "agent") return e.a.id + " · " + (e.a.shell ? "$ " + e.a.shell : "idle " + age(e.a.quiet)) + " · " + treeSummary(e.a.project) + " · Enter jumps (" + e.a.host + ") · d its diff";
     var s = e.s;
     return s.project + " · " + s.cmd + " · " + (s.cmd === "postgres" ? "postgres://" : "http://") + "localhost:" + s.port + " · ~/dev/" + s.project +
       (s.lan ? " · LAN-exposed (0.0.0.0)" : "") + (s.orphan ? " · via claude (session 5e551000 ended)" : s.by ? " · via " + s.by : s.container ? " · docker " + s.container : "");
@@ -275,9 +415,94 @@
 
   function ln(html, cls) { return '<div class="ln ' + (cls || "") + '">' + (html || "") + "</div>"; }
 
+  // ---- The diff pane ---------------------------------------------------------
+
+  function counts(f) {
+    var a = f.added ? sp("green", "+" + f.added) : "", r = f.removed ? sp("red", "−" + f.removed) : "";
+    return a + (a && r ? " " : "") + r;
+  }
+  function countsLen(f) { return (f.added ? String(f.added).length + 1 : 0) + (f.removed ? String(f.removed).length + 1 : 0) + (f.added && f.removed ? 1 : 0); }
+  function pad(s, w) { return s + new Array(Math.max(0, w - s.length) + 1).join(" "); }
+  function fileRows(d) {
+    if (!d.files.length) return [ln(sp("dim", "  no uncommitted changes"))];
+    var pw = Math.max.apply(null, d.files.map(function (f) { return f.path.length; }));
+    var cw = Math.max.apply(null, d.files.map(countsLen));
+    var top = Math.max(0, d.cursor - (S.paneH - 1));
+    return d.files.slice(top).map(function (f, j) {
+      var i = top + j, st = f.status === "?" || f.status === "A" ? "green" : f.status === "D" ? "red" : "yellow";
+      return '<div class="ln file' + (i === d.cursor ? " fsel" : "") + '" data-file="' + i + '">' + (i === d.cursor ? sp("mag", "▌") + " " : "  ") +
+        sp(st, f.status) + " " + esc(pad(f.path, pw)) + "  " + pad("", cw - countsLen(f)) + counts(f) + "</div>";
+    });
+  }
+  // the changed middle of a replaced line, widened to whole words; null when
+  // the two share too little for that to mean anything
+  function changedMiddle(a, b) {
+    var pre = 0, n = Math.min(a.length, b.length);
+    while (pre < n && a[pre] === b[pre]) pre++;
+    var suf = 0;
+    while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+    var word = /[A-Za-z0-9_]/;
+    while (pre > 0 && word.test(a[pre - 1])) pre--;
+    function joined(s) { return suf > 0 && word.test(s[s.length - suf - 1] || "") && word.test(s[s.length - suf]); }
+    while (suf > 0 && (joined(a) || joined(b))) suf--;
+    var common = pre + suf, longer = Math.max(a.length, b.length);
+    if (common === longer || common * 3 < longer) return null;
+    return [[pre, a.length - suf], [pre, b.length - suf]];
+  }
+  function patchRows(f) {
+    var lines = f.lines, nums = [], emph = [], old = 0, nw = 0, top = 0, i = 0;
+    while (i < lines.length) {
+      var l = lines[i], c = l[0];
+      if (c === "@") {
+        var m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(l);
+        old = m ? +m[1] : 0; nw = m ? +m[2] : 0;
+        nums.push([null, null]); i++;
+      } else if (c === "-") {
+        var rm = i;
+        while (i < lines.length && lines[i][0] === "-") { nums.push([old++, null]); i++; }
+        var ad = i;
+        while (i < lines.length && lines[i][0] === "+") { nums.push([null, nw++]); i++; }
+        for (var k = 0; k < Math.min(ad - rm, i - ad); k++) {
+          var cm = changedMiddle(lines[rm + k].slice(1), lines[ad + k].slice(1));
+          if (cm) { emph[rm + k] = cm[0]; emph[ad + k] = cm[1]; }
+        }
+      } else if (c === "+") { nums.push([null, nw++]); i++; }
+      else { nums.push([old++, nw++]); i++; }
+      top = Math.max(top, old, nw);
+    }
+    var w = String(Math.max(1, top)).length;
+    function num(x) { return x === null ? pad("", w) : pad("", w - String(x).length) + x; }
+    return lines.map(function (l, j) {
+      var c = l[0], gutter = sp("dim", num(nums[j][0]) + " " + num(nums[j][1]) + " │ ");
+      if (c === "@") {
+        var parts = l.split("@@");
+        return ln(sp("dim", pad("", w) + " " + pad("", w) + " ┊ ") + sp("cyan", parts[1].trim() + " ") + "<b>" + sp("cyan", (parts[2] || "").trim()) + "</b>");
+      }
+      if (c === "+" || c === "-") {
+        var cls = c === "+" ? "green" : "red", t = l.slice(1), e = emph[j];
+        var body = e ? sp(cls, t.slice(0, e[0])) + sp("rev-" + cls, t.slice(e[0], e[1])) + sp(cls, t.slice(e[1])) : sp(cls, t);
+        return ln(gutter + sp(cls, c + " ") + body);
+      }
+      return ln(gutter + esc("  " + l.slice(1)));
+    });
+  }
+  function diffPane(d) {
+    var z = S.zoom ? "z unzoom" : "z zoom", mv = S.zoom ? "j k" : "[ ]";
+    if (d.mode === "patch" && d.files[d.cursor]) {
+      var f = d.files[d.cursor];
+      return { title: " diff: " + d.title + " · " + f.path + " (" + (d.cursor + 1) + "/" + d.files.length + ") — Tab files · n N hunk · { } file · " + mv + " scroll · " + z + " · q close ",
+        rows: patchRows(f).slice(d.scroll) };
+    }
+    var a = 0, r = 0;
+    d.files.forEach(function (x) { a += x.added; r += x.removed; });
+    var n = d.files.length;
+    return { title: n ? " diff: " + d.title + " · " + n + " file" + (n === 1 ? "" : "s") + " +" + a + " −" + r + " — Tab/click opens · " + mv + " move · " + z + " · q close " : " diff: " + d.title + " — " + z + " · q close ",
+      rows: fileRows(d) };
+  }
+
   function helpHtml() {
     var rows = [["j / k", "move · g / G top · bottom"], ["Enter", "fold a group · on an agent: jump to it"], ["X", "kill (again: force-kill)"],
-      ["R", "restart, output captured to a log"], ["", "X and R on a group ask first"], ["t · d", "its log · its uncommitted diff"], ["o · y", "open · copy its URL"],
+      ["R", "restart, output captured to a log"], ["", "X and R on a group ask first"], ["t · d", "its log · its uncommitted diff"], ["Tab { }", "diff: files ↔ patch · next file"], ["n N · z", "diff: hunks · zoom the pane"], ["o · y", "open · copy its URL"],
       ["s", "sort: port · cpu · mem"], ["v", "group by project / by who started them"]];
     return '<div class="help"><div class="help-box">' + ln("<b>" + sp("cyan", "marina — keys") + "</b>") + ln("") +
       rows.map(function (r) { return '<div class="help-row">' + sp("mag", r[0]) + sp("white", r[1]) + "</div>"; }).join("") +
@@ -300,21 +525,32 @@
     var title = " DEMO · marina · " + S.servers.length + " servers · " + S.agents.length + " agents 2.0GB · sort:" + S.sort + (S.by === "session" ? " · by:session" : "") + " ";
     var head = cells([["  PROJECT", "th"], ["COMMAND", "th"], ["PORT" + (S.sort === "port" ? " ▾" : ""), "th"], ["CPU" + (S.sort === "cpu" ? " ▾" : ""), "th"],
       ["MEM" + (S.sort === "mem" ? " ▾" : ""), "th"], ["VIA", "th c-via"], ["UP", "th c-up"], ["BRANCH", "th c-br"]]);
-    var html = '<div class="box main"><div class="box-title"><span>' + esc(title) + '</span></div><div class="box-body"><div class="tbl">' +
-      head + list.map(function (x, i) { return rowHtml(x, i, t); }).join("") + "</div></div></div>";
+    var zoomed = S.log && S.zoom, html = "";
+    if (!zoomed) {
+      html += '<div class="box main"><div class="box-title"><span>' + esc(title) + '</span></div><div class="box-body"><div class="tbl">' +
+        head + list.map(function (x, i) { return rowHtml(x, i, t); }).join("") + "</div></div></div>";
+    }
     if (S.log) {
-      html += '<div class="box logs"><div class="box-title"><span>' + esc(" " + S.log.kind + ": " + S.log.title + " — q close ") + '</span></div><div class="box-body">' +
-        S.log.lines.map(function (l) { return ln(esc(l)); }).join("") + "</div></div>";
+      var pane = S.log.kind === "diff" ? diffPane(S.log)
+        : { title: " log: " + S.log.title + " — [ ] scroll · " + (S.zoom ? "z unzoom" : "z zoom") + " · q close ", rows: S.log.lines.slice(S.log.scroll || 0).map(function (l) { return ln(esc(l)); }) };
+      html += '<div class="box logs' + (S.log.kind === "diff" ? " diff" : "") + (zoomed ? " zoom" : "") + '"><div class="box-title"><span>' + esc(pane.title) +
+        '</span></div><div class="box-body">' + pane.rows.join("") + "</div></div>";
     }
     html += '<div class="status">' + ln(esc(detailLine(e))) +
       ln(S.notice ? sp(S.notice.cls, S.notice.text) : sp("dim", hints(e))) + "</div>";
     if (S.help) html += helpHtml();
     if (S.hint) {
       html += '<div class="invite-hint"><b>Your turn.</b> ' + (touchOnly
-        ? "Tap the keys below: X kills, t shows logs, v groups by agent session."
-        : "Press <kbd>j</kbd> <kbd>k</kbd> to move, <kbd>X</kbd> to kill, <kbd>t</kbd> for logs, <kbd>v</kbd> to group by session.") + "</div>";
+        ? "Tap the keys below: X kills, t shows logs, d shows an agent's diff."
+        : "Press <kbd>j</kbd> <kbd>k</kbd> to move, <kbd>X</kbd> to kill, <kbd>t</kbd> for logs, <kbd>d</kbd> on an agent for its diff.") + "</div>";
     }
     screen.innerHTML = html;
+    // how many pane lines fit, for paging and keeping the file cursor in view
+    var body = screen.querySelector(".box.logs .box-body"), one = screen.querySelector(".box.logs .ln");
+    if (body && one && one.offsetHeight) {
+      var h = Math.max(1, Math.floor(body.clientHeight / one.offsetHeight));
+      if (h !== S.paneH) { S.paneH = h; render(); }
+    }
   }
 
   // ---- Input ---------------------------------------------------------------
@@ -338,6 +574,12 @@
   // Clicking a row selects it; clicking it again is Enter
   term.addEventListener("pointerdown", function (e) {
     touch();
+    var file = e.target.closest("[data-file]");
+    if (file && S.log && S.log.kind === "diff") {
+      S.log.cursor = +file.dataset.file; S.log.mode = "patch"; S.log.scroll = 0;
+      render();
+      return;
+    }
     var row = e.target.closest("[data-row]");
     if (!row || !term.contains(row)) return;
     var i = +row.dataset.row;
@@ -357,7 +599,7 @@
 
   // While the demo is on screen, its keys work from anywhere on the page
   // (not Space or Enter, which the page needs), so you can just start typing.
-  var pageKeys = "jkgGXRtdoysvKx?";
+  var pageKeys = "jkgGXRtdoysvKx?nNz{}[]";
   var onScreen = false;
   document.addEventListener("keydown", function (e) {
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
