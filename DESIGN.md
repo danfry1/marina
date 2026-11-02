@@ -360,7 +360,7 @@ filter (project/command/port/cwd/branch/launcher; Esc while typing restores the
 previous filter), `s` cycle sort and `S` reverse (or click a header, again to
 reverse), `i` inspect panel, `Enter` folds a header / inspects a server / jumps
 to an agent (clicking the selected row does the same), `[`/`]` + `+`/`-`
-scroll/resize the pane, `Esc` closes the innermost thing (pane → inspect →
+scroll/resize the pane and `z` zooms it (`Tab`, `{`/`}`, `n`/`N` in the diff), `Esc` closes the innermost thing (pane → inspect →
 filter), `q` closes an open pane or else quits, `Ctrl+C` quits. **Shift means
 it touches processes** — `X` kill, `R` restart — and nothing else is
 uppercase except vim's `G`: `t` log, `d` diff, `y` copy-url, `o` open. `X` sits
@@ -585,8 +585,15 @@ and after `marina agents`.
 **Work tree** (`git.rs`): `git status --porcelain=v2 --branch` +
 `diff --shortstat HEAD` per agent cwd, under `GIT_OPTIONAL_LOCKS=0`, cached
 20s and refreshed at most 6 directories per tick, in parallel (the CLI refreshes all).
-Shown as a badge before the branch (`●4 ↑2`, `✓`); `d` streams `diff --stat`,
-untracked files and the patch into the log pane. *Looks finished* = stale, no
+Shown as a badge before the branch (`●4 ↑2`, `✓`); `d` reads `diff HEAD`
+(output shape pinned: `--no-ext-diff --no-color`, `a/` `b/` prefixes) plus
+untracked files (as all-added, first 100, 64 KiB each), split per file, into
+the pane: a file list, `Tab` to one file's patch (`{`/`}` step files, `n`/`N`
+hunks, running on into the next file). It is re-read every 3s while open; a
+change keeps the cursor on the same file and flags `updated` in the title.
+The pane follows the selection to another work tree. `z` zooms any pane
+over the table (movement keys then move through the pane; `X`/`R` refuse,
+as with any hidden table). *Looks finished* = stale, no
 live servers, clean and pushed tree — closing it loses nothing, and the
 session can be resumed.
 

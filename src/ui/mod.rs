@@ -1,11 +1,13 @@
 //! Ratatui view, split by responsibility:
 //! - `state`  — view state that survives snapshot swaps (selection, sort,
-//!   filter, log pane, stopping/held rows, confirms, flash animation), plus all input
+//!   filter, log / diff pane, stopping/held rows, confirms, flash animation), plus all input
 //!   handling logic (keys arrive via `main`, mouse via `App::on_mouse`).
 //! - `render` — drawing from `(snapshot + view state)`; no state decisions
 //!   beyond recording layout rects for mouse hit-testing.
+//! - `diff`   — the diff pane's view state and its lines.
 //! - `format` — small display helpers.
 
+mod diff;
 mod format;
 mod render;
 mod state;
