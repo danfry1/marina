@@ -265,13 +265,26 @@ fn changed_middle(a: &str, b: &str) -> Option<((usize, usize), (usize, usize))> 
         .map_or(a.len().min(b.len()), |((i, _), _)| i);
     // `pre` is a char boundary in both (the shared prefix is identical)
     let (ra, rb) = (&a[pre..], &b[pre..]);
-    let suf = ra
+    let mut suf = ra
         .chars()
         .rev()
         .zip(rb.chars().rev())
         .take_while(|(x, y)| x == y)
         .map(|(x, _)| x.len_utf8())
         .sum::<usize>();
+    // whole words: `false` → `true`, not `fals` → `tru`
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut pre = pre;
+    while let Some(c) = a[..pre].chars().next_back().filter(|&c| word(c)) {
+        pre -= c.len_utf8();
+    }
+    let joined = |s: &str, suf: usize| {
+        s[..s.len() - suf].chars().next_back().is_some_and(word)
+            && s[s.len() - suf..].chars().next().is_some_and(word)
+    };
+    while suf > 0 && (joined(a, suf) || joined(b, suf)) {
+        suf -= a[a.len() - suf..].chars().next().map_or(1, char::len_utf8);
+    }
     let common = pre + suf;
     let longer = a.len().max(b.len());
     if common == longer || common * 3 < longer {
@@ -409,7 +422,10 @@ mod tests {
         let a = "  payments: false,";
         let b = "  payments: true,";
         let ((s, e), (s2, e2)) = changed_middle(a, b).unwrap();
-        assert_eq!((&a[s..e], &b[s2..e2]), ("fals", "tru"));
+        assert_eq!((&a[s..e], &b[s2..e2]), ("false", "true"));
+        let (a, b) = ("x = user.cards;", "x = user.savedCards;");
+        let ((s, e), (s2, e2)) = changed_middle(a, b).unwrap();
+        assert_eq!((&a[s..e], &b[s2..e2]), ("cards", "savedCards"));
         assert!(changed_middle("abc", "xyz").is_none(), "rewritten");
         assert!(changed_middle("same", "same").is_none());
         // multibyte stays on char boundaries

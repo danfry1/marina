@@ -1710,22 +1710,26 @@ mod tests {
         let out = render_to_string(&mut app, 120, 40);
         assert!(out.contains("reading…"));
 
-        tx.send(crate::demo::diff_files("shop")).unwrap();
+        tx.send(crate::demo::diff_files("checkout")).unwrap();
         app.pump_log();
         let out = render_to_string(&mut app, 120, 40);
-        assert!(out.contains("diff: ~/w · 2 files +8 −3"), "{out}");
-        assert!(out.contains("▌ M src/shop/index.ts"));
-        assert!(out.contains("src/shop/index.ts  +6 −2"), "{out}");
+        assert!(out.contains("diff: ~/w · 3 files +23 −3"), "{out}");
+        assert!(out.contains("▌ M src/checkout/index.tsx"));
+        assert!(out.contains("src/checkout/index.tsx       +7 −2"), "{out}");
+        assert!(
+            out.contains("? src/checkout/SavedCards.tsx    +14"),
+            "{out}"
+        );
 
         app.diff_step(1);
         app.diff_toggle();
         let out = render_to_string(&mut app, 120, 40);
-        assert!(out.contains("src/lib/flags.ts (2/2)"), "{out}");
+        assert!(out.contains("src/lib/flags.ts (2/3)"), "{out}");
         assert!(out.contains("4   │ -   payments: false,"), "{out}");
         assert!(out.contains("  4 │ +   payments: true,"), "{out}");
-        assert!(!out.contains("index.ts"), "one file at a time");
+        assert!(!out.contains("index.tsx"), "one file at a time");
 
-        app.diff_step(1); // already the last
+        app.diff_step(5); // past the last: stays on it
         app.diff_toggle();
         assert!(app.diff_listing());
     }
@@ -1736,7 +1740,7 @@ mod tests {
         let mut app = app_with_sample();
         app.inspect = true;
         app.open_diff("/w".into(), "~/w".into(), rx);
-        tx.send(crate::demo::diff_files("shop")).unwrap();
+        tx.send(crate::demo::diff_files("checkout")).unwrap();
         app.pump_log();
         app.toggle_zoom();
         let out = render_to_string(&mut app, 120, 30);
@@ -1753,15 +1757,18 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = app_with_sample();
         app.open_diff("/w".into(), "~/w".into(), rx);
-        tx.send(crate::demo::diff_files("shop")).unwrap();
+        tx.send(crate::demo::diff_files("checkout")).unwrap();
         app.pump_log();
-        app.diff_toggle(); // index.ts, one hunk at line 0
-        app.diff_hunk(true); // no more hunks there: on to flags.ts
+        app.diff_toggle(); // index.tsx: hunks at lines 0 and 6
+        app.diff_hunk(true);
+        assert_eq!(app.log.as_ref().unwrap().scroll, Some(6));
+        app.diff_hunk(true); // no more there: on to flags.ts
         let out = render_to_string(&mut app, 120, 40);
-        assert!(out.contains("src/lib/flags.ts (2/2)"), "{out}");
-        app.diff_hunk(false); // back to index.ts's last hunk
+        assert!(out.contains("src/lib/flags.ts (2/3)"), "{out}");
+        app.diff_hunk(false); // back to index.tsx's last hunk
         let out = render_to_string(&mut app, 120, 40);
-        assert!(out.contains("src/shop/index.ts (1/2)"), "{out}");
+        assert!(out.contains("src/checkout/index.tsx (1/3)"), "{out}");
+        assert_eq!(app.log.as_ref().unwrap().scroll, Some(6));
     }
 
     #[test]

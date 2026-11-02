@@ -60,13 +60,18 @@ struct Srv {
     scheme: UrlScheme,
 }
 
-fn git(changed: u32, untracked: u32, ins: u32, del: u32, ahead: u32) -> GitStatus {
+/// A session's work-tree badge, counted from the diff `d` shows for it,
+/// so the two always agree: tracked files and their lines (as
+/// `diff --shortstat` counts them), untracked files apart.
+fn git_of(project: &str) -> GitStatus {
+    let files = diff_files(project);
+    let tracked = || files.iter().filter(|f| f.status != '?');
     GitStatus {
-        changed,
-        untracked,
-        insertions: ins,
-        deletions: del,
-        ahead: Some(ahead),
+        changed: tracked().count() as u32,
+        untracked: files.iter().filter(|f| f.status == '?').count() as u32,
+        insertions: tracked().map(|f| f.added as u32).sum(),
+        deletions: tracked().map(|f| f.removed as u32).sum(),
+        ahead: Some(0),
         behind: Some(0),
     }
 }
@@ -83,7 +88,7 @@ fn sessions() -> Vec<Sess> {
             shell: Some("pnpm test checkout"),
             host: HostKind::Herdr,
             quiet: 60,
-            git: git(9, 3, 301, 40, 0),
+            git: git_of("checkout"),
         },
         Sess {
             agent: "codex",
@@ -95,7 +100,7 @@ fn sessions() -> Vec<Sess> {
             shell: None,
             host: HostKind::Tmux,
             quiet: 3 * 60,
-            git: git(3, 1, 88, 4, 0),
+            git: git_of("api"),
         },
         Sess {
             agent: "claude",
@@ -107,7 +112,7 @@ fn sessions() -> Vec<Sess> {
             shell: Some("pnpm vitest run"),
             host: HostKind::Herdr,
             quiet: 20,
-            git: git(2, 0, 19, 7, 0),
+            git: git_of("web"),
         },
         Sess {
             agent: "codex",
@@ -119,7 +124,7 @@ fn sessions() -> Vec<Sess> {
             shell: None,
             host: HostKind::Ghostty,
             quiet: 3 * 86_400,
-            git: git(0, 0, 0, 0, 0),
+            git: git_of("search"),
         },
     ]
 }
@@ -465,41 +470,157 @@ pub fn log_lines(project: &str, label: &str, port: Option<u16>) -> Vec<String> {
     }
 }
 
-/// What `d` shows for a made-up work tree.
+/// What `d` shows for a made-up work tree, keyed by its directory name.
 pub fn diff_files(project: &str) -> Vec<crate::git::FileDiff> {
-    let patch = format!(
-        "\
-diff --git a/src/{project}/index.ts b/src/{project}/index.ts
---- a/src/{project}/index.ts
-+++ b/src/{project}/index.ts
-@@ -12,9 +12,13 @@ export function Checkout({{ user }}: Props) {{
+    let (patch, new): (&str, &[(&str, &str)]) = match project {
+        "checkout" => (CHECKOUT, &[("src/checkout/SavedCards.tsx", SAVED_CARDS)]),
+        "api" => (API, &[("src/limit.rs", LIMIT)]),
+        "web" => (WEB, &[]),
+        _ => ("", &[]),
+    };
+    let mut files = crate::git::parse_patch(patch);
+    for (path, body) in new {
+        let lines: Vec<String> = body.lines().map(|l| format!("+{l}")).collect();
+        let mut f = crate::git::FileDiff {
+            path: path.to_string(),
+            status: '?',
+            added: lines.len(),
+            ..Default::default()
+        };
+        f.lines.push(format!("@@ -0,0 +1,{} @@", lines.len()));
+        f.lines.extend(lines);
+        files.push(f);
+    }
+    files
+}
+
+const CHECKOUT: &str = "\
+diff --git a/src/checkout/index.tsx b/src/checkout/index.tsx
+--- a/src/checkout/index.tsx
++++ b/src/checkout/index.tsx
+@@ -1,4 +1,5 @@
+ import { CardForm } from './CardForm'
++import { SavedCards } from './SavedCards'
+ import { useFlags } from '../lib/flags'
+ 
+ type Props = { user: User }
+@@ -12,9 +13,13 @@ export function Checkout({ user }: Props) {
    const flags = useFlags()
 -  const cards = user.cards
 +  const cards = user.savedCards ?? []
  
--  return <CardForm user={{user}} />
-+  if (flags.payments) {{
-+    return <SavedCards cards={{cards}} />
-+  }}
+-  return <CardForm user={user} />
++  if (flags.savedCards && cards.length > 0) {
++    return <SavedCards cards={cards} onNew={() => setAdding(true)} />
++  }
 +
-+  return <CardForm user={{user}} cards={{cards}} />
- }}
++  return <CardForm user={user} />
+ }
  
  export default Checkout
 diff --git a/src/lib/flags.ts b/src/lib/flags.ts
 --- a/src/lib/flags.ts
 +++ b/src/lib/flags.ts
 @@ -3,5 +3,6 @@
- export const defaults = {{
+ export const defaults = {
 -  payments: false,
 +  payments: true,
 +  savedCards: true,
    search: true,
- }}
-"
-    );
-    crate::git::parse_patch(&patch)
+ }
+";
+
+const SAVED_CARDS: &str = "\
+import type { Card } from '../lib/types'
+
+type Props = { cards: Card[]; onNew: () => void }
+
+export function SavedCards({ cards, onNew }: Props) {
+  return (
+    <ul className=\"saved-cards\">
+      {cards.map((c) => (
+        <li key={c.id}>•••• {c.last4} · {c.brand}</li>
+      ))}
+      <li><button onClick={onNew}>Use a new card</button></li>
+    </ul>
+  )
 }
+";
+
+const API: &str = "\
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,6 +1,8 @@
+ mod routes;
++mod limit;
+ 
+ use axum::Router;
++use limit::RateLimit;
+ 
+ #[tokio::main]
+ async fn main() {
+@@ -18,7 +20,8 @@ async fn main() {
+     let app = Router::new()
+         .nest(\"/v1\", routes::public())
+-        .nest(\"/admin\", routes::admin());
++        .nest(\"/admin\", routes::admin())
++        .layer(RateLimit::per_minute(120));
+ 
+     serve(app).await
+ }
+";
+
+const LIMIT: &str = "\
+//! A token bucket per API key.
+
+use std::time::{Duration, Instant};
+
+pub struct RateLimit {
+    per: Duration,
+    burst: u32,
+}
+
+impl RateLimit {
+    pub fn per_minute(n: u32) -> Self {
+        RateLimit { per: Duration::from_secs(60) / n, burst: n }
+    }
+}
+";
+
+const WEB: &str = "\
+diff --git a/src/lib/date.test.ts b/src/lib/date.test.ts
+--- a/src/lib/date.test.ts
++++ b/src/lib/date.test.ts
+@@ -1,10 +1,15 @@
+-import { describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { relative } from './date'
+ 
+ describe('relative', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    vi.setSystemTime(new Date('2026-03-01T12:00:00Z'))
++  })
++  afterEach(() => vi.useRealTimers())
++
+   it('says yesterday', () => {
+-    const d = new Date(Date.now() - 86_400_000)
++    const d = new Date('2026-02-28T12:00:00Z')
+     expect(relative(d)).toBe('yesterday')
+   })
+ })
+diff --git a/src/lib/date.ts b/src/lib/date.ts
+--- a/src/lib/date.ts
++++ b/src/lib/date.ts
+@@ -4,5 +4,5 @@ const DAY = 86_400_000
+ export function relative(d: Date): string {
+-  const days = Math.floor((Date.now() - d.getTime()) / DAY)
++  const days = Math.round((Date.now() - d.getTime()) / DAY)
+   if (days === 1) return 'yesterday'
+   return `${days} days ago`
+ }
+";
 
 #[cfg(test)]
 mod tests {
