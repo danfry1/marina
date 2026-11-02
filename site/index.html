@@ -203,6 +203,12 @@
   .demo-screen > .box { margin-top: 0.7em; }
   .box.main { flex: 1; }
   .box.logs { flex: none; height: 9.5em; margin-top: 1.1em; }
+  .box.logs.diff { height: 13em; }
+  .box.logs.zoom { flex: 1; height: auto; margin-top: 0.7em; }
+  .demo .rev-green { background: var(--t-green); color: var(--t-bg); }
+  .demo .rev-red { background: var(--t-red); color: var(--t-bg); }
+  .ln.file { cursor: pointer; }
+  .ln.fsel { background: var(--t-sel); }
   .box { position: relative; border: 1px solid var(--t-border); min-width: 0; min-height: 0; padding: 10px 8px 10px; display: flex; flex-direction: column; }
   .box-title { position: absolute; top: -0.8em; left: 8px; right: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
   .box-title span { background: var(--t-bg); padding: 0 1px; }
@@ -265,7 +271,6 @@
   .keycaps b { font-weight: 600; line-height: 1; }
   .keycaps i { display: block; font: 500 0.7rem/1 var(--body); color: var(--foam-2); font-style: normal; }
   .keycaps [data-key="y"] b { color: var(--t-green, #6fe08a); }
-  .keycaps [data-key="n"] b { color: var(--red); }
   .keycaps button.hit { animation: press .22s ease-out; }
   @keyframes press { 40% { transform: translateY(2px); box-shadow: 0 1px 0 #2b4260; background: #22385a; } }
   /* Phones and tablets: the keys become a controller stuck to the bottom of
@@ -278,7 +283,7 @@
       border-top: 1px solid var(--rule);
     }
     .keystrip p { display: none; }
-    .keycaps { width: 100%; display: grid; gap: 0.4rem; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .keycaps { width: 100%; display: grid; gap: 0.4rem; grid-template-columns: repeat(5, minmax(0, 1fr)); }
     .keycaps button { height: 3.3rem; min-width: 0; padding: 0; touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
     .keycaps b { font-size: 1rem; }
     .keycaps i { font-size: 0.62rem; }
@@ -471,7 +476,7 @@
       </div>
       <div class="window">
         <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i><span>~ marina demo</span><span class="demo-tag">live demo, try the keys</span><span class="live-hint">keys go to marina</span></div>
-        <div id="demo" class="demo" tabindex="0" role="application" aria-label="marina demo: click, then use j and k to move, X to kill, R to restart, t for logs, v to group by agent session and Enter to fold or jump">
+        <div id="demo" class="demo" tabindex="0" role="application" aria-label="marina demo: click, then use j and k to move, X to kill, R to restart, t for logs, d for an agent's diff, v to group by agent session and Enter to fold or jump">
           <textarea id="demo-keys" class="demo-keys" tabindex="-1" aria-label="marina demo keys" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
           <div id="demo-screen" class="demo-screen"></div>
         </div>
@@ -484,6 +489,8 @@
           <button type="button" data-key="X"><b>X</b><i>kill</i></button>
           <button type="button" data-key="R"><b>R</b><i>restart</i></button>
           <button type="button" data-key="t"><b>t</b><i>logs</i></button>
+          <button type="button" data-key="d"><b>d</b><i>diff</i></button>
+          <button type="button" data-key="n"><b>n</b><i>next hunk</i></button>
           <button type="button" data-key="v"><b>v</b><i>by session</i></button>
           <button type="button" data-key="Enter"><b>Enter</b><i>fold · jump</i></button>
           <button type="button" data-key="?"><b>?</b><i>keys</i></button>
