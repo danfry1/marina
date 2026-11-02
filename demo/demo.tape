@@ -70,7 +70,32 @@ Sleep 1200ms
 Type "v"
 Sleep 1500ms
 Down
+Sleep 2000ms
+
+# d: what that session changed — the files, then one file's patch
+Type "d"
+Sleep 2200ms
+Tab
+Sleep 3s
+# n: the next hunk; z: the pane full-screen
+Type "n"
+Sleep 2200ms
+Type "z"
 Sleep 2500ms
+Type "n"
+Sleep 2500ms
+Type "z"
+Sleep 800ms
+Tab
+Sleep 1s
+
+# the diff follows the selection to another session
+Down
+Down
+Down
+Sleep 3s
+Type "q"
+Sleep 1s
 Type "v"
 Sleep 1s
 
