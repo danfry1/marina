@@ -20,6 +20,7 @@
 //! does no per-frame work.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
+
+use super::diff::{files_offset, DiffMode, DiffView, Landed};
+use crate::git::FileDiff;
 
 use super::format::{fmt_mem, tildify, unix_now};
 use crate::model::{Agent, Snapshot, Target, TargetKey};
@@ -109,11 +113,23 @@ pub(crate) struct LogView {
     pub(crate) stop: Arc<AtomicBool>,
     /// `Some(i)` = pinned with buffer line `i` at the top; `None` = follow tail.
     pub(crate) scroll: Option<usize>,
+    /// The diff pane's files and view (`lines` is unused then).
+    pub(crate) diff: Option<DiffView>,
 }
 
 impl LogView {
     fn close(self) {
         self.stop.store(true, Ordering::Relaxed); // end the tail thread
+    }
+
+    /// Lines the pane scrolls through.
+    fn len(&self) -> usize {
+        self.diff.as_ref().map_or(self.lines.len(), DiffView::rows)
+    }
+
+    /// The diff pane's file list is showing (its scroll keys move the cursor).
+    fn diff_files(&mut self) -> Option<&mut DiffView> {
+        self.diff.as_mut().filter(|d| d.mode == DiffMode::Files)
     }
 }
 
@@ -179,6 +195,8 @@ pub struct App {
     pub(crate) notifications: Vec<String>,
     pub(crate) log: Option<LogView>,
     pub(crate) log_height: u16,
+    /// `z`: the pane fills the screen, the table hidden behind it.
+    pub(crate) pane_zoom: bool,
     /// A background log discovery is running (guards double-`t`).
     pub(crate) log_pending: bool,
     /// Servers `X` sent SIGTERM to that are still running, with the
@@ -243,6 +261,7 @@ impl App {
             notifications: Vec::new(),
             log: None,
             log_height: 12,
+            pane_zoom: false,
             log_pending: false,
             stopping: HashMap::new(),
             hold: None,
@@ -472,6 +491,12 @@ impl App {
     /// Per-loop upkeep: expire the status line, a held placeholder row, and
     /// row flashes. Sets `dirty` only when something actually changed.
     pub fn tick(&mut self) {
+        if let Some(d) = self.log.as_mut().and_then(|l| l.diff.as_mut()) {
+            if d.changed_at.is_some() && !d.recently_changed(Instant::now()) {
+                d.changed_at = None; // the title's "updated" note goes
+                self.dirty = true;
+            }
+        }
         if self.status.is_some() && self.status_at.elapsed() > self.status_ttl {
             self.status = None;
             self.dirty = true;
@@ -1008,7 +1033,9 @@ impl App {
     /// Esc in normal mode: close the most intrusive thing first —
     /// log pane, then inspect panel, then a committed filter.
     pub fn escape(&mut self) {
-        if self.log.is_some() {
+        if self.log.is_some() && self.pane_zoom {
+            self.toggle_zoom();
+        } else if self.log.is_some() {
             self.close_log();
         } else if self.inspect {
             self.inspect = false;
@@ -1035,12 +1062,134 @@ impl App {
         self.open_pane(PaneKind::Log, title, rx, stop);
     }
 
-    /// The diff pane, read from the top.
-    pub fn open_diff(&mut self, title: String, rx: Receiver<String>, stop: Arc<AtomicBool>) {
-        self.open_pane(PaneKind::Diff, title, rx, stop);
+    /// The diff pane for the work tree at `dir`, its files arriving on `rx`.
+    /// Opens on the file list.
+    pub fn open_diff(&mut self, dir: PathBuf, title: String, rx: Receiver<Vec<FileDiff>>) {
+        let (_tx, none) = std::sync::mpsc::channel();
+        self.open_pane(
+            PaneKind::Diff,
+            title,
+            none,
+            Arc::new(AtomicBool::new(false)),
+        );
         if let Some(l) = &mut self.log {
             l.scroll = Some(0);
+            l.diff = Some(DiffView::new(dir, rx));
         }
+    }
+
+    /// The work tree the open diff pane shows.
+    pub fn diff_dir(&self) -> Option<&Path> {
+        self.log.as_ref()?.diff.as_ref().map(|d| d.dir.as_path())
+    }
+
+    /// The work tree `d` diffs for the selection: an agent's, or a
+    /// server's.
+    pub fn selection_dir(&self) -> Option<PathBuf> {
+        match (self.selected_agent(), self.selected_target()) {
+            (Some(a), _) => Some(a.cwd.clone()),
+            (None, Some(t)) if !t.cwd.as_os_str().is_empty() => Some(t.cwd.clone()),
+            _ => None,
+        }
+    }
+
+    /// `Tab`: the diff pane's file list ↔ the selected file's patch.
+    pub fn diff_toggle(&mut self) {
+        let Some(l) = &mut self.log else { return };
+        let Some(d) = &mut l.diff else { return };
+        if d.mode == DiffMode::Files && d.file().is_none() {
+            return; // nothing to open
+        }
+        d.mode = match d.mode {
+            DiffMode::Files => DiffMode::Patch,
+            DiffMode::Patch => DiffMode::Files,
+        };
+        l.scroll = Some(0);
+        self.dirty = true;
+    }
+
+    /// `{` / `}`: the previous / next changed file, in either view.
+    pub fn diff_step(&mut self, delta: isize) {
+        let Some(l) = &mut self.log else { return };
+        let Some(d) = &mut l.diff else { return };
+        let last = d.len().saturating_sub(1) as isize;
+        let to = (d.cursor as isize + delta).clamp(0, last) as usize;
+        if to != d.cursor {
+            d.cursor = to;
+            l.scroll = Some(0);
+            self.dirty = true;
+        }
+    }
+
+    /// The diff pane is showing its file list.
+    pub fn diff_listing(&self) -> bool {
+        self.log
+            .as_ref()
+            .and_then(|l| l.diff.as_ref())
+            .is_some_and(|d| d.mode == DiffMode::Files)
+    }
+
+    /// The open diff's work tree, when it's time to re-read it.
+    pub fn diff_due(&self) -> Option<PathBuf> {
+        let d = self.log.as_ref()?.diff.as_ref()?;
+        d.due(Instant::now()).then(|| d.dir.clone())
+    }
+
+    /// A re-read of the open diff has started; its result lands on `rx`.
+    pub fn diff_reading(&mut self, rx: Receiver<Vec<FileDiff>>) {
+        if let Some(d) = self.log.as_mut().and_then(|l| l.diff.as_mut()) {
+            d.rx = Some(rx);
+        }
+    }
+
+    /// `n` / `N`: the next / previous hunk of the patch, running on into
+    /// the next / previous file at either end. On the file list, a file.
+    pub fn diff_hunk(&mut self, fwd: bool) {
+        let h = self.log_visible_lines();
+        let Some(l) = &mut self.log else { return };
+        let Some(d) = &mut l.diff else { return };
+        if d.mode == DiffMode::Files {
+            return self.diff_step(if fwd { 1 } else { -1 });
+        }
+        let top = l.scroll.unwrap_or(d.rows().saturating_sub(h));
+        if let Some(i) = d.hunk_from(top, fwd) {
+            l.scroll = Some(i);
+        } else if fwd && d.cursor + 1 < d.len() {
+            d.cursor += 1;
+            l.scroll = Some(0);
+        } else if !fwd && d.cursor > 0 {
+            d.cursor -= 1;
+            l.scroll = Some(d.last_hunk());
+        } else {
+            self.set_status(if fwd { "last hunk" } else { "first hunk" });
+            return;
+        }
+        self.dirty = true;
+    }
+
+    /// `z`: the pane full-screen ↔ below the table.
+    pub fn toggle_zoom(&mut self) {
+        if self.log.is_none() {
+            self.set_status("z zooms an open log or diff — t or d opens one");
+            return;
+        }
+        self.pane_zoom = !self.pane_zoom;
+        self.dirty = true;
+    }
+
+    /// The pane is zoomed: the movement keys move through it instead.
+    pub fn zoomed(&self) -> bool {
+        self.pane_zoom && self.log.is_some()
+    }
+
+    /// `g` / `G` while zoomed: the pane's top / bottom.
+    pub fn pane_end(&mut self, bottom: bool) {
+        let Some(l) = &mut self.log else { return };
+        match l.diff_files() {
+            Some(d) => d.cursor = if bottom { d.len().saturating_sub(1) } else { 0 },
+            None => l.scroll = if bottom { None } else { Some(0) },
+        }
+        self.dirty = true;
     }
 
     fn open_pane(
@@ -1060,11 +1209,13 @@ impl App {
             rx,
             stop,
             scroll: None,
+            diff: None,
         });
         self.dirty = true;
     }
 
     pub fn close_log(&mut self) {
+        self.pane_zoom = false;
         if let Some(old) = self.log.take() {
             self.set_status(match old.kind {
                 PaneKind::Log => "closed the log",
@@ -1076,6 +1227,30 @@ impl App {
 
     pub fn pump_log(&mut self) {
         let mut got = false;
+        if let Some(l) = &mut self.log {
+            if let Some(d) = &mut l.diff {
+                let read = d.rx.as_ref().map(|rx| rx.try_recv());
+                match read {
+                    Some(Ok(files)) => {
+                        match d.land(files, Instant::now()) {
+                            Landed::Same => {}
+                            // a different file now: from its top
+                            Landed::First | Landed::Moved => {
+                                l.scroll = Some(0);
+                                got = true;
+                            }
+                            // same file: stay put (render clamps the scroll)
+                            Landed::Kept { .. } => got = true,
+                        }
+                    }
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        d.rx = None; // the read died; the next one retries
+                        d.read_at = Instant::now();
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(l) = &mut self.log {
             while let Ok(line) = l.rx.try_recv() {
                 l.lines.push_back(line);
@@ -1112,8 +1287,11 @@ impl App {
 
     pub fn log_scroll_up(&mut self, n: usize) {
         let h = self.log_visible_lines();
-        if let Some(l) = &mut self.log {
-            let bottom = l.lines.len().saturating_sub(h);
+        if let Some(d) = self.log.as_mut().and_then(LogView::diff_files) {
+            d.cursor = d.cursor.saturating_sub(n);
+            self.dirty = true;
+        } else if let Some(l) = &mut self.log {
+            let bottom = l.len().saturating_sub(h);
             let cur = l.scroll.unwrap_or(bottom);
             l.scroll = Some(cur.saturating_sub(n));
             self.dirty = true;
@@ -1122,8 +1300,11 @@ impl App {
 
     pub fn log_scroll_down(&mut self, n: usize) {
         let h = self.log_visible_lines();
-        if let Some(l) = &mut self.log {
-            let bottom = l.lines.len().saturating_sub(h);
+        if let Some(d) = self.log.as_mut().and_then(LogView::diff_files) {
+            d.cursor = (d.cursor + n).min(d.len().saturating_sub(1));
+            self.dirty = true;
+        } else if let Some(l) = &mut self.log {
+            let bottom = l.len().saturating_sub(h);
             let cur = l.scroll.unwrap_or(bottom);
             let new = cur + n;
             l.scroll = if new >= bottom { None } else { Some(new) };
@@ -1146,6 +1327,23 @@ impl App {
 
     // --- mouse --------------------------------------------------------------
 
+    /// A click in the pane: on the diff's file list, opens that file.
+    fn click_pane(&mut self, r: Rect, y: u16) {
+        let h = r.height.saturating_sub(2) as usize;
+        let Some(l) = &mut self.log else { return };
+        let Some(d) = l.diff_files() else { return };
+        if y <= r.y || y + 1 >= r.y + r.height {
+            return; // the border
+        }
+        let i = (y - r.y - 1) as usize + files_offset(d.cursor, h);
+        if i < d.len() {
+            d.cursor = i;
+            d.mode = DiffMode::Patch;
+            l.scroll = Some(0);
+            self.dirty = true;
+        }
+    }
+
     /// Click to select (clicking the selected row again does what Enter does
     /// — returns true, for the caller to run it), click a PORT/CPU/MEM header
     /// cell to sort (again: reverse), wheel to move (or scroll the log pane
@@ -1160,6 +1358,10 @@ impl App {
                 }
                 if self.confirm.take().is_some() {
                     self.set_status("cancelled");
+                }
+                if let Some(r) = self.log_rect.filter(|&r| rect_contains(r, x, y)) {
+                    self.click_pane(r, y);
+                    return false;
                 }
                 let t = self.table_rect;
                 if !rect_contains(t, x, y) {
@@ -1952,7 +2154,7 @@ mod tests {
         let mut app = app_with_sample();
         app.inspect = true;
         let (_tx, rx) = std::sync::mpsc::channel();
-        app.open_diff("d".into(), rx, Arc::new(AtomicBool::new(false)));
+        app.open_diff("/tmp".into(), "d".into(), rx);
         assert!(app.close_top() && app.log.is_none() && app.inspect);
         assert!(app.close_top() && !app.inspect);
         assert!(!app.close_top(), "nothing left: q quits");

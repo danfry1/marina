@@ -138,6 +138,12 @@ fn run(
                             KeyCode::Char(c) if !ctrl => app.filter_push(c),
                             _ => {}
                         }
+                    } else if ctrl && app.zoomed() {
+                        match key.code {
+                            KeyCode::Char('d') => app.log_page(true),
+                            KeyCode::Char('u') => app.log_page(false),
+                            _ => {}
+                        }
                     } else if ctrl {
                         match key.code {
                             KeyCode::Char('d') => app.half_page(true),
@@ -149,6 +155,24 @@ fn run(
                             // a pane open: q closes it, like less or a pager
                             KeyCode::Char('q') if app.close_top() => {}
                             KeyCode::Char('q') => return Ok(()),
+                            // zoomed, the movement keys move through the pane
+                            KeyCode::Char('j') | KeyCode::Down if app.zoomed() => {
+                                app.log_scroll_down(1)
+                            }
+                            KeyCode::Char('k') | KeyCode::Up if app.zoomed() => {
+                                app.log_scroll_up(1)
+                            }
+                            KeyCode::Char('g') | KeyCode::Home if app.zoomed() => {
+                                app.pane_end(false)
+                            }
+                            KeyCode::Char('G') | KeyCode::End if app.zoomed() => app.pane_end(true),
+                            KeyCode::Char('z') => app.toggle_zoom(),
+                            KeyCode::Char('n') if app.pane_kind() == Some(ui::PaneKind::Diff) => {
+                                app.diff_hunk(true)
+                            }
+                            KeyCode::Char('N') if app.pane_kind() == Some(ui::PaneKind::Diff) => {
+                                app.diff_hunk(false)
+                            }
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                             KeyCode::Char('g') | KeyCode::Home => app.jump_top(),
@@ -172,6 +196,12 @@ fn run(
                             KeyCode::Char('y') => verb_copy(app),
                             KeyCode::Char('o') => verb_open(app),
                             KeyCode::Char('t') => verb_tail(app, &ev_tx),
+                            KeyCode::Tab => app.diff_toggle(),
+                            KeyCode::Char('{') => app.diff_step(-1),
+                            KeyCode::Char('}') => app.diff_step(1),
+                            // on the diff's file list, a file at a time
+                            KeyCode::Char('[') if app.diff_listing() => app.diff_step(-1),
+                            KeyCode::Char(']') if app.diff_listing() => app.diff_step(1),
                             KeyCode::Char('[') => app.log_scroll_up(5),
                             KeyCode::Char(']') => app.log_scroll_down(5),
                             KeyCode::Char('+') | KeyCode::Char('=') => app.log_grow(),
@@ -226,7 +256,10 @@ fn run(
             }
         }
 
-        // New log lines; expire status / held rows / row flashes.
+        // The diff pane follows the selection and stays live; new log
+        // lines and diff results; expire status / held rows / row flashes.
+        follow_diff(app);
+        refresh_diff(app);
         app.pump_log();
         app.tick();
     }
@@ -454,32 +487,54 @@ fn verb_diff(app: &mut ui::App) {
         app.close_log();
         return;
     }
-    let dir = match (app.selected_agent(), app.selected_target()) {
-        (Some(a), _) => a.cwd.clone(),
-        (None, Some(t)) if !t.cwd.as_os_str().is_empty() => t.cwd.clone(),
-        _ => {
-            app.set_status("select an agent session or a server to see its diff");
-            return;
+    match app.selection_dir() {
+        Some(dir) => load_diff(app, dir),
+        None => app.set_status("select an agent session or a server to see its diff"),
+    }
+}
+
+/// With the diff pane open, moving to a row in another work tree shows that
+/// tree's diff. Rows without one (a group header) leave it as it is.
+fn follow_diff(app: &mut ui::App) {
+    if app.pane_kind() != Some(ui::PaneKind::Diff) {
+        return;
+    }
+    if let Some(dir) = app.selection_dir() {
+        if app.diff_dir() != Some(dir.as_path()) {
+            load_diff(app, dir);
         }
-    };
-    let (tx, rx) = mpsc::channel();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let demo = app.demo;
+    }
+}
+
+/// Read the diff of `dir` into a fresh diff pane.
+fn load_diff(app: &mut ui::App, dir: std::path::PathBuf) {
     let title = ui::tildify(&dir.display().to_string());
+    let rx = read_diff(app.demo, dir.clone());
+    app.open_diff(dir, title, rx);
+}
+
+/// Keep an open diff live: re-read it every few seconds.
+fn refresh_diff(app: &mut ui::App) {
+    if let Some(dir) = app.diff_due() {
+        let rx = read_diff(app.demo, dir);
+        app.diff_reading(rx);
+    }
+}
+
+/// Read the diff of `dir` off the UI thread. A superseded read finds its
+/// receiver gone and its result is dropped.
+fn read_diff(demo: bool, dir: std::path::PathBuf) -> mpsc::Receiver<Vec<git::FileDiff>> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let lines = if demo {
+        let files = if demo {
             let project = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-            demo::diff_lines(&project.unwrap_or_default())
+            demo::diff_files(&project.unwrap_or_default())
         } else {
-            git::diff_lines(&dir)
+            git::diff_files(&dir)
         };
-        for line in lines {
-            if tx.send(line).is_err() {
-                break; // pane closed
-            }
-        }
+        let _ = tx.send(files);
     });
-    app.open_diff(title, rx, stop);
+    rx
 }
 
 /// `X`: SIGTERM the selection; on a server that's still stopping, SIGKILL.

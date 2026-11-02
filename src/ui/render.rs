@@ -13,8 +13,9 @@ use ratatui::{
     Frame,
 };
 
+use super::diff::{self, DiffMode, DiffView};
 use super::format::{centered_rect, fmt_age, fmt_mem, fmt_uptime, tildify, unix_now};
-use super::state::{is_agent_service, App, Entry, GroupBy, HistKey, PaneKind, SortMode};
+use super::state::{is_agent_service, App, Entry, GroupBy, HistKey, SortMode};
 use crate::launcher::{Launcher, LauncherKind};
 use crate::model::{Agent, Target, TargetKey, TargetKind};
 
@@ -33,7 +34,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.reconcile();
 
     let log_open = app.log.is_some();
-    let inspect_open = app.inspect;
+    // `z`: the pane takes the table's (and inspect's) room
+    let zoom = app.zoomed();
+    let inspect_open = app.inspect && !zoom;
     // an agent lists its shells/helpers below the usual five lines
     let mut inspect_h = match (inspect_open, app.selected_agent().is_some()) {
         (false, _) => 0,
@@ -48,6 +51,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     log_h -= cut;
     over -= cut;
     inspect_h -= over.min(inspect_h.saturating_sub(3));
+    if zoom {
+        log_h = room;
+    }
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
     if inspect_open {
@@ -208,24 +214,37 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let (Some(area), Some(l)) = (log_area, app.log.as_ref()) {
         let inner_h = area.height.saturating_sub(2) as usize;
-        let start = match l.scroll {
-            Some(s) => s.min(l.lines.len().saturating_sub(1)),
-            None => l.lines.len().saturating_sub(inner_h),
+        let start = |len: usize| match l.scroll {
+            Some(s) => s.min(len.saturating_sub(1)),
+            None => len.saturating_sub(inner_h),
         };
-        let text: Vec<Line> = l
-            .lines
-            .iter()
-            .skip(start)
-            .take(inner_h)
-            .map(|s| Line::from(s.clone()))
-            .collect();
-        let title = match (l.kind, l.scroll.is_some()) {
-            (PaneKind::Diff, _) => format!(" diff: {} — [ ] scroll · q close ", l.title),
-            (PaneKind::Log, true) => {
-                format!(" log: {} — scrolled · ] follow · q close ", l.title)
-            }
-            (PaneKind::Log, false) => {
-                format!(" log: {} — [ ] scroll · +/- size · q close ", l.title)
+        let (text, title): (Vec<Line>, String) = match &l.diff {
+            Some(d) => diff_pane(
+                d,
+                &l.title,
+                area.width.saturating_sub(2) as usize,
+                inner_h,
+                start,
+                zoom,
+            ),
+            None => {
+                let text = l
+                    .lines
+                    .iter()
+                    .skip(start(l.lines.len()))
+                    .take(inner_h)
+                    .map(|s| Line::from(s.clone()))
+                    .collect();
+                let title = match (l.scroll.is_some(), zoom) {
+                    (true, _) => format!(" log: {} — scrolled · ] follow · q close ", l.title),
+                    (false, true) => {
+                        format!(" log: {} — j k scroll · z unzoom · q close ", l.title)
+                    }
+                    (false, false) => {
+                        format!(" log: {} — [ ] scroll · z zoom · q close ", l.title)
+                    }
+                };
+                (text, title)
             }
         };
         let para = Paragraph::new(text).block(Block::bordered().title(title));
@@ -243,6 +262,57 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Paragraph::new(lines).block(Block::bordered().title(" keys ")),
             area,
         );
+    }
+}
+
+/// The diff pane's lines and title: the file list, or one file's patch.
+fn diff_pane(
+    d: &DiffView,
+    dir: &str,
+    w: usize,
+    h: usize,
+    start: impl Fn(usize) -> usize,
+    zoom: bool,
+) -> (Vec<Line<'static>>, String) {
+    let n = d.len();
+    let updated = if d.recently_changed(std::time::Instant::now()) {
+        " · updated"
+    } else {
+        ""
+    };
+    let (scroll, z) = if zoom {
+        ("j k", "z unzoom")
+    } else {
+        ("[ ]", "z zoom")
+    };
+    match (d.mode, d.file()) {
+        (DiffMode::Patch, Some(f)) => {
+            let lines = diff::patch_lines(f);
+            let title = format!(
+                " diff: {dir} · {} ({}/{n}){updated} — Tab files · n N hunk · {{ }} file · \
+                 {scroll} scroll · {z} · q close ",
+                f.path,
+                d.cursor + 1,
+            );
+            let skip = start(lines.len());
+            (lines.into_iter().skip(skip).take(h).collect(), title)
+        }
+        _ => {
+            let (a, r) = d
+                .files
+                .iter()
+                .flatten()
+                .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+            let title = match d.files {
+                Some(_) if n > 0 => format!(
+                    " diff: {dir} · {n} file{} +{a} −{r}{updated} — Tab/click opens · \
+                     {scroll} move · {z} · q close ",
+                    if n == 1 { "" } else { "s" }
+                ),
+                _ => format!(" diff: {dir}{updated} — {z} · q close "),
+            };
+            (diff::file_rows(d, w, h), title)
+        }
     }
 }
 
@@ -1172,8 +1242,9 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Enter", "fold · inspect a server · jump to"),
         row("", "an agent's pane (click again: same)"),
         row("i", "inspect"),
-        row("t · d", "log · uncommitted diff, in a pane"),
-        row("[ ] + -", "scroll · resize the pane"),
+        row("t · d", "log · live diff (follows the selection)"),
+        row("[ ] + - z", "scroll · resize · zoom the pane"),
+        row("Tab { } n N", "diff: files ↔ patch · file · hunk"),
         row("y · o", "copy URL · open it (on a session or"),
         row("", "group: its servers in turn)"),
         row("X", "kill (again: force-kill)"),
@@ -1629,6 +1700,68 @@ mod tests {
         app.data_warning = Some("port scan failed: boom".into());
         let out = render_to_string(&mut app, 120, 20);
         assert!(out.contains("port scan failed"));
+    }
+
+    #[test]
+    fn diff_pane_lists_files_then_shows_one() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = app_with_sample();
+        app.open_diff("/w".into(), "~/w".into(), rx);
+        let out = render_to_string(&mut app, 120, 40);
+        assert!(out.contains("reading…"));
+
+        tx.send(crate::demo::diff_files("shop")).unwrap();
+        app.pump_log();
+        let out = render_to_string(&mut app, 120, 40);
+        assert!(out.contains("diff: ~/w · 2 files +8 −3"), "{out}");
+        assert!(out.contains("▌ M src/shop/index.ts"));
+        assert!(out.contains("src/shop/index.ts  +6 −2"), "{out}");
+
+        app.diff_step(1);
+        app.diff_toggle();
+        let out = render_to_string(&mut app, 120, 40);
+        assert!(out.contains("src/lib/flags.ts (2/2)"), "{out}");
+        assert!(out.contains("4   │ -   payments: false,"), "{out}");
+        assert!(out.contains("  4 │ +   payments: true,"), "{out}");
+        assert!(!out.contains("index.ts"), "one file at a time");
+
+        app.diff_step(1); // already the last
+        app.diff_toggle();
+        assert!(app.diff_listing());
+    }
+
+    #[test]
+    fn a_zoomed_pane_hides_the_table() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = app_with_sample();
+        app.inspect = true;
+        app.open_diff("/w".into(), "~/w".into(), rx);
+        tx.send(crate::demo::diff_files("shop")).unwrap();
+        app.pump_log();
+        app.toggle_zoom();
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(!out.contains("PROJECT") && !out.contains("cwd"), "{out}");
+        assert!(out.contains("z unzoom"));
+        assert_eq!(app.page_rows, 0, "X and R refuse while it's hidden");
+        app.escape(); // unzooms, keeps the pane
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("PROJECT") && app.log_open());
+    }
+
+    #[test]
+    fn n_walks_hunks_then_files() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = app_with_sample();
+        app.open_diff("/w".into(), "~/w".into(), rx);
+        tx.send(crate::demo::diff_files("shop")).unwrap();
+        app.pump_log();
+        app.diff_toggle(); // index.ts, one hunk at line 0
+        app.diff_hunk(true); // no more hunks there: on to flags.ts
+        let out = render_to_string(&mut app, 120, 40);
+        assert!(out.contains("src/lib/flags.ts (2/2)"), "{out}");
+        app.diff_hunk(false); // back to index.ts's last hunk
+        let out = render_to_string(&mut app, 120, 40);
+        assert!(out.contains("src/shop/index.ts (1/2)"), "{out}");
     }
 
     #[test]

@@ -90,8 +90,12 @@ developer-process-centric.
   section and at the end of `marina agents`.
 - **What each agent changed** — the BRANCH column leads with the work tree's
   state (`●4 ↑2 main`: 4 files uncommitted, 2 commits unpushed; `✓` clean),
-  and `d` opens the uncommitted diff (stat, untracked files, patch) in the
-  pane below. A stale session with no servers and a clean, pushed tree is
+  and `d` opens the uncommitted diff in the pane below: the changed files
+  first, then `Tab` (or a click) for one file's patch — line numbers,
+  red/green lines, the changed part of an edited line picked out; `n`/`N`
+  jump between hunks and `z` zooms the pane full-screen. The diff is live
+  (re-read every few seconds, staying on the file you're reading) and
+  follows the selection, so moving to another agent shows its diff. A stale session with no servers and a clean, pushed tree is
   marked *looks finished* — the one to close first.
 - **Orphan notices** — when an agent session ends and leaves servers running,
   marina says so once — `⚠ claude session in ~/dev/app ended — left 2 servers
@@ -171,6 +175,8 @@ No flags or config needed — it auto-discovers your running dev servers. Press
 | `i` | inspect the selection (command, ports, cwd, launcher, pids) |
 | `t` · `d` | the server's log · the uncommitted diff of its (or an agent's) work tree, in a pane; again closes it |
 | `[` `]`, `+` `-` | scroll · resize the pane |
+| `Tab` · `{` `}` · `n` `N` | in the diff: file list ↔ a file's patch · previous / next file · next / previous hunk |
+| `z` | zoom the pane full-screen (`j` `k` `g` `G` then move through it); again or `Esc` unzooms |
 | `y` · `o` | copy URL · open in browser (on a session or group: its first web server; again: the next) |
 | `X` | kill: SIGTERM; again on a server still stopping: SIGKILL |
 | `R` | restart (output captured to a log) |

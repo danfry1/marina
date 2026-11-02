@@ -465,18 +465,40 @@ pub fn log_lines(project: &str, label: &str, port: Option<u16>) -> Vec<String> {
     }
 }
 
-/// What `D` shows for a made-up work tree.
-pub fn diff_lines(project: &str) -> Vec<String> {
-    vec![
-        format!(" src/{project}/index.ts | 42 +++++++++++++++++++++----"),
-        " src/lib/flags.ts        |  6 ++++-".into(),
-        " 2 files changed, 41 insertions(+), 7 deletions(-)".into(),
-        String::new(),
-        format!("+++ b/src/{project}/index.ts"),
-        "+  if (flags.payments) {".into(),
-        "+    return <SavedCards user={user} />".into(),
-        "+  }".into(),
-    ]
+/// What `d` shows for a made-up work tree.
+pub fn diff_files(project: &str) -> Vec<crate::git::FileDiff> {
+    let patch = format!(
+        "\
+diff --git a/src/{project}/index.ts b/src/{project}/index.ts
+--- a/src/{project}/index.ts
++++ b/src/{project}/index.ts
+@@ -12,9 +12,13 @@ export function Checkout({{ user }}: Props) {{
+   const flags = useFlags()
+-  const cards = user.cards
++  const cards = user.savedCards ?? []
+ 
+-  return <CardForm user={{user}} />
++  if (flags.payments) {{
++    return <SavedCards cards={{cards}} />
++  }}
++
++  return <CardForm user={{user}} cards={{cards}} />
+ }}
+ 
+ export default Checkout
+diff --git a/src/lib/flags.ts b/src/lib/flags.ts
+--- a/src/lib/flags.ts
++++ b/src/lib/flags.ts
+@@ -3,5 +3,6 @@
+ export const defaults = {{
+-  payments: false,
++  payments: true,
++  savedCards: true,
+   search: true,
+ }}
+"
+    );
+    crate::git::parse_patch(&patch)
 }
 
 #[cfg(test)]
